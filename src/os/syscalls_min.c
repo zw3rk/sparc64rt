@@ -42,6 +42,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
 #include "os/syscalls_min.h"
+#include "os/threads.h"
 
 /* SPARC Linux prot/flag ABI (asm/mman.h, arch 64-bit). Defined locally so
  * this TU compiles identically on any build host. */
@@ -422,7 +423,19 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         ret = sparc64_l2a_getrandom(ctx, mem, o0, o1, o2);
         break;
     case (long)SPARC64__NR_futex:
-        ret = sparc64_l2a_futex(ctx, mem, o0, o1, o2, o3);
+        ret = sparc64_thread_futex(ctx, mem, o0, o1, o2, o3, o4, o5);
+        break;
+    case (long)SPARC64__NR_clone:
+        ret = sparc64_thread_clone(ctx, mem, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC64__NR_gettid:
+        ret = sparc64_thread_gettid(ctx);
+        break;
+    case (long)SPARC64__NR_set_robust_list:
+        ret = sparc64_thread_set_robust_list(ctx, o0, o1);
+        break;
+    case (long)SPARC64__NR_get_robust_list:
+        ret = sparc64_thread_get_robust_list(ctx, mem, o0, o1, o2);
         break;
     case (long)SPARC64__NR_rt_sigreturn:
         /* Absolute resume: the frame sets pc/npc, so the common tail

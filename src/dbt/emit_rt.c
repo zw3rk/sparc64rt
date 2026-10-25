@@ -18,6 +18,7 @@
 
 #include "core/cpu.h"
 #include "interp/interp.h"
+#include "os/threads.h"
 
 uint64_t s64_rt_mem(sparc64_ctx_t *ctx, const sparc64_mem_ops_t *mem,
     void *mc, uint64_t pc, uint64_t pack_a, uint32_t raw, uint64_t pack_b)
@@ -37,9 +38,19 @@ uint64_t s64_rt_mem(sparc64_ctx_t *ctx, const sparc64_mem_ops_t *mem,
     case SPARC64_ICLS_STORE:
         r = sparc64_exec_store(ctx, mem, mc, pc, &d);
         break;
-    case SPARC64_ICLS_ATOMIC:
+    case SPARC64_ICLS_LDSTUB:
+    case SPARC64_ICLS_SWAP:
+    case SPARC64_ICLS_ATOMIC: {
+        /* L4b: same single-copy host-__atomic fast path the interp
+         * exec_atomic takes; the reservation path below is unchanged. */
+        sparc64_step_result_t fast;
+        if (sparc64_threads_try_host_atomic(ctx, mc, pc, &d, &fast)) {
+            return fast.kind == SPARC64_STEP_CONTINUE ? UINT64_C(0) :
+                (uint64_t)SPARC64_EXIT_UNDEF;
+        }
         r = sparc64_exec_atomic(ctx, mem, mc, pc, &d);
         break;
+    }
     default:
         return (uint64_t)SPARC64_EXIT_UNDEF;
     }
