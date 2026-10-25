@@ -295,6 +295,29 @@ bool sparc64_eval_rcond(unsigned rcond, uint64_t v)
     }
 }
 
+/* FBfcc condition over one fcc field (0 eq, 1 lt, 2 gt, 3 unordered). */
+bool sparc64_eval_fcond(unsigned cond, uint32_t fcc)
+{
+    switch (cond & 15U) {
+    case 0x0U: return false;
+    case 0x1U: return fcc != 0U;
+    case 0x2U: return fcc == 1U || fcc == 2U;
+    case 0x3U: return fcc == 3U || fcc == 1U;
+    case 0x4U: return fcc == 1U;
+    case 0x5U: return fcc == 3U || fcc == 2U;
+    case 0x6U: return fcc == 2U;
+    case 0x7U: return fcc == 3U;
+    case 0x8U: return true;
+    case 0x9U: return fcc == 0U;
+    case 0xAU: return fcc == 0U || fcc == 3U;
+    case 0xBU: return fcc == 0U || fcc == 2U;
+    case 0xCU: return fcc != 1U;
+    case 0xDU: return fcc == 0U || fcc == 1U;
+    case 0xEU: return fcc != 2U;
+    default: return fcc != 3U;
+    }
+}
+
 /* Logic ops clear V/C; N/Z come from bit 31/low32-zero (icc) and bit 63 /
  * full-zero (xcc). */
 static void cc_logic(sparc64_ctx_t *ctx, uint64_t res)

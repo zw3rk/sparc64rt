@@ -486,11 +486,26 @@ sparc64_step_result_t sparc64_exec_load(sparc64_cpu_t *cpu,
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
-    default: /* LDFSR: the FSR is integer-modeled. */
-        if (!sparc64_ld_int(mem, mc, va, 4U, false, little, &v, &res, pc)) {
-            return res;
+    default: /* LDFSR (rd 0: low 32, upper zeroed) / LDXFSR (rd 1:
+        * full 64-bit, oracle-probed). Either form re-syncs the fcc
+        * shadow from the FSR fields. */
+        if (d->rd == 1U) {
+            if (!sparc64_ld_int(mem, mc, va, 8U, false, little, &v, &res,
+                    pc)) {
+                return res;
+            }
+            cpu->fsr = v;
+        } else {
+            if (!sparc64_ld_int(mem, mc, va, 4U, false, little, &v, &res,
+                    pc)) {
+                return res;
+            }
+            cpu->fsr = v & UINT64_C(0xFFFFFFFF);
         }
-        cpu->fsr = v & UINT64_C(0xFFFFFFFF);
+        cpu->fcc[0] = (uint32_t)((cpu->fsr >> 10) & UINT64_C(3));
+        cpu->fcc[1] = (uint32_t)((cpu->fsr >> 32) & UINT64_C(3));
+        cpu->fcc[2] = (uint32_t)((cpu->fsr >> 34) & UINT64_C(3));
+        cpu->fcc[3] = (uint32_t)((cpu->fsr >> 36) & UINT64_C(3));
         break;
     }
     return sparc64_step_ok(pc);
@@ -546,7 +561,15 @@ sparc64_step_result_t sparc64_exec_store(sparc64_cpu_t *cpu,
             return res;
         }
         break;
-    default: /* STFSR */
+    default: /* STFSR (rd 0: low 32) / STXFSR (rd 1: full 64-bit,
+        * oracle-probed). */
+        if (d->rd == 1U) {
+            if (!sparc64_st_int(mem, mc, va, 8U, little, cpu->fsr, &res,
+                    pc)) {
+                return res;
+            }
+            break;
+        }
         if (!sparc64_st_int(mem, mc, va, 4U, little,
                 cpu->fsr & UINT64_C(0xFFFFFFFF), &res, pc)) {
             return res;
