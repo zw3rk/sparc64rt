@@ -1,0 +1,8 @@
+DSO-CALL-OK sum=42 prod=42 name=libp5
+DLOPEN-OK sym=42
+TLS-OK main=7 thread=13
+MALLOC-OK sum=36
+PRINTF-OK dec=42 hex=2a
+AUXV-OK pagesz=8192 clktck=100 secure=0
+PTHREAD-OK count=2000
+P5-PASS
