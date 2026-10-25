@@ -23,13 +23,13 @@ Implement, verify, and harden **`sparc64rt`** — a zero-dependency, static-PIE 
 
 ### Phase E — Pre-Implementation Empirical Experiments (`RC-E`)
 Read [`docs/lanes/phase-e.md`](docs/lanes/phase-e.md) and run concurrent experiment lanes `E01..E06`:
-- [ ] **E01 (`2047` (`0x7ff`) Stack Bias on `SAVE`/`RESTORE` & Initial `_start`)**: Verify `[%sp + 2047]` 128-byte `rwindow_64` spill/fill and initial `_start` stack bias under `qemu-sparc64`. (`experiments/E01/FINDINGS.md`)
-- [ ] **E02 (Dual Carry Flag Update (`CCR.icc.C` & `CCR.xcc.C`) on `ta 0x6d`)**: Verify that `ta 0x6d` updates both `icc.C` (bit 0) and `xcc.C` (bit 4) so `bcs %icc` and `bcs %xcc` both work. (`experiments/E02/FINDINGS.md`)
-- [ ] **E03 (`BPcc`, `BPr`, `MOVcc`, `MOVr`, `CASA`/`CASXA` & Little-Endian ASIs)**: Verify SPARC V9 conditional branches/moves and `ASI_PRIMARY` (`0x80`) / `ASI_PRIMARY_LITTLE` (`0x88`) under `qemu-sparc64`. (`experiments/E03/FINDINGS.md`)
-- [ ] **E04 (SPARC64 `rt_signal_frame64` (528 B, `sparc_stackf` 192 B))**: Verify exact byte offsets of `sparc_stackf` (192 B), `pt_regs` (160 B), and `rt_signal_frame64` (528 B). (`experiments/E04/FINDINGS.md`)
-- [ ] **E05 (SPARC V9 FPU (`%f0..%f31`, `%d0..%d62`, `%q0..%q60`, `fcc0..fcc3`) & VIS `faligndata`)**: Verify V9 extended double registers, 4 FP condition code fields, and `alignaddr`/`faligndata`. (`experiments/E05/FINDINGS.md`)
-- [ ] **E06 (`glibc` `sparc64-unknown-linux-gnu` TLS (`%g7`) & `clone`)**: Verify `%g7` TLS pointer and `fork`/`clone` child `%o1 = 1` semantics under `qemu-sparc64`. (`experiments/E06/FINDINGS.md`)
-- [ ] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-sparc64` ground-truth verification.
+- [x] **E01 (`2047` (`0x7ff`) Stack Bias on `SAVE`/`RESTORE` & Initial `_start`)**: Verify `[%sp + 2047]` 128-byte `rwindow_64` spill/fill and initial `_start` stack bias under `qemu-sparc64`. (`experiments/E01/FINDINGS.md`)
+- [x] **E02 (Dual Carry Flag Update (`CCR.icc.C` & `CCR.xcc.C`) on `ta 0x6d`)**: Verify that `ta 0x6d` updates both `icc.C` (bit 0) and `xcc.C` (bit 4) so `bcs %icc` and `bcs %xcc` both work. (`experiments/E02/FINDINGS.md`)
+- [x] **E03 (`BPcc`, `BPr`, `MOVcc`, `MOVr`, `CASA`/`CASXA` & Little-Endian ASIs)**: Verify SPARC V9 conditional branches/moves and `ASI_PRIMARY` (`0x80`) / `ASI_PRIMARY_LITTLE` (`0x88`) under `qemu-sparc64`. (`experiments/E03/FINDINGS.md`)
+- [x] **E04 (SPARC64 `rt_signal_frame64` (528 B, `sparc_stackf` 192 B))**: Verify exact byte offsets of `sparc_stackf` (192 B), `pt_regs` (160 B), and `rt_signal_frame64` (528 B). (`experiments/E04/FINDINGS.md`)
+- [x] **E05 (SPARC V9 FPU (`%f0..%f31`, `%d0..%d62`, `%q0..%q60`, `fcc0..fcc3`) & VIS `faligndata`)**: Verify V9 extended double registers, 4 FP condition code fields, and `alignaddr`/`faligndata`. (`experiments/E05/FINDINGS.md`)
+- [x] **E06 (`glibc` `sparc64-unknown-linux-gnu` TLS (`%g7`) & `clone`)**: Verify `%g7` TLS pointer and `fork`/`clone` child `%o1 = 1` semantics under `qemu-sparc64`. (`experiments/E06/FINDINGS.md`)
+- [x] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-sparc64` ground-truth verification.
 
 ### Phase 0 — Repository Scaffold, Frozen Headers & Substrate Copy (`RC0`)
 Read [`docs/lanes/phase-0.md`](docs/lanes/phase-0.md) and run lanes `L0a..L0b`:
