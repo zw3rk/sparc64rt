@@ -353,6 +353,17 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
     case (long)SPARC64__NR_openat:
         ret = sparc64_l2a_openat(ctx, mem, o0, o1, o2, o3);
         break;
+    case (long)SPARC64__NR_open:
+        ret = sparc64_l2a_open(ctx, mem, o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_readlinkat:
+        ret = sparc64_l2a_readlinkat(ctx, mem, o0, o1, o2, o3);
+        break;
+    case (long)SPARC64__NR_readlink:
+        /* readlink(file, buf, len) is readlinkat(AT_FDCWD). */
+        ret = sparc64_l2a_readlinkat(ctx, mem,
+            (uint64_t)(int64_t)-100, o0, o1, o2);
+        break;
     case (long)SPARC64__NR_fcntl:
     case (long)SPARC64__NR_fcntl64:
         ret = sparc64_l2a_fcntl(o0, o1, o2);

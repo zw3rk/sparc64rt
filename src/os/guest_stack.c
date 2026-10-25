@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "core/cpu.h"
+#include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
 #include "rt64/memory/space.h"
 
@@ -40,24 +41,40 @@
 #define GUEST_AT_PHENT 4U
 #define GUEST_AT_PHNUM 5U
 #define GUEST_AT_PAGESZ 6U
+#define GUEST_AT_BASE 7U
+#define GUEST_AT_FLAGS 8U
 #define GUEST_AT_ENTRY 9U
 #define GUEST_AT_UID 11U
 #define GUEST_AT_EUID 12U
 #define GUEST_AT_GID 13U
 #define GUEST_AT_EGID 14U
 #define GUEST_AT_HWCAP 16U
+#define GUEST_AT_CLKTCK 17U
+#define GUEST_AT_SECURE 23U
 /* Oracle AT_HWCAP (qemu-sparc64 7.2.22 auxv probe): FLUSH|STBAR|SWAP|
  * MULDIV|V9 baseline. */
 #define GUEST_AT_HWCAP_BITS UINT64_C(0x1f)
 #define GUEST_AT_RANDOM 25U
 #define GUEST_AT_RANDOM_BYTES 16U
+#define GUEST_AT_HWCAP2 26U
 #define GUEST_AT_EXECFN 31U
+#define GUEST_AT_CLKTCK_VALUE UINT64_C(100)
 
-/* AT_* keys carried in the initial stack, in auxv order. */
-static const unsigned aux_keys[12] = {
+/* AT_* keys carried in the initial stack, in auxv order (static). */
+static const uint64_t aux_keys[12] = {
     GUEST_AT_PHDR, GUEST_AT_PHENT, GUEST_AT_PHNUM, GUEST_AT_PAGESZ,
     GUEST_AT_ENTRY, GUEST_AT_UID, GUEST_AT_EUID, GUEST_AT_GID,
     GUEST_AT_EGID, GUEST_AT_HWCAP, GUEST_AT_EXECFN, GUEST_AT_RANDOM,
+};
+
+/* Full dynamic auxv (Phase 5, L5a): app phdr/entry plus AT_BASE for
+ * ld.so; AT_ENTRY still names the app (the start pc is ld.so). */
+static const uint64_t aux_keys_dyn[17] = {
+    GUEST_AT_PHDR, GUEST_AT_PHENT, GUEST_AT_PHNUM, GUEST_AT_PAGESZ,
+    GUEST_AT_BASE, GUEST_AT_FLAGS, GUEST_AT_ENTRY, GUEST_AT_UID,
+    GUEST_AT_EUID, GUEST_AT_GID, GUEST_AT_EGID, GUEST_AT_HWCAP,
+    GUEST_AT_HWCAP2, GUEST_AT_CLKTCK, GUEST_AT_SECURE, GUEST_AT_RANDOM,
+    GUEST_AT_EXECFN,
 };
 
 extern char **environ;
@@ -160,19 +177,31 @@ static int put_vec(guest_state_t *g, uint64_t *cursor, const uint64_t *v,
 }
 
 /* Lay out argc/argv/envp/auxv/strings; returns the biased %sp. Stack
- * pages are mapped READ|WRITE; every multi-byte field is big-endian. */
-int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
-                uint64_t phnum, uint64_t phent, char **argv, uint64_t argc,
+ * pages are mapped READ|WRITE; every multi-byte field is big-endian.
+ * interp_base selects the auxv set: 0 keeps the static 12-key subset
+ * byte-identical, nonzero emits the full dynamic auxv with AT_BASE. */
+static int build_stack_core(guest_state_t *g, uint64_t phdr_va,
+                uint64_t entry, uint64_t phnum, uint64_t phent,
+                uint64_t interp_base, char **argv, uint64_t argc,
                 uint64_t *sp_out)
 {
     uint64_t envc = count_strings(environ, GUEST_MAX_ENVC);
     uint64_t argv_bytes = 0, env_bytes = 0, str_size, str_base;
-    uint64_t cursor, frame, stack_base, stack_size, execfn = 0, words, at, i;
+    uint64_t cursor, frame, stack_base, stack_size, execfn = 0, words, at;
+    unsigned nkeys, i;
+    const uint64_t *keys;
     uint64_t argv_addr[GUEST_MAX_ARGC], env_addr[GUEST_MAX_ENVC];
-    uint64_t auxv[26], vals[12];
+    uint64_t auxv[40], vals[17];
     uint64_t rnd_addr = UINT64_C(0);
     uint8_t zeros[128];
     uint8_t rnd[GUEST_AT_RANDOM_BYTES];
+    if (interp_base != UINT64_C(0)) {
+        keys = aux_keys_dyn;
+        nkeys = 17U;
+    } else {
+        keys = aux_keys;
+        nkeys = 12U;
+    }
     if (argc > (uint64_t)GUEST_MAX_ARGC ||
         envc > (uint64_t)GUEST_MAX_ENVC) {
         return -E2BIG;
@@ -182,9 +211,9 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
         return -E2BIG;
     }
     str_size = argv_bytes + env_bytes + (uint64_t)GUEST_AT_RANDOM_BYTES;
-    /* Reserve: argc + argv+NULL + envp+NULL + 13 auxv pairs. */
+    /* Reserve: argc + argv+NULL + envp+NULL + auxv pairs + AT_NULL. */
     words = UINT64_C(1) + (argc + UINT64_C(1)) + (envc + UINT64_C(1)) +
-        UINT64_C(26);
+        (uint64_t)(nkeys + 1U) * UINT64_C(2);
     str_base = GUEST_STACK_TOP - str_size;
     if (str_size > GUEST_MAX_STRING_BYTES || str_size >= GUEST_STACK_TOP ||
         str_base < words * UINT64_C(8) + UINT64_C(128)) {
@@ -241,13 +270,26 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
                                      sizeof(zeros))) {
         return -ENOMEM;
     }
-    vals[0] = phdr_va; vals[1] = phent; vals[2] = phnum;
-    vals[3] = GUEST_PAGE_SIZE; vals[4] = entry;
-    vals[5] = (uint64_t)getuid(); vals[6] = (uint64_t)geteuid();
-    vals[7] = (uint64_t)getgid(); vals[8] = (uint64_t)getegid();
-    vals[9] = GUEST_AT_HWCAP_BITS; vals[10] = execfn; vals[11] = rnd_addr;
-    for (i = 0; i < 12U; i++) {
-        auxv[2U * i] = aux_keys[i];
+    if (interp_base != UINT64_C(0)) {
+        vals[0] = phdr_va; vals[1] = phent; vals[2] = phnum;
+        vals[3] = GUEST_AT_PAGESZ_VALUE; vals[4] = interp_base;
+        vals[5] = 0U;
+        vals[6] = entry;
+        vals[7] = (uint64_t)getuid(); vals[8] = (uint64_t)geteuid();
+        vals[9] = (uint64_t)getgid(); vals[10] = (uint64_t)getegid();
+        vals[11] = GUEST_AT_HWCAP_BITS; vals[12] = 0U;
+        vals[13] = GUEST_AT_CLKTCK_VALUE; vals[14] = 0U;
+        vals[15] = rnd_addr; vals[16] = execfn;
+    } else {
+        vals[0] = phdr_va; vals[1] = phent; vals[2] = phnum;
+        vals[3] = GUEST_AT_PAGESZ_VALUE; vals[4] = entry;
+        vals[5] = (uint64_t)getuid(); vals[6] = (uint64_t)geteuid();
+        vals[7] = (uint64_t)getgid(); vals[8] = (uint64_t)getegid();
+        vals[9] = GUEST_AT_HWCAP_BITS; vals[10] = execfn;
+        vals[11] = rnd_addr;
+    }
+    for (i = 0; i < nkeys; i++) {
+        auxv[2U * i] = keys[i];
         auxv[2U * i + 1U] = vals[i];
     }
     at = frame + UINT64_C(128);
@@ -256,11 +298,33 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
         put64(g, &at, 0U) != 0 ||
         put_vec(g, &at, env_addr, envc) != 0 ||
         put64(g, &at, 0U) != 0 ||
-        put_vec(g, &at, auxv, 24U) != 0 ||
+        put_vec(g, &at, auxv, (uint64_t)nkeys * UINT64_C(2)) != 0 ||
         put64(g, &at, GUEST_AT_NULL) != 0 ||
         put64(g, &at, 0U) != 0) {
         return -ENOMEM;
     }
     *sp_out = frame - SPARC64_STACK_BIAS;
-    return 0;
+    /* Snapshot argv/auxv/registers for /proc/self (L5a); the stack
+     * bytes above are the source of truth for auxv. */
+    sparc64_guest_proc_note_map(g, stack_base, GUEST_STACK_TOP, "[stack]");
+    return sparc64_guest_proc_note_stack(g, argv, argc, keys, vals, nkeys,
+        *sp_out, stack_base, GUEST_STACK_TOP);
+}
+
+/* Static entry (Phase 1): the 12-key auxv subset, unchanged. */
+int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
+                uint64_t phnum, uint64_t phent, char **argv, uint64_t argc,
+                uint64_t *sp_out)
+{
+    return build_stack_core(g, phdr_va, entry, phnum, phent,
+        UINT64_C(0), argv, argc, sp_out);
+}
+
+/* Dynamic entry (Phase 5): full auxv with AT_BASE (ld.so bias). */
+int build_stack_dyn(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
+                uint64_t phnum, uint64_t phent, uint64_t interp_base,
+                char **argv, uint64_t argc, uint64_t *sp_out)
+{
+    return build_stack_core(g, phdr_va, entry, phnum, phent, interp_base,
+        argv, argc, sp_out);
 }

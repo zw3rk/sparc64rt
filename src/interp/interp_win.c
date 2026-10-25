@@ -791,13 +791,21 @@ sparc64_step_result_t sparc64_exec_mov(sparc64_cpu_t *cpu, uint64_t pc,
 }
 
 /* User state registers: %y/%ccr/%asi/%pc/%fprs/%gsr (RDPC reads the
- * address of the instruction itself, V9 6.6.5). */
+ * address of the instruction itself, V9 6.6.5). %tick is emulated
+ * with a fixed value (Phase 5, L5a): the oracle returns its virtual
+ * clock, but a live clock would diverge lockstep difftest (two
+ * copies, separate reads) and interp-vs-dbt runs, so determinism
+ * wins; the guest only samples it for startup mixing. */
+#define SPARC64RT_TICK_VALUE UINT64_C(0x100000001)
 sparc64_step_result_t sparc64_exec_rdasr(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
     switch (d->rs1) {
     case SPARC64_ASR_Y:
         sparc64_wreg(cpu, d->rd, cpu->y);
+        break;
+    case SPARC64_ASR_TICK:
+        sparc64_wreg(cpu, d->rd, SPARC64RT_TICK_VALUE);
         break;
     case SPARC64_ASR_PC:
         sparc64_wreg(cpu, d->rd, pc);

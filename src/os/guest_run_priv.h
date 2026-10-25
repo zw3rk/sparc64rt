@@ -29,11 +29,18 @@ typedef struct {
     long host_tid;
     /* Non-NULL while a DBT engine runs: mapping changes invalidate it. */
     struct sparc64_dbt *dbt;
+    /* Phase 5 L5a: /proc/self snapshot (exe, argv, auxv, file spans).
+     * Owned here, replaced on execve, dropped on fork-child paths. */
+    struct sparc64_guest_proc *proc;
 } guest_state_t;
 
 /* Guest ABI constants shared by the loader (guest_run.c) and the
  * _start stack synthesis (guest_stack.c). */
 #define GUEST_PAGE_SIZE UINT64_C(4096)
+/* AT_PAGESZ value (Phase 5, L5a): the SPARC64 Linux page size is 8K
+ * (oracle and hardware truth). The translator's mapping granule
+ * stays 4K (a harmless superset: 8K-aligned guests map fine). */
+#define GUEST_AT_PAGESZ_VALUE UINT64_C(8192)
 #define GUEST_MAX_ARGC 256U
 
 /* Loader outcomes: positive errno-style values without depending on
@@ -55,6 +62,12 @@ uint64_t count_strings(char **vec, uint64_t max);
 int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
     uint64_t phnum, uint64_t phent, char **argv, uint64_t argc,
     uint64_t *sp_out);
+
+/* Dynamic stack (Phase 5, L5a): app phdr/entry plus the ld.so load
+ * bias (AT_BASE); interp_base 0 selects the static auxv subset. */
+int build_stack_dyn(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
+    uint64_t phnum, uint64_t phent, uint64_t interp_base, char **argv,
+    uint64_t argc, uint64_t *sp_out);
 
 /* Syscall memory/file/map layer over the same space. */
 const sparc64_syscall_mem_t *sysmem_ops(guest_state_t *g,

@@ -25,12 +25,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include "core/cpu.h"
+#include "os/guest_proc.h"
 #include "os/guest_run.h"
 #include "os/guest_run_priv.h"
 #include "dbt/dbt.h"
@@ -38,6 +40,7 @@
 #include "os/sync_sig.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
+#include "rt64/loader/interp_map.h"
 #include "rt64/memory/space.h"
 
 /* ---- Guest ABI constants (SPARC Linux, arch/sparc) --------------------- */
@@ -60,6 +63,12 @@
 #define GUEST_MAP_PRIVATE 0x02U
 #define GUEST_MAP_FIXED 0x10U
 #define GUEST_MAP_ANONYMOUS 0x20U
+
+/* Loader mapping granule (Phase 5, L5a): PT_LOAD spans round to the
+ * reported guest page size (8K), not the 4K syscall granule, so the
+ * 8K-rounded RELRO mprotect ld.so issues stays inside the mapping. */
+#define GUEST_MAP_GRANULE GUEST_AT_PAGESZ_VALUE
+#define GUEST_MAP_GRANULE_MASK (GUEST_AT_PAGESZ_VALUE - UINT64_C(1))
 
 /* Stack synthesis lives in guest_stack.c; loader outcomes in
  * guest_run_priv.h. */
@@ -337,6 +346,21 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
         (void)sparc64_space_unmap(&g->space, base, size);
         return -ENOMEM;
     }
+    /* Label the span for /proc/self/maps (L5a, best-effort):
+     * guest fds are host fds, so readlink the translator's own fd. */
+    {
+        char link[32];
+        char target[SPARC64RT_INTERP_PATH_MAX];
+        ssize_t got;
+        int wn = snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        if (wn > 0 && (size_t)wn < sizeof(link)) {
+            got = readlink(link, target, sizeof(target) - 1U);
+            if (got > 0) {
+                target[got] = '\0';
+                sparc64_guest_proc_note_map(g, base, base + size, target);
+            }
+        }
+    }
     if (g->dbt != NULL) {
         sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
     }
@@ -514,12 +538,14 @@ static int zero_tail(guest_state_t *g, uint64_t at, uint64_t end)
 
 /* Map every PT_LOAD in file order (merge unions perms and preserves
  * bytes), copy file bytes, and zero the BSS tail inline so a later
- * segment's file bytes always win over an earlier BSS. Rejects
- * PT_INTERP: Phase 1 runs static guests only. hi_out receives the
- * post-image break, phdr_va_out the VA of the program-header table. */
+ * segment's file bytes always win over an earlier BSS. PT_INTERP is
+ * collected into interp_out (empty when static) for the Phase-5
+ * dynamic path. hi_out receives the post-image break, phdr_va_out
+ * the VA of the program-header table. */
 static int load_segments(int fd, guest_state_t *g, uint64_t bias,
                          uint64_t phoff, uint32_t phnum, uint64_t file_phoff,
-                         uint64_t *hi_out, uint64_t *phdr_va_out)
+                         uint64_t *hi_out, uint64_t *phdr_va_out,
+                         char *interp_out, const char *map_label)
 {
     uint64_t hi = 0;
     uint64_t phdr_va = 0;
@@ -543,7 +569,25 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
         }
         p_type = rd32be(phdr);
         if (p_type == (uint32_t)GUEST_PT_INTERP) {
-            return -LOAD_INTERP;
+            /* Dynamic guest: stash the path for interp_map (a second
+             * PT_INTERP or an overlong path is rejected). */
+            uint64_t ilen = rd64be(phdr + 32);
+            uint64_t ioff = rd64be(phdr + 8);
+            uint64_t imoved = 0;
+            if (interp_out == NULL || interp_out[0] != '\0' ||
+                ilen < 2U ||
+                ilen > (uint64_t)SPARC64RT_INTERP_PATH_MAX) {
+                return -LOAD_BAD;
+            }
+            if (read_at(fd, ioff, (uint8_t *)interp_out, ilen,
+                    &imoved) != 0 ||
+                imoved != ilen ||
+                interp_out[ilen - 1U] != '\0' ||
+                memchr(interp_out, '\0', (size_t)ilen - 1U) != NULL) {
+                interp_out[0] = '\0';
+                return -LOAD_BAD;
+            }
+            continue;
         }
         if (p_type != (uint32_t)GUEST_PT_LOAD) {
             continue;
@@ -562,10 +606,12 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
         perms = ((p_flags & GUEST_PF_R) != 0U ? SPARC64_MEM_READ : 0U) |
                 ((p_flags & GUEST_PF_W) != 0U ? SPARC64_MEM_WRITE : 0U) |
                 ((p_flags & GUEST_PF_X) != 0U ? SPARC64_MEM_EXEC : 0U);
-        start = align_down(p_vaddr, GUEST_PAGE_SIZE);
-        end = align_up(p_vaddr + p_memsz, GUEST_PAGE_SIZE);
+        /* Round to the 8K loader granule (see GUEST_MAP_GRANULE);
+         * overlapping rounded spans union perms harmlessly. */
+        start = align_down(p_vaddr, GUEST_MAP_GRANULE);
+        end = align_up(p_vaddr + p_memsz, GUEST_MAP_GRANULE);
         if (end <= start || end - start > SPARC64_TASK_SIZE ||
-            start >= SPARC64_TASK_SIZE || end > SPARC64_TASK_SIZE) {
+            start < GUEST_PAGE_SIZE || end > SPARC64_TASK_SIZE) {
             return -LOAD_BAD;
         }
         if (!sparc64_space_map(&g->space, start, end - start, perms, true)) {
@@ -584,6 +630,9 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
                 return seg_rc;
             }
         }
+        if (map_label != NULL) {
+            sparc64_guest_proc_note_map(g, start, end, map_label);
+        }
         n++;
         if (end > hi) {
             hi = end;
@@ -595,6 +644,32 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
     *phdr_va_out = phdr_va;
     *hi_out = hi;
     return 0;
+}
+
+/* Dynamic tail (L5a): resolve PT_INTERP via SPARC64RT_SYSROOT
+ * (else /), map ld.so, return its entry/base (app keeps AT_ENTRY). */
+static int load_interp(guest_state_t *g, const char *interp,
+                       uint64_t *entry_out, uint64_t *base_out,
+                       char *resolved_out)
+{
+    const char *sysroot = getenv("SPARC64RT_SYSROOT");
+    int ifd = -1, mrc;
+    uint64_t hi = 0;
+    if (sparc64_interp_resolve(interp, sysroot, resolved_out,
+            SPARC64RT_INTERP_PATH_MAX) != 0) {
+        return -LOAD_BAD;
+    }
+    ifd = open(resolved_out, O_RDONLY | O_CLOEXEC);
+    if (ifd < 0) {
+        return -LOAD_IO;
+    }
+    mrc = sparc64_interp_map(&g->space, ifd, entry_out, base_out, &hi);
+    (void)close(ifd);
+    if (mrc != 0) {
+        return (mrc == -ENOEXEC) ? -LOAD_BAD : -LOAD_NOMEM;
+    }
+    sparc64_guest_proc_note_map(g, *base_out, hi, resolved_out);
+    return LOAD_OK;
 }
 
 /* ---- Entry point (stack synthesis lives in guest_stack.c) ------------------ */
@@ -611,11 +686,16 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
     sparc64_syscall_mem_t ops_storage;
     const sparc64_syscall_mem_t *ops;
     uint64_t bias = 0, guest_phdr = 0, heap_hi = 0, sp = 0, argc = 0;
+    uint64_t start_entry = 0, interp_base = 0;
+    char interp[SPARC64RT_INTERP_PATH_MAX];
+    char resolved[SPARC64RT_INTERP_PATH_MAX];
     char *synthetic[2];
     int fd = -1;
     int rc;
     memset(&g, 0, sizeof(g));
     memset(&img, 0, sizeof(img));
+    memset(interp, 0, sizeof(interp));
+    memset(resolved, 0, sizeof(resolved));
     if (path == NULL) {
         (void)fprintf(stderr, "sparc64rt: no guest image\n");
         return 1;
@@ -643,29 +723,45 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
     g.host_tid = (long)getpid();
     rc = load_ehdr(fd, &img, &bias);
     if (rc != 0) {
-        (void)fprintf(stderr, "sparc64rt: '%s' is not a static SPARC64 ELF\n",
+        (void)fprintf(stderr, "sparc64rt: '%s' is not a SPARC64 ELF\n",
                       path);
         goto fail;
     }
     rc = load_segments(fd, &g, bias, img.phoff, img.phnum, img.phoff,
-                       &heap_hi, &guest_phdr);
+                       &heap_hi, &guest_phdr, interp, path);
     if (rc != 0) {
-        (void)fprintf(stderr, rc == -LOAD_INTERP ?
-                      "sparc64rt: '%s' needs an interpreter (static only)\n" :
-                      "sparc64rt: cannot load '%s'\n", path);
+        (void)fprintf(stderr, "sparc64rt: cannot load '%s'\n", path);
         goto fail;
+    }
+    start_entry = img.entry;
+    if (interp[0] != '\0') {
+        uint64_t ld_entry = 0, ld_base = 0;
+        rc = load_interp(&g, interp, &ld_entry, &ld_base, resolved);
+        if (rc != 0) {
+            (void)fprintf(stderr,
+                          "sparc64rt: cannot map interpreter '%s'\n", path);
+            goto fail;
+        }
+        start_entry = ld_entry;
+        interp_base = ld_base;
     }
     g.brk_base = align_up(heap_hi, GUEST_PAGE_SIZE);
     g.brk_cur = g.brk_base;
-    rc = build_stack(&g, guest_phdr, img.entry, img.phnum, img.phent,
-                     argv, argc, &sp);
+    if (interp_base != UINT64_C(0)) {
+        rc = build_stack_dyn(&g, guest_phdr, img.entry, img.phnum,
+                             img.phent, interp_base, argv, argc, &sp);
+    } else {
+        rc = build_stack(&g, guest_phdr, img.entry, img.phnum, img.phent,
+                         argv, argc, &sp);
+    }
     if (rc != 0) {
         (void)fprintf(stderr, "sparc64rt: cannot build the guest stack\n");
         goto fail;
     }
+    sparc64_guest_proc_note_exec(&g, path);
     (void)close(fd);
     fd = -1;
-    sparc64_ctx_init(&ctx, img.entry);
+    sparc64_ctx_init(&ctx, start_entry);
     ctx.r[SPARC64_SP] = sp;
     /* Fresh windows (E01): CWP 0, no invalid windows, so the first
      * SAVE/RESTORE pair rotates in-register without spill/fill. */
@@ -689,7 +785,9 @@ fail:
     }
     if (g.space_live) {
         sparc64_space_destroy(&g.space);
+        g.space_live = 0;
     }
+    sparc64_guest_proc_forget(&g);
     /* Loader/runner failures collapse to 1; guest and difftest codes
      * (including difftest's 2 = agreement without exit) pass through. */
     return rc < 0 ? 1 : rc;
@@ -727,43 +825,71 @@ int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
         (void)close(fd);
         return -ENOEXEC;
     }
+    uint64_t start_entry = img.entry, interp_base = 0;
+    char interp[SPARC64RT_INTERP_PATH_MAX];
+    char resolved[SPARC64RT_INTERP_PATH_MAX];
     memset(&ng, 0, sizeof(ng));
+    memset(interp, 0, sizeof(interp));
+    memset(resolved, 0, sizeof(resolved));
     sparc64_space_init(&ng.space, 64);
     ng.space_live = 1;
     ng.dbt = g->dbt;
     ng.host_tid = (long)getpid();
     ng.tid_addr = 0U;
     rc = load_segments(fd, &ng, bias, img.phoff, img.phnum, img.phoff,
-        &heap_hi, &guest_phdr);
+        &heap_hi, &guest_phdr, interp, path);
     (void)close(fd);
     fd = -1;
     if (rc != 0) {
         sparc64_space_destroy(&ng.space);
+        sparc64_guest_proc_forget(&ng);
         return (rc == -LOAD_NOMEM) ? -ENOMEM : -ENOEXEC;
+    }
+    if (interp[0] != '\0') {
+        uint64_t ld_entry = 0, ld_base = 0;
+        rc = load_interp(&ng, interp, &ld_entry, &ld_base, resolved);
+        if (rc != 0) {
+            sparc64_space_destroy(&ng.space);
+            sparc64_guest_proc_forget(&ng);
+            return (rc == -LOAD_NOMEM) ? -ENOMEM : -ENOEXEC;
+        }
+        start_entry = ld_entry;
+        interp_base = ld_base;
     }
     ng.brk_base = align_up(heap_hi, GUEST_PAGE_SIZE);
     ng.brk_cur = ng.brk_base;
-    rc = build_stack(&ng, guest_phdr, img.entry, img.phnum, img.phent,
-        argv, argc, &sp);
+    if (interp_base != UINT64_C(0)) {
+        rc = build_stack_dyn(&ng, guest_phdr, img.entry, img.phnum,
+            img.phent, interp_base, argv, argc, &sp);
+    } else {
+        rc = build_stack(&ng, guest_phdr, img.entry, img.phnum, img.phent,
+            argv, argc, &sp);
+    }
     if (rc != 0) {
         sparc64_space_destroy(&ng.space);
+        sparc64_guest_proc_forget(&ng);
         return rc;
     }
+    sparc64_guest_proc_note_exec(&ng, path);
     /* Commit: move the fresh registry over the old space. Both spaces
      * use the default heap factory (no external managed context), so
-     * the struct move transfers ownership cleanly. */
+     * the struct move transfers ownership cleanly. The fresh proc
+     * snapshot replaces the old one (execve atomicity). */
     if (g->space_live) {
         sparc64_space_destroy(&g->space);
         g->space_live = 0;
     }
+    sparc64_guest_proc_forget(g);
     g->space = ng.space;
     g->space_live = 1;
     ng.space_live = 0;
+    g->proc = ng.proc;
+    ng.proc = NULL;
     g->brk_base = ng.brk_base;
     g->brk_cur = ng.brk_cur;
     g->tid_addr = 0U;
     g->host_tid = (long)getpid();
-    sparc64_ctx_init(ctx, img.entry);
+    sparc64_ctx_init(ctx, start_entry);
     ctx->r[SPARC64_SP] = sp;
     /* Fresh windows (E01): CWP 0, no invalid windows, so the first
      * SAVE/RESTORE pair rotates in-register without spill/fill. */

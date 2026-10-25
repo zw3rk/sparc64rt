@@ -45,6 +45,7 @@
 #endif
 
 #include "core/cpu.h"
+#include "os/guest_proc.h"
 #include "os/sigframe_sparc64rt.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
@@ -196,9 +197,35 @@ long sparc64_l2a_openat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     if (rc != 0) {
         return rc;
     }
+    /* Phase 5 L5a: /proc/self files are synthetic (exe/maps/cmdline/
+     * stat/auxv); anything else falls through to the host. */
+    if (sparc64_guest_proc_handles(path)) {
+        return sparc64_guest_proc_openat(mem->context, mem, path,
+            host_flags);
+    }
     host_dirfd = ((int64_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd;
     fd = openat(host_dirfd, path, host_flags, (mode_t)(mode & 0777U));
     return (fd < 0) ? -(long)errno : (long)fd;
+}
+
+/* open(5) is openat(AT_FDCWD) (same interception included). */
+long sparc64_l2a_open(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
+    uint64_t path_va, uint64_t flags, uint64_t mode)
+{
+    return sparc64_l2a_openat(ctx, mem, (uint64_t)(int64_t)SP_AT_FDCWD,
+        path_va, flags, mode);
+}
+
+/* readlinkat(294): synthetic paths served by src/os/guest_proc.c
+ * (exe yields argv[0], other synthetic files are EINVAL), the rest
+ * is the host readlinkat. */
+long sparc64_l2a_readlinkat(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t dirfd, uint64_t path_va,
+    uint64_t buf_va, uint64_t bufsz)
+{
+    (void)ctx;
+    return sparc64_guest_proc_readlinkat(mem->context, mem, dirfd,
+        path_va, buf_va, bufsz);
 }
 
 long sparc64_l2a_getpid(void) { return (long)getpid(); }

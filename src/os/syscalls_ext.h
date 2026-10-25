@@ -168,9 +168,20 @@ long sparc64_l2a_readv(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
 long sparc64_l2a_writev(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t fd, uint64_t iov_va, uint64_t iovcnt);
 
-/* Path open with SPARC O_* flag translation. */
+/* Path open with SPARC O_* flag translation (/proc/self files are
+ * synthetic per src/os/guest_proc.h). */
 long sparc64_l2a_openat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t dirfd, uint64_t path_va, uint64_t flags, uint64_t mode);
+
+/* open(5): openat(AT_FDCWD), same interception. */
+long sparc64_l2a_open(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
+    uint64_t path_va, uint64_t flags, uint64_t mode);
+
+/* readlinkat(294): /proc/self/exe yields argv[0]; other synthetic
+ * files are EINVAL; the rest is the host readlinkat. */
+long sparc64_l2a_readlinkat(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t dirfd, uint64_t path_va,
+    uint64_t buf_va, uint64_t bufsz);
 
 /* Descriptor control (SPARC F_* numbers match the host F_* numbers). */
 long sparc64_l2a_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
