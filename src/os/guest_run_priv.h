@@ -69,4 +69,10 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
 int run_difftest(guest_state_t *g, sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *ops);
 
+/* Phase 4 L4b thread decls: the host-thread entry reusing run_interp/
+ * run_dbt per thread lives in guest_engines.c; the table, futex,
+ * clone/gettid/robust bodies and the host-atomic fast path live in
+ * src/os/threads.c (see src/os/threads.h). */
+void *sparc64_thread_entry(void *arg);
+
 #endif /* SPARC64RT_OS_GUEST_RUN_PRIV_H */

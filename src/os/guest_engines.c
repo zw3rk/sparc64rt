@@ -21,6 +21,7 @@
 #include "os/guest_run_priv.h"
 #include "os/sync_sig.h"
 #include "os/syscalls_min.h"
+#include "os/threads.h"
 
 /* ---- Engine runners ------------------------------------------------------- */
 
@@ -36,10 +37,11 @@ static int run_deliver_trap(guest_state_t *g, sparc64_ctx_t *ctx,
         return 0;
     }
     (void)fprintf(stderr,
-                  "sparc64rt: unhandled guest trap: cause=%d pc=0x%llx tval=0x%llx\n",
+                  "sparc64rt: unhandled guest trap: cause=%d pc=0x%llx tval=0x%llx memreason=%d\n",
                   (int)step->cause,
                   (unsigned long long)step->pc,
-                  (unsigned long long)step->tval);
+                  (unsigned long long)step->tval,
+                  (int)step->memory_reason);
     return 1;
 }
 
@@ -194,6 +196,16 @@ static int engine_longjmp_trap(sparc64_ctx_t *ctx,
 int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *ops)
 {
+    /* L4b: register the main thread and serialize execution across
+     * threads (shared interp winfile / shared space metadata). Child
+     * threads reuse this same loop; futex WAIT drops the lock while
+     * it sleeps so a waker can run. */
+    sparc64_threads_boot(ops, 0, ctx);
+    sparc64_thread_big_lock();
+    /* Every lock acquisition starts with a clean window cache (see the
+     * futex handoff in threads.c): cached images belong to whichever
+     * thread cached them, so refill from our own homes on demand. */
+    sparc64_win_invalidate_all();
     for (;;) {
         sparc64_step_result_t step = sparc64_step(ctx, &guest_mem_ops, g);
         if (step.kind == SPARC64_STEP_SYSCALL) {
@@ -210,11 +222,13 @@ int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,
                 long nr = (long)ctx->r[SPARC64_G1];
                 long status = sparc64_handle_syscall(ctx, ops);
                 if (sparc64_syscall_is_exit(nr)) {
+                    sparc64_thread_big_unlock();
                     return (int)(status & 0xffL);
                 }
             }
         } else if (step.kind == SPARC64_STEP_TRAP) {
             if (run_deliver_trap(g, ctx, ops, &step) != 0) {
+                sparc64_thread_big_unlock();
                 return 1;
             }
         } else if (step.kind != SPARC64_STEP_CONTINUE) {
@@ -222,6 +236,7 @@ int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,
                           "sparc64rt: guest stopped: kind=%d cause=%d pc=0x%llx\n",
                           (int)step.kind, (int)step.cause,
                           (unsigned long long)step.pc);
+            sparc64_thread_big_unlock();
             return 1;
         }
     }
@@ -237,11 +252,20 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
         (void)fprintf(stderr, "sparc64rt: cannot init DBT\n");
         return 1;
     }
+    /* L4b: same boot/serialization as run_interp. DBT instances stay
+     * per-thread (no cache locking); re-assert g->dbt every iteration
+     * because a sibling thread may have pointed it at its own DBT
+     * while this thread slept in a blocking syscall. */
+    sparc64_threads_boot(ops, 1, ctx);
+    sparc64_thread_big_lock();
+    /* Same clean-cache rule as the interp loop (shared winfile). */
+    sparc64_win_invalidate_all();
     g->dbt = &dbt;
     rc = 1;
     for (;;) {
-        sparc64_step_result_t step = sparc64_dbt_run(ctx, &guest_mem_ops,
-            g, &dbt);
+        sparc64_step_result_t step;
+        g->dbt = &dbt;
+        step = sparc64_dbt_run(ctx, &guest_mem_ops, g, &dbt);
         if (step.kind == SPARC64_STEP_SYSCALL) {
             unsigned trapno = engine_trapno(ops, step.pc);
             if (trapno == 0x6eU) {
@@ -273,8 +297,35 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
         }
     }
     g->dbt = NULL;
+    sparc64_thread_big_unlock();
     sparc64_dbt_fini(&dbt);
     return rc;
+}
+
+/* ---- Phase 4 L4b thread entry/loop ---------------------------------------- */
+
+/* Host-thread entry for one CLONE_VM thread: reuse the engine loop the
+ * process booted with (interp or DBT) on the slot's own ctx, then
+ * finalize through threads.c (CLEARTID + wake, group-exit record). The
+ * engine loop re-acquires the big guest lock; a terminal exit there is
+ * a group exit per the lane contract. */
+void *sparc64_thread_entry(void *arg)
+{
+    sparc64_thread_t *slot = (sparc64_thread_t *)arg;
+    guest_state_t *g;
+    long rc;
+    if (slot == NULL) {
+        return NULL;
+    }
+    sparc64_thread_entry_started(slot);
+    g = (guest_state_t *)slot->space_ctx;
+    if (slot->engine == 1) {
+        rc = (long)run_dbt(g, slot->ctx_ref, slot->ops);
+    } else {
+        rc = (long)run_interp(g, slot->ctx_ref, slot->ops);
+    }
+    sparc64_thread_entry_done(slot, rc);
+    return NULL;
 }
 
 /* Difftest syscall hook: run once on the interp copy, mirror to dbt. */

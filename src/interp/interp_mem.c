@@ -13,6 +13,7 @@
  */
 
 #include "interp/interp_mem.h"
+#include "os/threads.h"
 
 static uint64_t swap_bytes(uint64_t v, unsigned size)
 {
@@ -596,6 +597,12 @@ sparc64_step_result_t sparc64_exec_atomic(sparc64_cpu_t *cpu,
         d->op3 == SPARC64_OP3_CASA || d->op3 == SPARC64_OP3_CASXA;
     uint64_t old = UINT64_C(0);
     sparc64_step_result_t res;
+    /* L4b: single-copy host-__atomic fast path on the shared mapping
+     * first; anything it declines (unmapped, page-crossing, misaligned,
+     * non-data ASI) falls through to the reservation path unchanged. */
+    if (sparc64_threads_try_host_atomic(cpu, mc, pc, d, &res)) {
+        return res;
+    }
     if (alt && !sparc64_asi_check(pc, d, &little, &res)) {
         return res;
     }
