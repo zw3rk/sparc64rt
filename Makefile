@@ -10,6 +10,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help all build check check-line-limits check-abi-invariants clean
+MAKEFLAGS += -j8
 
 BUILD_DIR := _build
 A64_CC ?= aarch64-unknown-linux-musl-gcc
@@ -18,7 +19,7 @@ HOST_CC ?= cc
 # Curated C11, no VLAs, no Annex K, no <threads.h>, no _Generic.
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra
-CPPFLAGS += -Isrc -Isrc/rt64
+CPPFLAGS += -Isrc -Isrc/rt64 -Iinclude
 LDFLAGS_STATIC_PIE := -static-pie
 
 # Four carried files stay out of the Phase 0 link until their later lanes
@@ -64,11 +65,11 @@ $(BUILD_DIR)/sparc64rt: $(OBJS)
 	$(A64_CC) $(CFLAGS) $(CPPFLAGS) -fPIE $(LDFLAGS_STATIC_PIE) \
 		$(OBJS) -o $@
 
-$(OBJ_DIR)/%.o: src/%.c Makefile
+$(OBJ_DIR)/%.o: src/%.c Makefile $(shell find src include -name '*.h')
 	@mkdir -p $(dir $@)
 	$(A64_CC) $(CFLAGS) $(CPPFLAGS) -fPIE -c $< -o $@
 
-$(OBJ_DIR)/%.o: src/%.S Makefile
+$(OBJ_DIR)/%.o: src/%.S Makefile $(shell find src include -name '*.h')
 	@mkdir -p $(dir $@)
 	$(A64_CC) $(CFLAGS) $(CPPFLAGS) -fPIE -c $< -o $@
 

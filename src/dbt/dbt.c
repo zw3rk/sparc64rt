@@ -4,14 +4,15 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 2 lane L2b (docs/lanes/phase-2.md). The block cache, W^X code
- * arena, direct-chaining dispatcher, IBTC, and RAS live here; integer
- * lowering is L2c's src/dbt/emit_int.h. Until that merge, every block
- * executes through the shared reference interpreter (sparc64_step over
- * sparc64_mem_ops_t, never a direct host dereference of guest VA), so
- * interp and dbt observe one window/memory model for difftest parity.
- * Blocks the classifier marks PRIV/FPU/FBR/ILLEGAL always take this
- * interpreter fallback with identical protocol.
+ * Phase 2 lane L2b (docs/lanes/phase-2.md) plus coordinator RC2 emission
+ * wiring. The block cache, W^X code arena, direct-chaining dispatcher,
+ * IBTC, and RAS live here; integer lowering is L2c's src/dbt/emit_int.h
+ * (dbt_emit_range below). Emitted blocks run natively through the
+ * trampoline and exit back per instruction (BRANCH chains, SYSCALL
+ * stops, anything else replays one interpreter step for precise traps).
+ * Blocks the classifier marks PRIV/FPU/FBR/ILLEGAL, or whose delay slot
+ * the emitter refuses, always take the interpreter fallback with
+ * identical protocol.
  *
  * Exit reporting: sparc64_dbt_run returns the first non-CONTINUE step
  * result (SYSCALL with no register or pc change, precise TRAP with
@@ -34,10 +35,23 @@
 
 #include "a32host.h"
 #include "dbt/dbt.h"
+#include "dbt/emit_int.h"
 #include "interp/interp.h"
+
+/* Trampoline entries (trampoline_a64.S): ctx in x0, fragment entry in
+ * x1, chaining entry in x2 (unused by exit-to-dispatcher fragments),
+ * epoch word in x3. enter_step additionally pins x28 at a zero word
+ * so any future epoch-gated chain probe bails after one fragment. */
+extern void sparc64_dbt_enter(sparc64_ctx_t *ctx, const void *entry,
+    const void *chain, const void *epoch);
+extern void sparc64_dbt_enter_step(sparc64_ctx_t *ctx, const void *entry,
+    const void *chain, const void *epoch);
 
 /* Staging reserved per translated block for future L2c emission. */
 #define DBT_STAGE_BYTES_PER_BLOCK 64U
+/* Staging per emitted block (worst case: 64 insns plus delay slot). */
+#define DBT_EMIT_STAGE_BYTES (4096U * 3U)
+#define DBT_EMIT_STAGE_WORDS (DBT_EMIT_STAGE_BYTES / 4U)
 /* Invalidate wider than this many pages courses to a full flush. */
 #define DBT_MAX_PRECISE_PAGES 4096U
 
@@ -208,6 +222,143 @@ static bool dbt_is_cti(const sparc64_dec_t *d)
         d->cls == (uint8_t)SPARC64_ICLS_TCC;
 }
 
+/* ---- L2c emission (coordinator, RC2) ---- */
+
+/* A delay slot is emittable only as a plain data/control op: a CTI,
+ * Tcc, privileged, FPU, or illegal delay ends the block before the CTI
+ * (the emitter refuses it and the interpreter replays both). */
+static bool dbt_delay_emittable(const sparc64_dec_t *d)
+{
+    switch (d->cls) {
+    case SPARC64_ICLS_LOAD:
+    case SPARC64_ICLS_STORE:
+    case SPARC64_ICLS_ATOMIC:
+    case SPARC64_ICLS_ALU:
+    case SPARC64_ICLS_SHIFT:
+    case SPARC64_ICLS_RDASR:
+    case SPARC64_ICLS_WRASR:
+    case SPARC64_ICLS_MOVCC:
+    case SPARC64_ICLS_MOVR:
+    case SPARC64_ICLS_ALIGN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Emit [pc, end) into fresh arena staging. Returns the entry on success,
+ * NULL when anything refuses (caller keeps the interpreter fallback and
+ * rewinds the unused staging). CTI/Tcc always terminate [pc, end), so a
+ * CTI here owns its delay slot at a + 4. */
+static const void *dbt_emit_range(sparc64_dbt_t *dbt,
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t pc, uint64_t end)
+{
+    uint8_t *stage = dbt_stage(dbt, (size_t)DBT_EMIT_STAGE_BYTES);
+    size_t used_before;
+    sparc64_dbt_buf_t buf;
+    sparc64_emit_ctx_t ec;
+    uint64_t a;
+    if (stage == NULL) {
+        return NULL;
+    }
+    used_before = dbt->arena_used - (size_t)DBT_EMIT_STAGE_BYTES;
+    buf.words = (uint32_t *)stage;
+    buf.count = 0U;
+    buf.capacity = DBT_EMIT_STAGE_WORDS;
+    buf.overflow = false;
+    buf.is_call = false;
+    ec.buf = &buf;
+    ec.mem = mem;
+    ec.mc = mc;
+    ec.delay = NULL;
+    a = pc;
+    while (a < end) {
+        sparc64_dec_t d;
+        bool term_here;
+        ec.pc = a;
+        ec.fault_pc = a;
+        ec.delay = NULL;
+        if (!dbt_fetch_classify(mem, mc, a, &d)) {
+            goto fail;
+        }
+        if (d.cls != (uint8_t)SPARC64_ICLS_TCC && dbt_is_cti(&d)) {
+            /* CTI plus delay slot ends the range and self-terminates. */
+            sparc64_dec_t dl;
+            if (!dbt_fetch_classify(mem, mc, a + 4U, &dl) ||
+                !dbt_delay_emittable(&dl)) {
+                goto fail;
+            }
+            ec.delay = &dl;
+            if (!sparc64_emit_int(&ec, &d)) {
+                goto fail;
+            }
+            break;
+        }
+        /* Tcc with a live condition self-terminates; everything else
+         * (plain insns, never-trapping Tcc) needs a fall-through exit
+         * at the range end. */
+        term_here = d.cls == (uint8_t)SPARC64_ICLS_TCC && d.cond != 0U;
+        if (!sparc64_emit_int(&ec, &d)) {
+            goto fail;
+        }
+        a += 4U;
+        if (a == end && !term_here) {
+            e_exit_imm(&buf, end, (uint32_t)SPARC64_EXIT_BRANCH);
+        }
+    }
+    if (buf.overflow) {
+        goto fail;
+    }
+    return (const void *)stage;
+fail:
+    dbt->arena_used = used_before;
+    return NULL;
+}
+
+/* Commit one fragment exit into ctx; returns the step-shaped outcome.
+ * BRANCH chains (CONTINUE with advanced pc/npc), SYSCALL stops without
+ * advancing (the caller runs the handler), anything else replays one
+ * interpreter step from the exit PC so traps stay precise. */
+static sparc64_step_result_t dbt_commit_exit(sparc64_ctx_t *ctx,
+    const sparc64_mem_ops_t *mem, void *mc)
+{
+    sparc64_step_result_t r;
+    uint32_t why = ctx->exit_reason;
+    uint64_t dst = ctx->exit_dest;
+    if (why == SPARC64_EXIT_BRANCH) {
+        ctx->pc = dst;
+        ctx->npc = dst + 4U;
+        return sparc64_step_ok(dst);
+    }
+    if (why == SPARC64_EXIT_SYSCALL) {
+        ctx->pc = dst;
+        ctx->npc = dst + 4U;
+        r.kind = SPARC64_STEP_SYSCALL;
+        r.cause = SPARC64_TRAP_ILLEGAL;
+        r.pc = dst;
+        r.tval = UINT64_C(0);
+        r.length = 4U;
+        r.memory_reason = SPARC64_MEM_FAULT_NONE;
+        return r;
+    }
+    ctx->pc = dst;
+    ctx->npc = dst + 4U;
+    return sparc64_step(ctx, mem, mc);
+}
+
+/* Enter one emitted fragment and commit its exit. */
+static sparc64_step_result_t dbt_enter_block(sparc64_ctx_t *ctx,
+    const sparc64_mem_ops_t *mem, void *mc, sparc64_dbt_t *dbt,
+    const void *code, bool single)
+{
+    if (single) {
+        sparc64_dbt_enter_step(ctx, code, NULL, &dbt->epoch);
+    } else {
+        sparc64_dbt_enter(ctx, code, NULL, &dbt->epoch);
+    }
+    return dbt_commit_exit(ctx, mem, mc);
+}
+
 /* ---- Translation: classify a block, stage room, install metadata ---- */
 
 static const sparc64_dbt_block_t *dbt_translate(
@@ -224,7 +375,7 @@ static const sparc64_dbt_block_t *dbt_translate(
     bool indirect = false;
     bool needs_interp = false;
     bool stop = false;
-    void *staging;
+    void *staging = NULL;
 
     while (n < SPARC64_DBT_MAX_INSNS_PER_BLOCK && !stop) {
         sparc64_dec_t d;
@@ -292,7 +443,17 @@ static const sparc64_dbt_block_t *dbt_translate(
         }
     }
 
-    staging = dbt_stage(dbt, (size_t)DBT_STAGE_BYTES_PER_BLOCK);
+    if (!needs_interp) {
+        const void *code = dbt_emit_range(dbt, mem, mc, pc, end);
+        if (code == NULL) {
+            needs_interp = true;
+        } else {
+            staging = (void *)code;
+        }
+    }
+    if (staging == NULL && !needs_interp) {
+        staging = dbt_stage(dbt, (size_t)DBT_STAGE_BYTES_PER_BLOCK);
+    }
     b->start_pc = pc;
     b->end_pc = end;
     b->n_insns = n;
@@ -307,6 +468,43 @@ static const sparc64_dbt_block_t *dbt_translate(
     dbt->cached_count += 1U;
     dbt->stat_blocks += 1U;
     return b;
+}
+
+/* Single-instruction step for difftest lockstep (a CTI plus its delay
+ * slot counts as one step, matching sparc64_step). Emits at most the
+ * pair into scratch staging, enters it once, and commits the exit;
+ * falls back to the interpreter whenever anything refuses, so every
+ * natively executed step is exactly what the block runner executes. */
+sparc64_step_result_t sparc64_dbt_step_one(sparc64_dbt_t *dbt,
+    sparc64_ctx_t *ctx, const sparc64_mem_ops_t *mem, void *mc)
+{
+    uint64_t pc = ctx->pc;
+    sparc64_dec_t d;
+    uint64_t span = 4U;
+    const void *code;
+    if (dbt == NULL) {
+        return sparc64_step(ctx, mem, mc);
+    }
+    if (!dbt_fetch_classify(mem, mc, pc, &d)) {
+        sparc64_step_result_t fail;
+        (void)sparc64_fetch_word(mem, mc, pc, &(uint32_t){ 0U },
+            &fail);
+        return fail;
+    }
+    if (d.cls != (uint8_t)SPARC64_ICLS_TCC && dbt_is_cti(&d)) {
+        sparc64_dec_t dl;
+        if (!dbt_fetch_classify(mem, mc, pc + 4U, &dl) ||
+            !dbt_delay_emittable(&dl)) {
+            return sparc64_step(ctx, mem, mc);
+        }
+        span = 8U;
+    }
+    code = dbt_emit_range(dbt, mem, mc, pc, pc + span);
+    if (code == NULL) {
+        return sparc64_step(ctx, mem, mc);
+    }
+    dbt_publish(dbt);
+    return dbt_enter_block(ctx, mem, mc, dbt, code, false);
 }
 
 static const sparc64_dbt_block_t *dbt_lookup(
@@ -375,6 +573,11 @@ static bool dbt_ras_match(const sparc64_dbt_t *dbt, uint64_t pc)
 static void dbt_note_transfer(sparc64_dbt_t *dbt, const sparc64_dec_t *d,
     uint64_t npc0, uint64_t target)
 {
+    /* Emitted blocks report exits directly (NULL here): RAS/IBTC fills
+     * are stats-only, so there is nothing to record for them. */
+    if (d == NULL) {
+        return;
+    }
     if (d->cls == (uint8_t)SPARC64_ICLS_CALL ||
         (d->cls == (uint8_t)SPARC64_ICLS_JMPL &&
             d->rd == (uint8_t)SPARC64_O7)) {
@@ -435,6 +638,17 @@ sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
             dbt_ibtc_fill(dbt, ctx->pc, dbt_cache_index(ctx->pc));
         }
         ctx->blocks_executed += 1U;
+        if (!b->needs_interp && b->host_code != NULL) {
+            sparc64_step_result_t r;
+            dbt_publish(dbt);
+            r = dbt_enter_block(ctx, mem, mc, dbt, b->host_code,
+                false);
+            dbt_note_transfer(dbt, NULL, ctx->pc, 0U);
+            if (r.kind != SPARC64_STEP_CONTINUE) {
+                return r;
+            }
+            continue;
+        }
         for (i = 0U; i < b->n_insns; i++) {
             sparc64_dec_t d;
             uint64_t npc0 = ctx->npc;

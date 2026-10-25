@@ -21,6 +21,24 @@
  * file serves one guest thread (matches the Phase 1 single-threaded
  * interpreter; Phase 4 threads need a side table). */
 static uint64_t interp_winfile[SPARC64_NWINDOWS][16];
+/* Home stack pointer per window: interp_winsp[w] is the %sp of the frame
+ * whose L/I image sits in interp_winfile[w] (0 when w was never stashed,
+ * e.g. fresh windows at the depth-8 boundary). Maintained on every stash
+ * and fill so spill, fill, and flush_all address the frame's own
+ * [%sp + 2047] slot; Phase 4 fork must copy this beside winfile. */
+static uint64_t interp_winsp[SPARC64_NWINDOWS];
+/* Validity per window: win_valid[w] means winfile[w] holds the image of
+ * an outstanding frame (fresh enough to reactivate without a fill).
+ * Fresh windows start invalid; a SAVE stash validates the switched-out
+ * (still outstanding) frame, a RESTORE stash records a dying frame and
+ * so invalidates its source at once, and a fill validates its target.
+ * Spill/flush consult validity, never the saturating cansave/canrestore
+ * counters (those cap at 7 and lose count past 8 nested frames, causing
+ * spurious fills that clobber resident images and poison winsp and the
+ * %o6 chain). Validity implies the frame is outstanding, so its home
+ * slot cannot overlap live descendant stack data; dead images are never
+ * written back. Phase 4 fork must copy this beside winfile. */
+static bool win_valid[SPARC64_NWINDOWS];
 
 /* Fresh-process init is lazy: sparc64_ctx_init() zeroes the counters, and
  * the first SAVE/RESTORE arms CANSAVE = NWINDOWS - 1. The pattern only
@@ -36,16 +54,15 @@ static void win_lazy_init(sparc64_cpu_t *cpu)
     }
 }
 
-/* Spill winfile[w] (16 x 64-bit l/i) big-endian to [va, va + 128). */
-static bool win_spill_to(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
-    void *mc, unsigned w, uint64_t va, sparc64_step_result_t *res,
+/* Spill a 16-register (l/i) image big-endian to [va, va + 128). */
+static bool win_spill_to(const sparc64_mem_ops_t *mem, void *mc,
+    const uint64_t img[16], uint64_t va, sparc64_step_result_t *res,
     uint64_t pc)
 {
     uint8_t buf[SPARC64_RWINDOW_SIZE];
     unsigned i;
-    (void)cpu;
     for (i = 0; i < 16U; i++) {
-        uint64_t v = interp_winfile[w][i];
+        uint64_t v = img[i];
         buf[8U * i] = (uint8_t)(v >> 56);
         buf[8U * i + 1U] = (uint8_t)(v >> 48);
         buf[8U * i + 2U] = (uint8_t)(v >> 40);
@@ -93,12 +110,18 @@ bool sparc64_win_save(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     uint64_t old_o[8];
     win_lazy_init(cpu);
     tgt = (cpu->cwp + SPARC64_NWINDOWS - 1U) % SPARC64_NWINDOWS;
-    if (cpu->cansave == 0U) {
-        /* Overflow: preserve the reused window on the new stack first. */
-        if (!win_spill_to(cpu, mem, mc, tgt, sum + SPARC64_STACK_BIAS, res,
-                pc)) {
+    if (win_valid[tgt]) {
+        /* Reuse of a window holding an outstanding frame: preserve it in
+         * its own home slot first (valid implies outstanding, and the
+         * recorded home equals the later fill's post_sp slot). An
+         * invalid tgt holds nothing needed (fresh or dead image): reuse
+         * it directly, no memory traffic. */
+        if (!win_spill_to(mem, mc, interp_winfile[tgt],
+                interp_winsp[tgt] + SPARC64_STACK_BIAS, res, pc)) {
             return false;
         }
+    }
+    if (cpu->cansave == 0U) {
         cpu->cansave = 1U;
     }
     for (i = 0; i < 8U; i++) {
@@ -109,6 +132,8 @@ bool sparc64_win_save(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
         interp_winfile[cpu->cwp][8U + i] =
             sparc64_rreg(cpu, SPARC64_I0 + i);
     }
+    interp_winsp[cpu->cwp] = sparc64_rreg(cpu, SPARC64_SP);
+    win_valid[cpu->cwp] = true;
     for (i = 0; i < 8U; i++) {
         sparc64_wreg(cpu, SPARC64_I0 + i, old_o[i]);
         sparc64_wreg(cpu, SPARC64_L0 + i, interp_winfile[tgt][i]);
@@ -141,13 +166,22 @@ bool sparc64_win_restore(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
         interp_winfile[cpu->cwp][8U + i] =
             sparc64_rreg(cpu, SPARC64_I0 + i);
     }
-    if (cpu->canrestore == 0U) {
-        /* Underflow: refill the target from the caller stack first. */
+    interp_winsp[cpu->cwp] = sparc64_rreg(cpu, SPARC64_SP);
+    /* The switched-out frame dies with this pop: its window copy must not
+     * be mistaken for an outstanding image by a later reuse or flush. */
+    win_valid[cpu->cwp] = false;
+    if (!win_valid[tgt]) {
+        /* The target holds nothing usable (fresh, evicted, or longjmp-
+         * invalidated): refill it from its home slot. */
         if (!win_fill_from(cpu, mem, mc, tgt, post_sp + SPARC64_STACK_BIAS,
                 res, pc)) {
             return false;
         }
-        cpu->canrestore = 1U;
+        interp_winsp[tgt] = post_sp;
+        win_valid[tgt] = true;
+        if (cpu->canrestore == 0U) {
+            cpu->canrestore = 1U;
+        }
     }
     for (i = 0; i < 8U; i++) {
         sparc64_wreg(cpu, SPARC64_O0 + i, old_i[i]);
@@ -163,6 +197,53 @@ bool sparc64_win_restore(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     return true;
 }
 
+/* Flush every outstanding window image to its architectural home: the
+ * live window from live registers, each stashed window from winfile to
+ * its recorded [winsp + 2047] slot. After a flush, stack and winfile
+ * agree, so later underflow fills are idempotent. Used by the setjmp
+ * trap (ta 0x6e) before snapshotting; the matching longjmp unwinds
+ * through win_restore, rebuilding winfile from these same slots. */
+bool sparc64_win_flush_all(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
+    void *mc, sparc64_step_result_t *res, uint64_t pc)
+{
+    unsigned w;
+    unsigned i;
+    uint64_t live[16];
+    for (i = 0U; i < 8U; i++) {
+        live[i] = sparc64_rreg(cpu, SPARC64_L0 + i);
+        live[8U + i] = sparc64_rreg(cpu, SPARC64_I0 + i);
+    }
+    if (!win_spill_to(mem, mc, live,
+            sparc64_rreg(cpu, SPARC64_SP) + SPARC64_STACK_BIAS, res,
+            pc)) {
+        return false;
+    }
+    for (w = 0U; w < SPARC64_NWINDOWS; w++) {
+        /* Only outstanding (valid) images are written back: dead images'
+         * home slots are live stack space now, and touching them would
+         * clobber descendant frames. */
+        if (w == cpu->cwp || !win_valid[w]) {
+            continue;
+        }
+        if (!win_spill_to(mem, mc, interp_winfile[w],
+                interp_winsp[w] + SPARC64_STACK_BIAS, res, pc)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Drop every cached image (longjmp trap): the handler frames clobbered
+ * winfile, so the subsequent unwind refills each reactivated window from
+ * its flushed home slot instead of trusting the cache. */
+void sparc64_win_invalidate_all(void)
+{
+    unsigned w;
+    for (w = 0U; w < SPARC64_NWINDOWS; w++) {
+        win_valid[w] = false;
+    }
+}
+
 /* ---- Architectural condition codes (E02 + RC1 probes) --------------------
  * V9 integer ops set icc from the low 32 bits and xcc from the full 64
  * bits (E02 FINDINGS: addcc(0xffffffff,1) -> ccr 0x05; addcc(-1,1) ->
@@ -171,6 +252,48 @@ bool sparc64_win_restore(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
  * because low32 halves are equal, and N=0/C=0 likewise from low32).
  * SLL/SRL (x=0) shift the full 64 bits (raw-byte probes t.S/t5), while
  * SRA (x=0) sign-extends bit 31. */
+
+/* Bicc/BPcc/Ticc/MOVcc condition over one 4-bit N/Z/V/C nibble
+ * (bit 3 N, bit 2 Z, bit 1 V, bit 0 C). */
+bool sparc64_eval_cond(unsigned cond, unsigned nibble)
+{
+    bool n = (nibble & 8U) != 0U;
+    bool z = (nibble & 4U) != 0U;
+    bool v = (nibble & 2U) != 0U;
+    bool c = (nibble & 1U) != 0U;
+    switch (cond & 15U) {
+    case 0x0U: return false;
+    case 0x1U: return z;
+    case 0x2U: return z || (n != v);
+    case 0x3U: return n != v;
+    case 0x4U: return c || z;
+    case 0x5U: return c;
+    case 0x6U: return n;
+    case 0x7U: return v;
+    case 0x8U: return true;
+    case 0x9U: return !z;
+    case 0xAU: return !(z || (n != v));
+    case 0xBU: return n == v;
+    case 0xCU: return !(c || z);
+    case 0xDU: return !c;
+    case 0xEU: return !n;
+    default: return !v;
+    }
+}
+
+/* BPr/MOVr register test over the full 64-bit value. rcond skips 4. */
+bool sparc64_eval_rcond(unsigned rcond, uint64_t v)
+{
+    switch (rcond & 15U) {
+    case 1U: return v == UINT64_C(0);
+    case 2U: return (int64_t)v <= (int64_t)0;
+    case 3U: return (int64_t)v < (int64_t)0;
+    case 5U: return v != UINT64_C(0);
+    case 6U: return (int64_t)v > (int64_t)0;
+    case 7U: return (int64_t)v >= (int64_t)0;
+    default: return false;
+    }
+}
 
 /* Logic ops clear V/C; N/Z come from bit 31/low32-zero (icc) and bit 63 /
  * full-zero (xcc). */
@@ -641,13 +764,17 @@ sparc64_step_result_t sparc64_exec_mov(sparc64_cpu_t *cpu, uint64_t pc,
     return sparc64_step_ok(pc);
 }
 
-/* User state registers: %y/%ccr/%asi/%fprs/%gsr. */
+/* User state registers: %y/%ccr/%asi/%pc/%fprs/%gsr (RDPC reads the
+ * address of the instruction itself, V9 6.6.5). */
 sparc64_step_result_t sparc64_exec_rdasr(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
     switch (d->rs1) {
     case SPARC64_ASR_Y:
         sparc64_wreg(cpu, d->rd, cpu->y);
+        break;
+    case SPARC64_ASR_PC:
+        sparc64_wreg(cpu, d->rd, pc);
         break;
     case SPARC64_ASR_CCR:
         sparc64_wreg(cpu, d->rd, cpu->ccr & UINT64_C(0xff));

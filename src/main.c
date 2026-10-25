@@ -101,14 +101,14 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* Phase 1: run the guest through the reference interpreter.
-     * The DBT engine lands in Phase 2; --dbt/--difftest without it is
-     * an error, not a silent fallback. */
-    if (engine == SPARC64_ENGINE_DBT || difftest) {
-        (void)fprintf(stderr,
-                      "sparc64rt: dbt engine not yet available (Phase 2)\n");
-        return 2;
-    }
+    /* Engine dispatch: --dbt runs the AArch64 DBT, --difftest the
+     * lockstep harness, anything else (or --interp) the interpreter. */
     (void)trace;
+    if (difftest) {
+        return sparc64_guest_run_engine(guest, &argv[guest_index], 2);
+    }
+    if (engine == SPARC64_ENGINE_DBT) {
+        return sparc64_guest_run_engine(guest, &argv[guest_index], 1);
+    }
     return sparc64_guest_run(guest, &argv[guest_index], 1);
 }

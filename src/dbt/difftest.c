@@ -26,6 +26,7 @@
 #include "core/cpu.h"
 #include "dbt/difftest.h"
 #include "interp/decode.h"
+#include "os/sync_sig.h"
 
 /* Hang guard: the P2 static-libc guests terminate in well under this. */
 #define DIFFTEST_DEFAULT_MAX_STEPS 100000000UL
@@ -242,9 +243,19 @@ static difftest_rmw_t difftest_rmw_snap(const sparc64_difftest_cfg_t *cfg,
     default:
         return s;
     }
-    va = difftest_reg(ctx, d.rs1) +
-        ((d.is_imm != 0U) ? (uint64_t)(int64_t)d.simm
-                          : difftest_reg(ctx, d.rs2));
+    /* CASA/CASXA address with R[rs1] directly: the low field names the
+     * compare register, so there is no rs2/simm offset form (the same
+     * rule sparc64_exec_atomic applies). Anything else reads past the
+     * target, the snapshot silently disarms, and the second engine
+     * re-reads the first engine's write. */
+    if (d.op3 == (uint32_t)SPARC64_OP3_CASA ||
+        d.op3 == (uint32_t)SPARC64_OP3_CASXA) {
+        va = difftest_reg(ctx, d.rs1);
+    } else {
+        va = difftest_reg(ctx, d.rs1) +
+            ((d.is_imm != 0U) ? (uint64_t)(int64_t)d.simm
+                              : difftest_reg(ctx, d.rs2));
+    }
     if (!difftest_mem_read(cfg, va, s.bytes, (size_t)len,
         SPARC64_ACCESS_LOAD)) {
         return s;
@@ -363,7 +374,28 @@ int sparc64_difftest_run(const sparc64_difftest_cfg_t *cfg,
             break;
         default:
             /* Matching non-continuable stop (TRAP/RETRY/INTERNAL):
-             * agreement only when the states and trap values match. */
+             * agreement only when the states and trap values match.
+             * A wired trap hook delivers synchronous guest signals on
+             * both copies (shared mapping, identical pre-state) and
+             * stepping continues inside the handler. */
+            if (ra.kind == SPARC64_STEP_TRAP &&
+                cfg->trap_deliver != NULL) {
+                int da;
+                int db;
+                int code = 0;
+                int signo = sparc64_sync_sig_for_trap(ra.cause, &code);
+                if (signo <= 0) {
+                    signo = 11;
+                    code = 1;
+                }
+                da = cfg->trap_deliver(&a, cfg->trap_arg, signo, code,
+                    ra.tval);
+                db = cfg->trap_deliver(&b, cfg->trap_arg, signo, code,
+                    rb.tval);
+                if (da == 0 && db == 0) {
+                    break;
+                }
+            }
             n = sparc64_difftest_cmp(&a, &b, step_pc);
             if (ra.tval != rb.tval) {
                 (void)printf("difftest: divergence at pc=0x%llx: tval interp=0x%llx dbt=0x%llx\n",

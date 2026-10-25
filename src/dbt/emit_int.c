@@ -7,8 +7,8 @@
  * Integer emitter with interpreter-identical semantics (--difftest).
  * Inline: SETHI, ALU + dual icc/xcc, ADDX/SUBX + cc (carry from icc.C),
  * MULX/UMUL/SMUL, UDIVX/SDIVX/UDIV/SDIV (+cc, divide-by-zero trap,
- * SDIV saturation), POPC (helper), TADD/TSUB (+TV trap), MULSCC,
- * shifts (SLL/SRL full-64, SRA sign-31/63), MOVcc (csel-free branch),
+ * SDIV saturation), POPC (helper), TADD/TSUB (+TV trap), MULSCC, shifts
+ * (SLL/SRL full-64, SRA sign-31/63), MOVcc (csel-free branch),
  * MOVr, RDASR/WRASR user state, ALIGNADDR, CALL/Bicc/BPcc/BPr/JMPL/
  * RETURN with delay slots + annul, Tcc (syscall gate). Helpers
  * (emit_priv.h): loads/stores/LDSTUB/SWAP/CASA/CASXA (alignment +
@@ -27,8 +27,7 @@
 
 
 
-/* Linux SPARC64 syscall trap number (ta 0x6d; decode.h names it
- * SPARC64_TRAP_SYSCALL_NUM, which lives outside the frozen interp.h). */
+/* Linux SPARC64 trap base: ta 0x6d syscall, 0x6e setjmp, 0x6f longjmp. */
 #define E_SYSCALL_NUM 0x6dU
 
 static bool e_emit_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d);
@@ -41,25 +40,23 @@ static const uint32_t e_a64_cond[16] = {
     13u, /* BLE  -> LE */
     11u, /* BL   -> LT */
     9u, /* BLEU -> LS */
-    2u, /* BCS  -> CS */
+    3u, /* BCS  -> CC (borrow) */
     4u, /* BNEG -> MI */
     6u, /* BVS  -> VS */
     14u, /* BA   -> AL */
     1u, /* BNE  -> NE */
     12u, /* BG   -> GT */
     10u, /* BGE  -> GE */
-    8u, /* BGU  -> HI */
-    3u, /* BCC  -> CC */
+    8u, /* BGU  -> HI (carry) */
+    2u, /* BCC  -> CS (no borrow) */
     5u, /* BPOS -> PL */
     7u /* BVC  -> VC */
 };
 
 /* ---- delay slots ---------------------------------------------------------
- * The delay instruction executes unless annulled away; its faults replay
- * through the interpreter at the CTI address (ec->fault_pc already holds
- * the CTI address, so no pc adjustment is needed). A CTI, Tcc, priv,
- * FPU, FBR, or illegal delay slot cannot be inlined: return false for a
- * pristine fallback and let the dispatcher replay via sparc64_step.
+ * The delay instruction executes unless annulled away; faults replay via
+ * the interpreter at the CTI address in ec->fault_pc. A CTI, Tcc, priv,
+ * FPU, FBR, or illegal delay cannot inline: return false for fallback.
  */
 
 static bool e_delay_is_plain(const sparc64_dec_t *d)
@@ -212,8 +209,8 @@ static bool e_emit_alu_simple(sparc64_emit_ctx_t *ec,
 
 
 
-/* ADDCC/SUBCC/ADDXCC/SUBXCC: dual-width carry/borrow with icc from the
- * low 32 bits and xcc from the full 64 bits. */
+/* ADDCC/SUBCC/ADDXCC/SUBXCC: icc from the low 32 bits, xcc from the
+ * full 64 bits; the stored result is always the full 64-bit value. */
 static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
     const sparc64_dec_t *d)
 {
@@ -227,9 +224,33 @@ static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
     }
     e_ld64(b, ES0, d->rs1);
     e_src2(b, ES1, d);
-    /* The flag-setting ops below consume the host carry, so the
-     * carry is reseeded from icc.C before each width. */
+    /* The 32-bit (icc) pass runs first into xzr so the 64-bit result
+     * survives in ES0 for the store below; each pass reseeds the
+     * carry it consumes. */
     if (with_carry) {
+        e_load_carry(b, ES2);
+        if (is_sub) {
+            e_seed_carry_sub(b, ES2);
+        } else {
+            e_seed_carry_add(b, ES2);
+        }
+    }
+    if (is_sub) {
+        if (with_carry) {
+            sb_sbc(b, false, 31U, ES0, ES1);
+        } else {
+            sb_sub_reg(b, false, true, 31U, ES0, ES1);
+        }
+    } else {
+        if (with_carry) {
+            sb_adc(b, false, 31U, ES0, ES1);
+        } else {
+            sb_add_reg(b, false, true, 31U, ES0, ES1);
+        }
+    }
+    e_host_to_nibble(b, ES4, ES2, is_sub);
+    if (with_carry) {
+        e_load_carry(b, ES2);
         if (is_sub) {
             e_seed_carry_sub(b, ES2);
         } else {
@@ -249,28 +270,7 @@ static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
             sb_add_reg(b, true, true, ES0, ES0, ES1);
         }
     }
-    e_host_to_nibble(b, ES3, ES2);
-    if (with_carry) {
-        if (is_sub) {
-            e_seed_carry_sub(b, ES2);
-        } else {
-            e_seed_carry_add(b, ES2);
-        }
-    }
-    if (is_sub) {
-        if (with_carry) {
-            sb_sbc(b, true, ES0, ES0, ES1);
-        } else {
-            sb_sub_reg(b, false, true, ES0, ES0, ES1);
-        }
-    } else {
-        if (with_carry) {
-            sb_adc(b, true, ES0, ES0, ES1);
-        } else {
-            sb_add_reg(b, false, true, ES0, ES0, ES1);
-        }
-    }
-    e_host_to_nibble(b, ES4, ES2);
+    e_host_to_nibble(b, ES3, ES2, is_sub);
     e_merge_cc(b, ES4, ES3, ES2);
     e_st64(b, d->rd, ES0);
     return !b->overflow;
@@ -307,10 +307,14 @@ static bool e_emit_logiccc(sparc64_emit_ctx_t *ec,
     default:
         return false;
     }
+    /* ANDS preserves C/V: clear NZCV first so the nibble sees V=C=0
+     * as the architecture requires for logic ops. */
+    sb_add_reg(b, false, true, ES2, 31U, 31U);
     sb_ands_reg(b, true, 31U, ES0, ES0);
-    e_host_to_nibble(b, ES3, ES2);
+    e_host_to_nibble(b, ES3, ES2, false);
+    sb_add_reg(b, false, true, ES2, 31U, 31U);
     sb_ands_reg(b, false, 31U, ES0, ES0);
-    e_host_to_nibble(b, ES4, ES2);
+    e_host_to_nibble(b, ES4, ES2, false);
     e_merge_cc(b, ES4, ES3, ES2);
     e_st64(b, d->rd, ES0);
     return !b->overflow;
@@ -342,7 +346,7 @@ static bool e_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     } else {
         sb_ubfm(b, false, ES0, ES0, 0U, 3U);
     }
-    e_nib_to_flags(b, ES0, ES0, ES1);
+    e_nib_to_flags(b, ES1, ES0, ES2);
     e_src2(b, ES1, d);
     p_skip = sb_b_cond_placeholder(b, e_a64_cond[d->cond & 15U] ^ 1U);
     e_st64(b, d->rd, ES1);
@@ -593,7 +597,7 @@ static bool e_emit_branch(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         }
         sb_ldst_imm(b, true, true, ES0, ECTX, SPARC64_CTX_CCR_OFFSET);
         sb_ubfm(b, false, ES0, ES0, shift, shift + 3U);
-        e_nib_to_flags(b, ES0, ES0, ES1);
+        e_nib_to_flags(b, ES1, ES0, ES2);
         taken_cond = e_a64_cond[d->cond & 15U];
         p_taken = sb_b_cond_placeholder(b, taken_cond);
     }
@@ -620,8 +624,9 @@ static bool e_emit_branch(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* JMPL/RETURN: misaligned targets trap, rd = pc precedes the delay,
- * then the transfer. Pristine fallback when the delay is not plain. */
+/* JMPL: misaligned targets trap, rd = pc precedes the delay, then the
+ * transfer. Pristine fallback when the delay is not plain. RETURN is
+ * handled by the interpreter (V9 A.45 window restore). */
 static bool e_emit_jmpl(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -654,9 +659,9 @@ static bool e_emit_jmpl(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Tcc: false conditions fall through; a true 0x6d trap number is the
- * syscall gate (%g1 to exit_arg), any other true trap number replays
- * through the interpreter. */
+/* Tcc: false conditions fall through; a true 0x6d..0x6f trap number
+ * is the syscall/setjmp/longjmp gate (engine re-reads the ta word),
+ * any other true trap number faults out to the interpreter. */
 static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -671,7 +676,7 @@ static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     } else {
         sb_ubfm(b, false, ES0, ES0, 0U, 3U);
     }
-    e_nib_to_flags(b, ES0, ES0, ES1);
+    e_nib_to_flags(b, ES1, ES0, ES2);
     if (d->cond == 8U) {
         p_taken = SPARC64_DBT_NOPOS;
     } else {
@@ -689,10 +694,12 @@ static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         sb_add_reg(b, true, false, ES0, ES0, ES1);
         sb_ubfm(b, true, ES0, ES0, 0U, 6U);
     }
-    sb_cmp_imm(b, true, ES0, (uint16_t)E_SYSCALL_NUM);
-    p_syscall = sb_b_cond_placeholder(b, 0U);
+    sb_mov_imm64(b, ES1, (uint64_t)E_SYSCALL_NUM);
+    sb_sub_reg(b, true, false, ES0, ES0, ES1);
+    sb_cmp_imm(b, true, ES0, 2U);
+    p_syscall = sb_b_cond_placeholder(b, 9U);
     e_fault_here(b, ec->fault_pc);
-    sb_patch_b_cond(b, p_syscall, 0U, b->count);
+    sb_patch_b_cond(b, p_syscall, 9U, b->count);
     sb_ldst_imm(b, true, true, ES0, ECTX, SPARC64_G1 * 8U);
     sb_ldst_imm(b, false, false, ES0, ECTX, E_OFF_EXIT_ARG);
     e_exit_imm(b, ec->pc, SPARC64_EXIT_SYSCALL);
@@ -768,8 +775,12 @@ static bool e_emit_one(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     case SPARC64_ICLS_BPR:
         return e_emit_branch(ec, d);
     case SPARC64_ICLS_JMPL:
-    case SPARC64_ICLS_RETURN:
         return e_emit_jmpl(ec, d);
+    case SPARC64_ICLS_RETURN:
+        /* V9 A.45 restores the window before the delay slot executes;
+         * replay pristinely through the interpreter until a native
+         * restore-then-transfer sequence lands. */
+        return false;
     case SPARC64_ICLS_TCC:
         return e_emit_tcc(ec, d);
     case SPARC64_ICLS_SAVE:

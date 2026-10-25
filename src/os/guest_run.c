@@ -15,6 +15,10 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+/* Needs _GNU_SOURCE: musl hides syscall(2) under -std=c11. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,18 +26,21 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include "core/cpu.h"
 #include "os/guest_run.h"
+#include "os/guest_run_priv.h"
+#include "dbt/dbt.h"
+#include "dbt/difftest.h"
 #include "os/sync_sig.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
 #include "rt64/memory/space.h"
 
 /* ---- Guest ABI constants (SPARC Linux, arch/sparc) --------------------- */
-#define GUEST_PAGE_SIZE UINT64_C(4096)
 #define GUEST_PAGE_MASK (GUEST_PAGE_SIZE - UINT64_C(1))
 #define GUEST_ET_EXEC 2U
 #define GUEST_ET_DYN 3U
@@ -45,13 +52,8 @@
 #define GUEST_EHDR_SIZE 64U
 #define GUEST_PHDR_SIZE 56U
 #define GUEST_MAX_PHDR 64U
-#define GUEST_STACK_TOP UINT64_C(0x7ffffffff000)
-#define GUEST_STACK_MAX UINT64_C(0x800000)
 #define GUEST_MMAP_BASE UINT64_C(0x6000000000)
 #define GUEST_DYN_BIAS UINT64_C(0x4000000000)
-#define GUEST_MAX_ARGC 256U
-#define GUEST_MAX_ENVC 512U
-#define GUEST_MAX_STRING_BYTES ((uint64_t)131072)
 
 /* SPARC mmap(71) flags (asm/mman.h). */
 #define GUEST_MAP_SHARED 0x01U
@@ -59,46 +61,8 @@
 #define GUEST_MAP_FIXED 0x10U
 #define GUEST_MAP_ANONYMOUS 0x20U
 
-/* AT_* keys carried in the initial stack (subset the static guest needs). */
-#define GUEST_AT_NULL 0U
-#define GUEST_AT_PHDR 3U
-#define GUEST_AT_PHENT 4U
-#define GUEST_AT_PHNUM 5U
-#define GUEST_AT_PAGESZ 6U
-#define GUEST_AT_ENTRY 9U
-#define GUEST_AT_UID 11U
-#define GUEST_AT_EUID 12U
-#define GUEST_AT_GID 13U
-#define GUEST_AT_EGID 14U
-#define GUEST_AT_EXECFN 31U
-
-/* AT_* keys carried in the initial stack, in auxv order. */
-static const unsigned aux_keys[10] = {
-    GUEST_AT_PHDR, GUEST_AT_PHENT, GUEST_AT_PHNUM, GUEST_AT_PAGESZ,
-    GUEST_AT_ENTRY, GUEST_AT_UID, GUEST_AT_EUID, GUEST_AT_GID,
-    GUEST_AT_EGID, GUEST_AT_EXECFN,
-};
-
-extern char **environ;
-
-/* Loader outcomes: positive errno-style values without depending on
- * host-specific codes (ELIBBAD exists on Linux only). */
-enum {
-    LOAD_OK = 0,
-    LOAD_BAD = 1,
-    LOAD_INTERP = 2,
-    LOAD_IO = 3,
-    LOAD_NOMEM = 4
-};
-
-typedef struct {
-    sparc64_space_t space;
-    int space_live;
-    uint64_t brk_base;
-    uint64_t brk_cur;
-    uint64_t tid_addr;
-    long host_tid;
-} guest_state_t;
+/* Stack synthesis lives in guest_stack.c; loader outcomes in
+ * guest_run_priv.h. */
 
 static uint64_t align_up(uint64_t v, uint64_t a)
 {
@@ -125,18 +89,6 @@ static uint32_t rd32be(const uint8_t *p)
 static uint64_t rd64be(const uint8_t *p)
 {
     return ((uint64_t)rd32be(p) << 32) | (uint64_t)rd32be(p + 4);
-}
-
-static void wr64be(uint8_t *p, uint64_t v)
-{
-    p[0] = (uint8_t)(v >> 56);
-    p[1] = (uint8_t)(v >> 48);
-    p[2] = (uint8_t)(v >> 40);
-    p[3] = (uint8_t)(v >> 32);
-    p[4] = (uint8_t)(v >> 24);
-    p[5] = (uint8_t)(v >> 16);
-    p[6] = (uint8_t)(v >> 8);
-    p[7] = (uint8_t)v;
 }
 
 /* Robust pread loop: 0 on success with *out_len bytes moved, -1 with
@@ -260,7 +212,7 @@ static bool guest_mem_atomic(void *context,
     return true;
 }
 
-static const sparc64_mem_ops_t guest_mem_ops = {
+const sparc64_mem_ops_t guest_mem_ops = {
     guest_mem_read, guest_mem_write, guest_mem_atomic,
 };
 
@@ -373,6 +325,9 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
             return -ENOMEM;
         }
         if ((flags & GUEST_MAP_ANONYMOUS) != 0U) {
+            if (g->dbt != NULL) {
+                sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+            }
             return (long)base;
         }
     }
@@ -381,6 +336,9 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
         copy_from_fd(g, fd, offset, base, len) == -LOAD_NOMEM) {
         (void)sparc64_space_unmap(&g->space, base, size);
         return -ENOMEM;
+    }
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
     }
     return (long)base;
 }
@@ -403,6 +361,9 @@ static long sysmem_munmap(void *context, uint64_t addr, uint64_t len)
     }
     /* Tolerates holes like Linux; shrink the break when its tail goes. */
     (void)sparc64_space_unmap(&g->space, base, size);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+    }
     if (base >= g->brk_base && base < g->brk_cur &&
         base + size >= g->brk_cur) {
         g->brk_cur = base;
@@ -431,6 +392,9 @@ static long sysmem_mprotect(void *context, uint64_t addr, uint64_t len,
     /* Every page must be mapped (Linux reports ENOMEM otherwise). */
     if (!sparc64_space_protect(&g->space, addr, size, prot & 7U)) {
         return -ENOMEM;
+    }
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
     }
     return 0;
 }
@@ -461,6 +425,9 @@ static long sysmem_brk(void *context, uint64_t addr)
         (void)sparc64_space_unmap(&g->space, target, cur - target);
     }
     g->brk_cur = addr;
+    if (g->dbt != NULL && target != cur) {
+        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+    }
     return (long)addr;
 }
 
@@ -474,7 +441,7 @@ static long sysmem_set_tid(void *context, uint64_t va)
     return g->host_tid;
 }
 
-static const sparc64_syscall_mem_t *sysmem_ops(guest_state_t *g,
+const sparc64_syscall_mem_t *sysmem_ops(guest_state_t *g,
                                                sparc64_syscall_mem_t *ops)
 {
     ops->context = g;
@@ -630,162 +597,13 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
     return 0;
 }
 
-/* ---- _start stack synthesis (E01) ---------------------------------------- */
-static uint64_t count_strings(char **vec, uint64_t max)
-{
-    uint64_t n = 0;
-    if (vec == NULL) {
-        return 0;
-    }
-    while (n < max && vec[n] != NULL) {
-        n++;
-    }
-    return n;
-}
-
-static int string_bytes(char **vec, uint64_t n, uint64_t *total)
-{
-    uint64_t sum = 0;
-    uint64_t i;
-    for (i = 0; i < n; i++) {
-        size_t len = strlen(vec[i]);
-        if (len > (size_t)65536 ||
-            sum > GUEST_MAX_STRING_BYTES - (uint64_t)len - UINT64_C(1)) {
-            return -E2BIG;
-        }
-        sum += (uint64_t)len + UINT64_C(1);
-    }
-    *total = sum;
-    return 0;
-}
-
-/* Push one NUL-terminated string below cursor; returns its guest VA. */
-static int push_string(guest_state_t *g, uint64_t *cursor, const char *s,
-                       uint64_t *addr)
-{
-    size_t len = strlen(s) + 1;
-    if (*cursor < (uint64_t)len) {
-        return -E2BIG;
-    }
-    *cursor -= (uint64_t)len;
-    *addr = *cursor;
-    return sparc64_space_write_initial(&g->space, *addr, s, len) ? 0 :
-                                                                   -ENOMEM;
-}
-
-static int put64(guest_state_t *g, uint64_t *cursor, uint64_t v)
-{
-    uint8_t buf[8];
-    wr64be(buf, v);
-    if (!sparc64_space_write_initial(&g->space, *cursor, buf, sizeof(buf))) {
-        return -ENOMEM;
-    }
-    *cursor += 8U;
-    return 0;
-}
-
-/* Push every string in vec below cursor, recording guest VAs. */
-static int push_vec(guest_state_t *g, uint64_t *cursor, char **vec,
-                    uint64_t n, uint64_t *addrs)
-{
-    uint64_t i;
-    for (i = 0; i < n; i++) {
-        if (push_string(g, cursor, vec[i], &addrs[i]) != 0) {
-            return -LOAD_NOMEM;
-        }
-    }
-    return LOAD_OK;
-}
-
-/* Write a vector of big-endian words at the ascending cursor. */
-static int put_vec(guest_state_t *g, uint64_t *cursor, const uint64_t *v,
-                   uint64_t n)
-{
-    uint64_t i;
-    for (i = 0; i < n; i++) {
-        if (put64(g, cursor, v[i]) != 0) {
-            return -LOAD_NOMEM;
-        }
-    }
-    return LOAD_OK;
-}
-
-/* Lay out argc/argv/envp/auxv/strings; returns the biased %sp. Stack
- * pages are mapped READ|WRITE; every multi-byte field is big-endian. */
-static int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
-                       uint64_t phnum, uint64_t phent, char **argv,
-                       uint64_t argc, uint64_t *sp_out)
-{
-    uint64_t envc = count_strings(environ, GUEST_MAX_ENVC);
-    uint64_t argv_bytes = 0, env_bytes = 0, str_size, str_base;
-    uint64_t cursor, frame, stack_base, stack_size, execfn = 0, words, at, i;
-    uint64_t argv_addr[GUEST_MAX_ARGC], env_addr[GUEST_MAX_ENVC];
-    uint64_t auxv[20], vals[10];
-    uint8_t zeros[128];
-    if (argc > (uint64_t)GUEST_MAX_ARGC ||
-        envc > (uint64_t)GUEST_MAX_ENVC) {
-        return -E2BIG;
-    }
-    if (string_bytes(argv, argc, &argv_bytes) != 0 ||
-        string_bytes(environ, envc, &env_bytes) != 0) {
-        return -E2BIG;
-    }
-    str_size = argv_bytes + env_bytes;
-    /* Reserve: argc + argv+NULL + envp+NULL + 11 auxv pairs. */
-    words = UINT64_C(1) + (argc + UINT64_C(1)) + (envc + UINT64_C(1)) +
-        UINT64_C(22);
-    str_base = GUEST_STACK_TOP - str_size;
-    if (str_size > GUEST_MAX_STRING_BYTES || str_size >= GUEST_STACK_TOP ||
-        str_base < words * UINT64_C(8) + UINT64_C(128)) {
-        return -E2BIG;
-    }
-    frame = align_down(str_base - words * UINT64_C(8) - UINT64_C(128), 16U);
-    stack_base = align_down(frame, GUEST_PAGE_SIZE);
-    stack_size = GUEST_STACK_TOP - stack_base;
-    if (stack_size == 0U || stack_size > GUEST_STACK_MAX) {
-        return -ENOMEM;
-    }
-    if (!sparc64_space_map(&g->space, stack_base, stack_size,
-                           SPARC64_MEM_READ | SPARC64_MEM_WRITE, false)) {
-        return -ENOMEM;
-    }
-    cursor = GUEST_STACK_TOP;
-    if (push_vec(g, &cursor, argv, argc, argv_addr) != 0 ||
-        push_vec(g, &cursor, environ, envc, env_addr) != 0) {
-        return -ENOMEM;
-    }
-    execfn = (argc != 0U) ? argv_addr[0] : 0U;
-    memset(zeros, 0, sizeof(zeros)); /* Zero the rwindow_64 [F, F+128). */
-    if (!sparc64_space_write_initial(&g->space, frame, zeros,
-                                     sizeof(zeros))) {
-        return -ENOMEM;
-    }
-    vals[0] = phdr_va; vals[1] = phent; vals[2] = phnum;
-    vals[3] = GUEST_PAGE_SIZE; vals[4] = entry;
-    vals[5] = (uint64_t)getuid(); vals[6] = (uint64_t)geteuid();
-    vals[7] = (uint64_t)getgid(); vals[8] = (uint64_t)getegid();
-    vals[9] = execfn;
-    for (i = 0; i < 10U; i++) {
-        auxv[2U * i] = aux_keys[i];
-        auxv[2U * i + 1U] = vals[i];
-    }
-    at = frame + UINT64_C(128);
-    if (put64(g, &at, argc) != 0 ||
-        put_vec(g, &at, argv_addr, argc) != 0 ||
-        put64(g, &at, 0U) != 0 ||
-        put_vec(g, &at, env_addr, envc) != 0 ||
-        put64(g, &at, 0U) != 0 ||
-        put_vec(g, &at, auxv, 20U) != 0 ||
-        put64(g, &at, GUEST_AT_NULL) != 0 ||
-        put64(g, &at, 0U) != 0) {
-        return -ENOMEM;
-    }
-    *sp_out = frame - SPARC64_STACK_BIAS;
-    return 0;
-}
-
-/* ---- Entry point --------------------------------------------------------- */
+/* ---- Entry point (stack synthesis lives in guest_stack.c) ------------------ */
 int sparc64_guest_run(const char *path, char **argv, int interp_only)
+{
+    return sparc64_guest_run_engine(path, argv, interp_only != 0 ? 0 : 1);
+}
+
+int sparc64_guest_run_engine(const char *path, char **argv, int engine)
 {
     guest_state_t g;
     guest_image_t img;
@@ -802,8 +620,8 @@ int sparc64_guest_run(const char *path, char **argv, int interp_only)
         (void)fprintf(stderr, "sparc64rt: no guest image\n");
         return 1;
     }
-    if (!interp_only) {
-        (void)fprintf(stderr, "sparc64rt: dbt lands in Phase 2\n");
+    if (engine < 0 || engine > 2) {
+        (void)fprintf(stderr, "sparc64rt: unknown engine %d\n", engine);
         return 1;
     }
     if (argv == NULL || argv[0] == NULL) {
@@ -854,39 +672,16 @@ int sparc64_guest_run(const char *path, char **argv, int interp_only)
     ctx.cwp = 0U;
     ctx.cansave = (uint32_t)(SPARC64_NWINDOWS - 1U);
     ops = sysmem_ops(&g, &ops_storage);
-    for (;;) {
-        sparc64_step_result_t step = sparc64_step(&ctx, &guest_mem_ops, &g);
-        if (step.kind == SPARC64_STEP_SYSCALL) {
-            long nr = (long)ctx.r[SPARC64_G1];
-            long status = sparc64_handle_syscall(&ctx, ops);
-            if (sparc64_syscall_is_exit(nr)) {
-                sparc64_space_destroy(&g.space);
-                return (int)(status & 0xffL);
-            }
-        } else if (step.kind == SPARC64_STEP_TRAP) {
-            /* Synchronous signal delivery (Phase 1): faults with an
-             * installed handler resume in the handler; anything else
-             * (and internal/retry states) is fatal. */
-            int code = 0;
-            int signo = sparc64_sync_sig_for_trap(step.cause, &code);
-            if (signo > 0 &&
-                sparc64_sync_sig_deliver(&ctx, ops, signo, code,
-                    step.tval) == 0) {
-                continue;
-            }
-            (void)fprintf(stderr,
-                          "sparc64rt: unhandled guest trap: cause=%d pc=0x%llx tval=0x%llx\n",
-                          (int)step.cause,
-                          (unsigned long long)step.pc,
-                          (unsigned long long)step.tval);
-            goto fail;
-        } else if (step.kind != SPARC64_STEP_CONTINUE) {
-            (void)fprintf(stderr,
-                          "sparc64rt: guest stopped: kind=%d cause=%d pc=0x%llx\n",
-                          (int)step.kind, (int)step.cause,
-                          (unsigned long long)step.pc);
-            goto fail;
-        }
+    if (engine == 2) {
+        rc = run_difftest(&g, &ctx, ops);
+    } else if (engine == 1) {
+        rc = run_dbt(&g, &ctx, ops);
+    } else {
+        rc = run_interp(&g, &ctx, ops);
+    }
+    if (rc == 0) {
+        sparc64_space_destroy(&g.space);
+        g.space_live = 0;
     }
 fail:
     if (fd >= 0) {
@@ -895,5 +690,7 @@ fail:
     if (g.space_live) {
         sparc64_space_destroy(&g.space);
     }
-    return 1;
+    /* Loader/runner failures collapse to 1; guest and difftest codes
+     * (including difftest's 2 = agreement without exit) pass through. */
+    return rc < 0 ? 1 : rc;
 }

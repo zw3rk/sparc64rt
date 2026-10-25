@@ -152,6 +152,10 @@ typedef enum {
 #define SPARC64_OP3_STFSR 0x25U
 #define SPARC64_OP3_STTW 0x26U
 #define SPARC64_OP3_STDF 0x27U
+#define SPARC64_OP3_LDFA 0x30U
+#define SPARC64_OP3_LDDFA 0x33U
+#define SPARC64_OP3_STFA 0x34U
+#define SPARC64_OP3_STDFA 0x37U
 #define SPARC64_OP3_PREFETCH 0x2DU
 #define SPARC64_OP3_CASA 0x3CU
 #define SPARC64_OP3_CASXA 0x3EU
@@ -190,6 +194,7 @@ typedef struct {
     uint8_t cond;  /* Branch/Tcc/MOVcc condition, BPr/MOVr rcond. */
     uint8_t cc;    /* cc select: 0 = icc, 2 = xcc. */
     uint8_t asi;   /* Immediate ASI (alternate-space forms, i == 0). */
+    uint8_t regasi; /* i == 1 alternate form: ASI comes from %asi. */
     uint8_t annul; /* Branch annul (a) bit. */
     uint8_t pred;  /* Branch prediction (p) bit, advisory only. */
     uint8_t is_imm;
@@ -299,6 +304,13 @@ bool sparc64_win_save(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
 bool sparc64_win_restore(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     void *mc, uint64_t sum, unsigned rd, sparc64_step_result_t *res,
     uint64_t pc);
+/* Flush-all (interp_win.c): mirror every outstanding window image into
+ * its architectural stack slot (setjmp-trap helper, see above). */
+bool sparc64_win_flush_all(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
+    void *mc, sparc64_step_result_t *res, uint64_t pc);
+/* Invalidate-all (interp_win.c): drop every cached image (longjmp-trap
+ * helper, see above). */
+void sparc64_win_invalidate_all(void);
 
 /* Integer execution backend (interp_win.c): single non-CTI data-path
  * instructions. Each returns CONTINUE (caller advances pc/npc) or a stop
@@ -315,6 +327,15 @@ sparc64_step_result_t sparc64_exec_wrasr(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d);
 sparc64_step_result_t sparc64_exec_align(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d);
+/* Minimal RC2 FPU kernel (interp/fp.c); Phase 3 subsumes it. */
+sparc64_step_result_t sparc64_exec_fpu(sparc64_ctx_t *cpu,
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t pc,
+    const sparc64_dec_t *d);
+
+/* Alternate-space ASI check (interp_mem.c); the FPU kernel resolves
+ * regasi into a copy before calling. */
+bool sparc64_asi_check(uint64_t pc, const sparc64_dec_t *d, bool *little,
+    sparc64_step_result_t *res);
 
 /* Memory execution backend (interp_mem.c): loads, stores, and atomics over
  * the guest memory operations. */

@@ -693,9 +693,12 @@ static inline void e_lsl_imm32(sparc64_dbt_buf_t *b, unsigned rd, unsigned rn,
 }
 
 
-/* Build an NZCV word in wF from the 4-bit guest nibble in wN
- * (nibble bits N=3,Z=2,V=1,C=0 map to NZCV bits 31,30,28,29)
- * and load it into the host flags. Clobbers wT. */
+/* Build an NZCV word in wF from the 4-bit guest nibble in wN and load
+ * it into the host flags. Clobbers wT; the three registers must be
+ * distinct (wF is written before the last nibble bit is read). N, Z, V
+ * map straight across, but the nibble C bit is a borrow (1 iff a<b)
+ * while AArch64 C is a carry, so bit 0 is inverted into NZCV bit 29.
+ * The e_a64_cond table matches this carry convention. */
 static inline void e_nib_to_flags(sparc64_dbt_buf_t *b, unsigned wF, unsigned wN,
     unsigned wT)
 {
@@ -708,15 +711,19 @@ static inline void e_nib_to_flags(sparc64_dbt_buf_t *b, unsigned wF, unsigned wN
     e_lsl_imm32(b, wT, wT, 28U);
     sb_orr_reg(b, false, wF, wF, wT);
     sb_ubfm(b, false, wT, wN, 0U, 0U);
+    sb_cmp_imm(b, false, wT, 0U);
+    sb_cset(b, wT, 0U);
     e_lsl_imm32(b, wT, wT, 29U);
     sb_orr_reg(b, false, wF, wF, wT);
     sb_msr_nzcv(b, wF);
 }
 
 /* Capture the host NZCV set by the previous flags-setting op into the
- * guest nibble layout (N=3,Z=2,V=1,C=0) in wI. Clobbers xT. */
+ * guest nibble layout (N=3,Z=2,V=1,C=0) in wI. Clobbers xT. SPARC C is
+ * the borrow (E02): for SUB the host carry is inverted, so the C bit is
+ * taken directly from the CC condition (1 iff borrow) instead. */
 static inline void e_host_to_nibble(sparc64_dbt_buf_t *b, unsigned wI,
-    unsigned xT)
+    unsigned xT, bool is_sub)
 {
     sb_mrs_nzcv(b, xT);
     sb_ubfm(b, false, wI, xT, 31U, 31U);
@@ -728,8 +735,12 @@ static inline void e_host_to_nibble(sparc64_dbt_buf_t *b, unsigned wI,
     sb_ubfm(b, false, xT, xT, 28U, 28U);
     e_lsl_imm32(b, xT, xT, 1U);
     sb_orr_reg(b, false, wI, wI, xT);
-    sb_mrs_nzcv(b, xT);
-    sb_ubfm(b, false, xT, xT, 29U, 29U);
+    if (is_sub) {
+        sb_cset(b, xT, 3U);
+    } else {
+        sb_mrs_nzcv(b, xT);
+        sb_ubfm(b, false, xT, xT, 29U, 29U);
+    }
     sb_orr_reg(b, false, wI, wI, xT);
 }
 

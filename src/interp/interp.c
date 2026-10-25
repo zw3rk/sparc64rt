@@ -57,48 +57,6 @@ static int64_t sx(uint64_t v, unsigned n)
     return (int64_t)((v ^ m) - m);
 }
 
-/* Bicc/BPcc/Ticc/MOVcc condition over one 4-bit N/Z/V/C nibble
- * (bit 3 N, bit 2 Z, bit 1 V, bit 0 C). */
-bool sparc64_eval_cond(unsigned cond, unsigned nibble)
-{
-    bool n = (nibble & 8U) != 0U;
-    bool z = (nibble & 4U) != 0U;
-    bool v = (nibble & 2U) != 0U;
-    bool c = (nibble & 1U) != 0U;
-    switch (cond & 15U) {
-    case 0x0U: return false;
-    case 0x1U: return z;
-    case 0x2U: return z || (n != v);
-    case 0x3U: return n != v;
-    case 0x4U: return c || z;
-    case 0x5U: return c;
-    case 0x6U: return n;
-    case 0x7U: return v;
-    case 0x8U: return true;
-    case 0x9U: return !z;
-    case 0xAU: return !(z || (n != v));
-    case 0xBU: return n == v;
-    case 0xCU: return !(c || z);
-    case 0xDU: return !c;
-    case 0xEU: return !n;
-    default: return !v;
-    }
-}
-
-/* BPr/MOVr register test over the full 64-bit value. rcond skips 4. */
-bool sparc64_eval_rcond(unsigned rcond, uint64_t v)
-{
-    switch (rcond & 15U) {
-    case 1U: return v == UINT64_C(0);
-    case 2U: return (int64_t)v <= (int64_t)0;
-    case 3U: return (int64_t)v < (int64_t)0;
-    case 5U: return v != UINT64_C(0);
-    case 6U: return (int64_t)v > (int64_t)0;
-    case 7U: return (int64_t)v >= (int64_t)0;
-    default: return false;
-    }
-}
-
 static bool rcond_valid(unsigned rcond)
 {
     return rcond == 1U || rcond == 2U || rcond == 3U || rcond == 5U ||
@@ -120,6 +78,7 @@ void sparc64_classify_word(uint32_t word, sparc64_dec_t *d)
     d->cond = 0U;
     d->cc = 0U;
     d->asi = 0U;
+    d->regasi = 0U;
     d->annul = 0U;
     d->pred = 0U;
     d->is_imm = 0U;
@@ -307,15 +266,21 @@ static void sparc64_decode_op2(sparc64_dec_t *d, uint32_t word, unsigned op3,
         return;
     }
     case SPARC64_OP3_RDASR:
+        if (rs1 == 15U) {
+            /* MEMBAR shares the RDASR opcode (ordering hint: nop). */
+            d->cls = SPARC64_ICLS_MEMBAR;
+            return;
+        }
         if (rs1 == SPARC64_ASR_Y || rs1 == SPARC64_ASR_CCR ||
-            rs1 == SPARC64_ASR_ASI || rs1 == SPARC64_ASR_FPRS ||
-            rs1 == SPARC64_ASR_GSR) {
+            rs1 == SPARC64_ASR_ASI || rs1 == SPARC64_ASR_PC ||
+            rs1 == SPARC64_ASR_FPRS || rs1 == SPARC64_ASR_GSR) {
             d->cls = SPARC64_ICLS_RDASR;
             return;
         }
-        if (rs1 == SPARC64_ASR_TICK || rs1 == SPARC64_ASR_PC ||
+        if (rs1 == SPARC64_ASR_TICK ||
             (rs1 >= 20U && rs1 <= 25U)) {
-            /* TICK/PC/SOFTINT/TICK_CMPR/STICK are supervisor-only. */
+            /* TICK/SOFTINT/TICK_CMPR/STICK are supervisor-only
+             * (RDPC reads the instruction address in user mode). */
             d->cls = SPARC64_ICLS_PRIV;
             return;
         }
@@ -476,6 +441,12 @@ static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
     case SPARC64_OP3_STFSR:
         /* FSR is integer-modeled; only the F-file forms trap. */
         break;
+    case SPARC64_OP3_LDFA:
+    case SPARC64_OP3_LDDFA:
+    case SPARC64_OP3_STFA:
+    case SPARC64_OP3_STDFA:
+        /* FP alternate forms share the operand/ASI decode below. */
+        break;
     case SPARC64_OP3_PREFETCH:
         d->cls = SPARC64_ICLS_FLUSH;
         return;
@@ -485,13 +456,20 @@ static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
             op3 == SPARC64_OP3_LDDF || op3 == SPARC64_OP3_STF ||
             op3 == SPARC64_OP3_STTW || op3 == SPARC64_OP3_STDF) {
             d->cls = SPARC64_ICLS_FPU;
+            if (i != 0U) {
+                d->imm = (int64_t)sx(fld(word, 12U, 0U), 13U);
+            } else {
+                d->rs2 = (uint8_t)fld(word, 4U, 0U);
+            }
         }
         return;
     }
     alt = (op3 >= SPARC64_OP3_LDA && op3 <= SPARC64_OP3_SWAPA) ||
-        op3 == SPARC64_OP3_CASA || op3 == SPARC64_OP3_CASXA;
+        op3 == SPARC64_OP3_CASA || op3 == SPARC64_OP3_CASXA ||
+        (op3 >= SPARC64_OP3_LDFA && op3 <= SPARC64_OP3_STDFA);
     if ((op3 == SPARC64_OP3_LDD || op3 == SPARC64_OP3_STD ||
-            op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA) &&
+            op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA ||
+            op3 == SPARC64_OP3_LDDFA || op3 == SPARC64_OP3_STDFA) &&
         (d->rd & 1U) != 0U) {
         /* Twin-word destinations must be even. */
         d->cls = SPARC64_ICLS_ILLEGAL;
@@ -501,8 +479,10 @@ static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
         if (i == 0U) {
             d->asi = (uint8_t)fld(word, 12U, 5U);
         } else {
-            /* %asi-register form: no oracle mapping, fault like qemu. */
+            /* %asi-register form: resolved from cpu->asi at execution;
+             * integer paths still fault on the 0xFF sentinel. */
             d->asi = 0xFFU;
+            d->regasi = 1U;
         }
     }
     /* Address operand decodes uniformly; alternate i == 1 traps on asi. */
@@ -510,6 +490,15 @@ static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
         d->imm = (int64_t)sx(fld(word, 12U, 0U), 13U);
     } else {
         d->rs2 = (uint8_t)fld(word, 4U, 0U);
+    }
+    if (op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA ||
+        op3 == SPARC64_OP3_LDFA || op3 == SPARC64_OP3_LDDFA ||
+        op3 == SPARC64_OP3_STFA || op3 == SPARC64_OP3_STDFA) {
+        /* FP-file loads/stores (plain doubleword alternate and the
+         * 0x30-0x37 FP alternate group): the reference FPU kernel moves
+         * the data; the DBT treats FPU as interpreter fallback. */
+        d->cls = SPARC64_ICLS_FPU;
+        return;
     }
     switch (op3) {
     case SPARC64_OP3_LDUW:
@@ -612,10 +601,11 @@ static sparc64_step_result_t exec_single(sparc64_cpu_t *cpu,
     case SPARC64_ICLS_PRIV:
         return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
     case SPARC64_ICLS_FPU:
+        return sparc64_exec_fpu(cpu, mem, mc, pc, d);
     case SPARC64_ICLS_ILLEGAL:
     case SPARC64_ICLS_FBR:
     default:
-        /* FBR (Phase 3 owns fcc) and FPU markers trap like EXIT_UNDEF. */
+        /* FBR (Phase 3 owns fcc) and unknown markers trap like EXIT_UNDEF. */
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
     }
 }
@@ -682,8 +672,28 @@ static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
         cpu->npc = cpu->pc + 4U;
         return sparc64_step_ok(pc);
     }
-    if (d->cls == (uint8_t)SPARC64_ICLS_JMPL ||
-        d->cls == (uint8_t)SPARC64_ICLS_RETURN) {
+    if (d->cls == (uint8_t)SPARC64_ICLS_RETURN) {
+        /* V9 A.45: the target is computed in the old window, rd is not
+         * written, and RESTORE %g0,%g0,%g0 runs before the delay slot
+         * (a bare JMPL/retl without restore would leak the window). */
+        target = sparc64_rreg(cpu, d->rs1) +
+            ((d->is_imm != 0U) ? (uint64_t)d->imm
+                               : sparc64_rreg(cpu, d->rs2));
+        if ((target & UINT64_C(3)) != UINT64_C(0)) {
+            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+        }
+        if (!sparc64_win_restore(cpu, mem, mc, UINT64_C(0), 0U, &res,
+            pc)) {
+            return res;
+        }
+        if (!exec_delay(cpu, mem, mc, npc, &res)) {
+            return res;
+        }
+        cpu->pc = target;
+        cpu->npc = target + 4U;
+        return sparc64_step_ok(pc);
+    }
+    if (d->cls == (uint8_t)SPARC64_ICLS_JMPL) {
         target = sparc64_rreg(cpu, d->rs1) +
             ((d->is_imm != 0U) ? (uint64_t)d->imm
                                : sparc64_rreg(cpu, d->rs2));
@@ -750,12 +760,16 @@ static sparc64_step_result_t exec_tcc(sparc64_cpu_t *cpu, uint64_t pc,
     trapno = (d->is_imm != 0U) ? (uint64_t)d->imm
                                : (sparc64_rreg(cpu, d->rs1) +
             sparc64_rreg(cpu, d->rs2));
-    if ((trapno & UINT64_C(0x7F)) == UINT64_C(0x6D)) {
+    /* Linux user traps: 0x6d syscall gate, 0x6e setjmp, 0x6f longjmp.
+     * tval carries the trap number; the engine re-reads the ta word, so
+     * interp, DBT, and difftest share one dispatch without frozen-header
+     * changes. Any other true trap number is an illegal instruction. */
+    if ((trapno & UINT64_C(0x7F)) - UINT64_C(0x6D) <= UINT64_C(2)) {
         sparc64_step_result_t r;
         r.kind = SPARC64_STEP_SYSCALL;
         r.cause = SPARC64_TRAP_ILLEGAL;
         r.pc = pc;
-        r.tval = UINT64_C(0);
+        r.tval = trapno & UINT64_C(0x7F);
         r.length = 4U;
         r.memory_reason = SPARC64_MEM_FAULT_NONE;
         return r;

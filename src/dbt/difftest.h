@@ -62,6 +62,16 @@ typedef sparc64_step_result_t (*sparc64_dbt_step_fn)(struct sparc64_dbt *dbt,
 typedef long (*sparc64_difftest_syscall_fn)(sparc64_ctx_t *ctx, void *arg,
     int *is_exit);
 
+/*
+ * Trap hook: delivers a synchronous guest signal for a STEP_TRAP stop
+ * (writes the rt frame, redirects ctx at the handler). Runs once per
+ * engine copy over the shared mapping. Returns 0 when delivered (both
+ * copies resume in the handler and stepping continues), nonzero when
+ * the trap is unhandled (the harness reports agreement and stops).
+ */
+typedef int (*sparc64_difftest_trap_fn)(sparc64_ctx_t *ctx, void *arg,
+    int signo, int code, uint64_t fault_addr);
+
 typedef struct {
     const sparc64_mem_ops_t *mem;   /* Shared guest-memory operations. */
     void *mc;                       /* Memory context threaded through. */
@@ -69,6 +79,8 @@ typedef struct {
     sparc64_dbt_step_fn dbt_step;    /* NULL selects sparc64_step fallback. */
     sparc64_difftest_syscall_fn syscall; /* NULL stops at syscalls (agreement). */
     void *syscall_arg;              /* Opaque arg for the syscall hook. */
+    sparc64_difftest_trap_fn trap_deliver; /* NULL stops at traps (agreement). */
+    void *trap_arg;                 /* Opaque arg for the trap hook. */
     unsigned long max_steps;        /* 0 selects the default hang guard. */
 } sparc64_difftest_cfg_t;
 

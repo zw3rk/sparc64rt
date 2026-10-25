@@ -15,8 +15,13 @@
 
 /* Run the guest at path with argv (argv[0] names the program, like
  * execv; NULL argv synthesizes one from path). interp_only selects the
- * reference interpreter; a zero value asks for the Phase-2 DBT engine and
- * currently fails. Returns the guest exit status, or 1 on runner error. */
+ * reference interpreter; a zero value runs the DBT engine. Returns the
+ * guest exit status, or 1 on runner error. */
 int sparc64_guest_run(const char *path, char **argv, int interp_only);
+
+/* Engine dispatch: 0 = reference interpreter, 1 = AArch64 DBT,
+ * 2 = lockstep difftest (prints the divergence report; returns the
+ * guest exit status on a divergence-free run). */
+int sparc64_guest_run_engine(const char *path, char **argv, int engine);
 
 #endif /* SPARC64RT_OS_GUEST_RUN_H */

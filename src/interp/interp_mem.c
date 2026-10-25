@@ -377,8 +377,9 @@ bool sparc64_swap(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
 /* Alternate-space ASI check (E03). Immediate ASIs 0x80/0x82 are
  * big-endian, 0x88/0x8a little-endian (bit 3). ASIs below 0x80 trap
  * privileged (qemu trap 0x37); the i == 1 %asi-register form and unknown
- * supervisor ASIs fault like the oracle's missing helper. */
-static bool asi_check(uint64_t pc, const sparc64_dec_t *d, bool *little,
+ * supervisor ASIs fault like the oracle's missing helper. Shared with the
+ * FPU kernel, which resolves regasi into d.asi before calling. */
+bool sparc64_asi_check(uint64_t pc, const sparc64_dec_t *d, bool *little,
     sparc64_step_result_t *res)
 {
     unsigned asi = d->asi;
@@ -420,7 +421,7 @@ sparc64_step_result_t sparc64_exec_load(sparc64_cpu_t *cpu,
     bool alt = d->op3 >= SPARC64_OP3_LDA && d->op3 <= SPARC64_OP3_LDXA;
     uint64_t v = UINT64_C(0);
     sparc64_step_result_t res;
-    if (alt && !asi_check(pc, d, &little, &res)) {
+    if (alt && !sparc64_asi_check(pc, d, &little, &res)) {
         return res;
     }
     switch (d->op3) {
@@ -504,7 +505,7 @@ sparc64_step_result_t sparc64_exec_store(sparc64_cpu_t *cpu,
     bool alt = d->op3 >= SPARC64_OP3_STA && d->op3 <= SPARC64_OP3_STXA;
     uint64_t v = sparc64_rreg(cpu, d->rd);
     sparc64_step_result_t res;
-    if (alt && !asi_check(pc, d, &little, &res)) {
+    if (alt && !sparc64_asi_check(pc, d, &little, &res)) {
         return res;
     }
     switch (d->op3) {
@@ -572,7 +573,7 @@ sparc64_step_result_t sparc64_exec_atomic(sparc64_cpu_t *cpu,
         d->op3 == SPARC64_OP3_CASA || d->op3 == SPARC64_OP3_CASXA;
     uint64_t old = UINT64_C(0);
     sparc64_step_result_t res;
-    if (alt && !asi_check(pc, d, &little, &res)) {
+    if (alt && !sparc64_asi_check(pc, d, &little, &res)) {
         return res;
     }
     if (d->cls == (uint8_t)SPARC64_ICLS_LDSTUB) {

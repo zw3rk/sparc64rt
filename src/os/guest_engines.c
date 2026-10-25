@@ -1,0 +1,349 @@
+/*
+ * src/os/guest_engines.c — interp/dbt/difftest run loops (coordinator)
+ *
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Engine loops shared by sparc64_guest_run_engine (guest_run.c): the
+ * reference interpreter, the AArch64 DBT, and the lockstep difftest
+ * harness. Trap delivery, syscall mirroring, and DBT invalidation are
+ * identical across engines by construction.
+ */
+
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "core/cpu.h"
+#include "dbt/dbt.h"
+#include "dbt/difftest.h"
+#include "interp/interp_win.h"
+#include "os/guest_run_priv.h"
+#include "os/sync_sig.h"
+#include "os/syscalls_min.h"
+
+/* ---- Engine runners ------------------------------------------------------- */
+
+/* Shared trap path: deliver synchronous signals, report the rest. */
+static int run_deliver_trap(guest_state_t *g, sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *ops, const sparc64_step_result_t *step)
+{
+    int code = 0;
+    int signo = sparc64_sync_sig_for_trap(step->cause, &code);
+    (void)g;
+    if (signo > 0 &&
+        sparc64_sync_sig_deliver(ctx, ops, signo, code, step->tval) == 0) {
+        return 0;
+    }
+    (void)fprintf(stderr,
+                  "sparc64rt: unhandled guest trap: cause=%d pc=0x%llx tval=0x%llx\n",
+                  (int)step->cause,
+                  (unsigned long long)step->pc,
+                  (unsigned long long)step->tval);
+    return 1;
+}
+
+/* ta trap dispatch: a SYSCALL stop leaves pc on the trapping ta, whose
+ * low 7 bits select the Linux gate (0x6d syscall, 0x6e setjmp, 0x6f
+ * longjmp). Re-read the word here so interp, DBT, and difftest share one
+ * branch without touching the frozen step-result contract. */
+static unsigned engine_trapno(const sparc64_syscall_mem_t *ops, uint64_t pc)
+{
+    uint8_t w[4];
+    uint32_t word;
+    if (!ops->read(ops->context, pc, w, (uint64_t)sizeof(w))) {
+        return 0U;
+    }
+    word = ((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) |
+        ((uint32_t)w[2] << 8) | (uint32_t)w[3];
+    return (unsigned)(word & 0x7FU);
+}
+
+static void engine_put64(uint8_t *p, uint64_t v)
+{
+    unsigned i;
+    for (i = 0U; i < 8U; i++) {
+        p[i] = (uint8_t)(v >> (56U - 8U * i));
+    }
+}
+
+static uint64_t engine_get64(const uint8_t *p)
+{
+    unsigned i;
+    uint64_t v = UINT64_C(0);
+    for (i = 0U; i < 8U; i++) {
+        v = (v << 8U) | (uint64_t)p[i];
+    }
+    return v;
+}
+
+/* setjmp/longjmp buffer (guest jmp_buf at %o0). Guest code touches only
+ * +0x40 (longjmp return value, stored by __libc_longjmp before ta 0x6f)
+ * and +0x200 (savemask flag word); the rest is kernel-private snapshot:
+ * magic @0x00, %sp @0x08, resume pc @0x10, cwp @0x18, %g1..%g7 @0x20..
+ * (skipping +0x40), signal mask @0x60, %asi @0x78, ccr @0x80, y @0x88.
+ * The mask save/restore is Phase 4 (no mask state exists yet); RC2
+ * stores zeros, matching _dl's savemask=0 use in _dl_catch_exception. */
+#define ENGINE_SETJMP_MAGIC UINT64_C(0x534A425546310000)
+
+static int engine_setjmp_trap(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *ops, guest_state_t *g, uint64_t pc)
+{
+    uint8_t jb[0x90];
+    uint64_t base = ctx->r[SPARC64_O0];
+    sparc64_step_result_t res;
+    (void)memset(jb, 0, sizeof(jb));
+    /* Mirror every outstanding image into its home slot first: longjmp
+     * pops below this point refill from these slots, and post-flush
+     * fills are idempotent by construction. Only valid (outstanding)
+     * images are written; dead images' homes are live stack space. */
+    if (!sparc64_win_flush_all(ctx, &guest_mem_ops, g, &res, pc)) {
+        return 1;
+    }
+    engine_put64(&jb[0x00], ENGINE_SETJMP_MAGIC);
+    engine_put64(&jb[0x08], ctx->r[SPARC64_SP]);
+    engine_put64(&jb[0x10], pc + 4U);
+    engine_put64(&jb[0x18], (uint64_t)ctx->cwp);
+    engine_put64(&jb[0x20], ctx->r[SPARC64_G1]);
+    engine_put64(&jb[0x28], ctx->r[SPARC64_G2]);
+    engine_put64(&jb[0x30], ctx->r[SPARC64_G3]);
+    engine_put64(&jb[0x38], ctx->r[SPARC64_G4]);
+    engine_put64(&jb[0x48], ctx->r[SPARC64_G5]);
+    engine_put64(&jb[0x50], ctx->r[SPARC64_G6]);
+    engine_put64(&jb[0x58], ctx->r[SPARC64_G7]);
+    engine_put64(&jb[0x78], ctx->asi);
+    engine_put64(&jb[0x80], ctx->ccr);
+    engine_put64(&jb[0x88], ctx->y);
+    if (!ops->write(ops->context, base, jb, (uint64_t)sizeof(jb))) {
+        return 1;
+    }
+    /* First return: 0 in %g1, resume at the retl past the ta. */
+    ctx->r[SPARC64_G1] = UINT64_C(0);
+    ctx->pc = pc + 4U;
+    ctx->npc = pc + 8U;
+    return 0;
+}
+
+static int engine_longjmp_trap(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *ops, guest_state_t *g, uint64_t pc)
+{
+    uint8_t jb[0x90];
+    uint8_t valw[8];
+    uint64_t base = ctx->r[SPARC64_O0];
+    uint64_t val;
+    uint64_t sp;
+    uint64_t rpc;
+    uint64_t cwp;
+    sparc64_step_result_t res;
+    unsigned guard;
+    if (!ops->read(ops->context, base, jb, (uint64_t)sizeof(jb))) {
+        return 1;
+    }
+    if (engine_get64(&jb[0x00]) != ENGINE_SETJMP_MAGIC) {
+        return 1;
+    }
+    if (!ops->read(ops->context, base + UINT64_C(0x40), valw,
+            (uint64_t)sizeof(valw))) {
+        return 1;
+    }
+    val = engine_get64(valw);
+    sp = engine_get64(&jb[0x08]);
+    rpc = engine_get64(&jb[0x10]);
+    cwp = engine_get64(&jb[0x18]);
+    if (cwp >= (uint64_t)SPARC64_NWINDOWS || rpc == UINT64_C(0)) {
+        return 1;
+    }
+    /* The handler frames clobbered winfile: drop the cache so the unwind
+     * below refills every reactivated window from its flushed home slot.
+     * Unwind to the setjmp window (flat trap: no window change of its
+     * own); the (cwp, sp) pair identifies the target frame. */
+    sparc64_win_invalidate_all();
+    for (guard = 0U; guard < 64U; guard++) {
+        if ((uint64_t)ctx->cwp == cwp && ctx->r[SPARC64_SP] == sp) {
+            break;
+        }
+        if (!sparc64_win_restore(ctx, &guest_mem_ops, g, UINT64_C(0), 0U,
+                &res, pc)) {
+            return 1;
+        }
+    }
+    if (guard >= 64U) {
+        return 1;
+    }
+    ctx->r[SPARC64_G1] = val;
+    ctx->r[SPARC64_G2] = engine_get64(&jb[0x28]);
+    ctx->r[SPARC64_G3] = engine_get64(&jb[0x30]);
+    ctx->r[SPARC64_G4] = engine_get64(&jb[0x38]);
+    ctx->r[SPARC64_G5] = engine_get64(&jb[0x48]);
+    ctx->r[SPARC64_G6] = engine_get64(&jb[0x50]);
+    ctx->r[SPARC64_G7] = engine_get64(&jb[0x58]);
+    ctx->asi = engine_get64(&jb[0x78]);
+    ctx->ccr = engine_get64(&jb[0x80]);
+    ctx->y = engine_get64(&jb[0x88]);
+    ctx->pc = rpc;
+    ctx->npc = rpc + 4U;
+    /* Images are resident again (rebuilt from flushed slots): serve pops
+     * from winfile, and force spill-always so a deep post-longjmp nest
+     * re-homes images instead of stranding them. */
+    ctx->canrestore = SPARC64_NWINDOWS - 1U;
+    ctx->cansave = 0U;
+    return 0;
+}
+
+/* Reference interpreter loop (engine 0). Returns the guest exit status. */
+int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *ops)
+{
+    for (;;) {
+        sparc64_step_result_t step = sparc64_step(ctx, &guest_mem_ops, g);
+        if (step.kind == SPARC64_STEP_SYSCALL) {
+            unsigned trapno = engine_trapno(ops, step.pc);
+            if (trapno == 0x6eU) {
+                if (engine_setjmp_trap(ctx, ops, g, step.pc) != 0) {
+                    return 1;
+                }
+            } else if (trapno == 0x6fU) {
+                if (engine_longjmp_trap(ctx, ops, g, step.pc) != 0) {
+                    return 1;
+                }
+            } else {
+                long nr = (long)ctx->r[SPARC64_G1];
+                long status = sparc64_handle_syscall(ctx, ops);
+                if (sparc64_syscall_is_exit(nr)) {
+                    return (int)(status & 0xffL);
+                }
+            }
+        } else if (step.kind == SPARC64_STEP_TRAP) {
+            if (run_deliver_trap(g, ctx, ops, &step) != 0) {
+                return 1;
+            }
+        } else if (step.kind != SPARC64_STEP_CONTINUE) {
+            (void)fprintf(stderr,
+                          "sparc64rt: guest stopped: kind=%d cause=%d pc=0x%llx\n",
+                          (int)step.kind, (int)step.cause,
+                          (unsigned long long)step.pc);
+            return 1;
+        }
+    }
+}
+
+/* DBT loop (engine 1): same stops as the interpreter, translated. */
+int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *ops)
+{
+    sparc64_dbt_t dbt;
+    int rc;
+    if (sparc64_dbt_init(&dbt) != 0) {
+        (void)fprintf(stderr, "sparc64rt: cannot init DBT\n");
+        return 1;
+    }
+    g->dbt = &dbt;
+    rc = 1;
+    for (;;) {
+        sparc64_step_result_t step = sparc64_dbt_run(ctx, &guest_mem_ops,
+            g, &dbt);
+        if (step.kind == SPARC64_STEP_SYSCALL) {
+            unsigned trapno = engine_trapno(ops, step.pc);
+            if (trapno == 0x6eU) {
+                if (engine_setjmp_trap(ctx, ops, g, step.pc) != 0) {
+                    break;
+                }
+            } else if (trapno == 0x6fU) {
+                if (engine_longjmp_trap(ctx, ops, g, step.pc) != 0) {
+                    break;
+                }
+            } else {
+                long nr = (long)ctx->r[SPARC64_G1];
+                long status = sparc64_handle_syscall(ctx, ops);
+                if (sparc64_syscall_is_exit(nr)) {
+                    rc = (int)(status & 0xffL);
+                    break;
+                }
+            }
+        } else if (step.kind == SPARC64_STEP_TRAP) {
+            if (run_deliver_trap(g, ctx, ops, &step) != 0) {
+                break;
+            }
+        } else if (step.kind != SPARC64_STEP_CONTINUE) {
+            (void)fprintf(stderr,
+                          "sparc64rt: guest stopped: kind=%d cause=%d pc=0x%llx\n",
+                          (int)step.kind, (int)step.cause,
+                          (unsigned long long)step.pc);
+            break;
+        }
+    }
+    g->dbt = NULL;
+    sparc64_dbt_fini(&dbt);
+    return rc;
+}
+
+/* Difftest syscall hook: run once on the interp copy, mirror to dbt. */
+typedef struct {
+    const sparc64_syscall_mem_t *ops;
+    guest_state_t *g;
+} diff_hook_arg_t;
+
+static long diff_syscall_hook(sparc64_ctx_t *ic, void *arg, int *is_exit)
+{
+    diff_hook_arg_t *h = (diff_hook_arg_t *)arg;
+    unsigned trapno = engine_trapno(h->ops, ic->pc);
+    long nr;
+    long status;
+    if (trapno == 0x6eU) {
+        if (engine_setjmp_trap(ic, h->ops, h->g, ic->pc) != 0) {
+            *is_exit = 1;
+            return 1L;
+        }
+        *is_exit = 0;
+        return 0L;
+    }
+    if (trapno == 0x6fU) {
+        if (engine_longjmp_trap(ic, h->ops, h->g, ic->pc) != 0) {
+            *is_exit = 1;
+            return 1L;
+        }
+        *is_exit = 0;
+        return 0L;
+    }
+    nr = (long)ic->r[SPARC64_G1];
+    status = sparc64_handle_syscall(ic, h->ops);
+    *is_exit = sparc64_syscall_is_exit(nr);
+    return status;
+}
+
+/* Difftest trap hook: synchronous signal delivery on one copy. */
+static int diff_trap_hook(sparc64_ctx_t *c, void *arg, int signo, int code,
+    uint64_t fault_addr)
+{
+    diff_hook_arg_t *h = (diff_hook_arg_t *)arg;
+    return sparc64_sync_sig_deliver(c, h->ops, signo, code, fault_addr);
+}
+
+/* Difftest loop (engine 2): lockstep interp-vs-dbt from the same load. */
+int run_difftest(guest_state_t *g, sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *ops)
+{
+    sparc64_dbt_t dbt;
+    sparc64_difftest_cfg_t cfg;
+    diff_hook_arg_t hook;
+    int rc;
+    if (sparc64_dbt_init(&dbt) != 0) {
+        (void)fprintf(stderr, "sparc64rt: cannot init DBT\n");
+        return 1;
+    }
+    memset(&cfg, 0, sizeof(cfg));
+    hook.ops = ops;
+    hook.g = g;
+    cfg.mem = &guest_mem_ops;
+    cfg.mc = g;
+    cfg.dbt = &dbt;
+    cfg.dbt_step = sparc64_dbt_step_one;
+    cfg.syscall = diff_syscall_hook;
+    cfg.syscall_arg = &hook;
+    cfg.trap_deliver = diff_trap_hook;
+    cfg.trap_arg = &hook;
+    rc = sparc64_difftest_run(&cfg, ctx);
+    sparc64_dbt_fini(&dbt);
+    return rc;
+}
+

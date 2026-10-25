@@ -100,4 +100,10 @@ sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
 /* Invalidate translated code overlapping [va, va+len) (SMC/mprotect). */
 void sparc64_dbt_invalidate(sparc64_dbt_t *dbt, uint64_t va, uint64_t len);
 
+/* Single-instruction step for difftest lockstep (a CTI plus its delay
+ * slot counts as one step, matching sparc64_step). Falls back to the
+ * interpreter whenever the instruction refuses emission. */
+sparc64_step_result_t sparc64_dbt_step_one(sparc64_dbt_t *dbt,
+    sparc64_ctx_t *ctx, const sparc64_mem_ops_t *mem, void *mc);
+
 #endif /* SPARC64RT_DBT_DBT_H */
