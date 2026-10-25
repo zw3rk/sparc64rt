@@ -1,114 +1,118 @@
-/* Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+/*
+ * src/main.c — sparc64rt CLI (Phase 6, L6a host-contract compliance)
+ *
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * sparc64rt CLI entry: SPARC V9 (sparc64, Oracle M8 / SPARC64 XII)
- * user-mode translator. Phase 0 parses flags and selects the engine;
- * guest loading and execution land in later phases (interp in Phase 1,
- * dbt in Phase 2).
+ * SPARC V9 (sparc64) user-mode translator entry: host-contract CLI/env
+ * parsing lives in src/rt64/runtime/host_contract.c; this TU wires the
+ * resolved options to the runner, reports --stats, and owns exit codes.
+ * Unknown --options fail hard (exit 2).
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "os/guest_run.h"
-
-#define SPARC64RT_VERSION "0.0.0-phase0"
-
-typedef enum {
-    SPARC64_ENGINE_DEFAULT,
-    SPARC64_ENGINE_INTERP,
-    SPARC64_ENGINE_DBT
-} sparc64_engine_t;
-
-static int usage(const char *argv0, FILE *out)
-{
-    return fprintf(out,
-                   "Usage: %s [options] <guest> [guest-args...]\n"
-                   "SPARC V9 (sparc64) user-mode translator.\n"
-                   "\n"
-                   "Options:\n"
-                   "  --interp       run the reference interpreter\n"
-                   "  --dbt          run the AArch64 dynamic binary translator\n"
-                   "  --difftest     compare dbt against interp step by step\n"
-                   "  --trace        trace executed guest instructions\n"
-                   "  --version      print version and exit\n"
-                   "  --help         print this help and exit\n"
-                   "\n"
-                   "Environment:\n"
-                   "  SPARC64RT_ENGINE=interp|dbt  default engine selection\n",
-                   argv0);
-}
+#include "runtime/host_contract.h"
 
 int main(int argc, char **argv)
 {
-    sparc64_engine_t engine = SPARC64_ENGINE_DEFAULT;
-    int difftest = 0;
-    int trace = 0;
-    const char *guest = NULL;
-    int guest_index = 0;
+    sparc64_host_options_t opts;
+    sparc64_host_cache_t cache;
+    const char *error = NULL;
+    const char *engine_name = "interp";
+    const char *exec_path;
+    const char *loader_path;
+    char *synthetic[2];
+    int help_only = 0;
+    int engine_id = 0;
+    int eff_fd = -1;
+    int rc;
+    int code;
 
-    const char *env = getenv("SPARC64RT_ENGINE");
-    if (env != NULL) {
-        if (strcmp(env, "interp") == 0)
-            engine = SPARC64_ENGINE_INTERP;
-        else if (strcmp(env, "dbt") == 0)
-            engine = SPARC64_ENGINE_DBT;
-        else {
-            (void)fprintf(stderr, "sparc64rt: unknown SPARC64RT_ENGINE=%s\n",
-                          env);
-            return 2;
-        }
+    memset(&opts, 0, sizeof(opts));
+    memset(&cache, 0, sizeof(cache));
+    code = sparc64_host_parse(argc, argv, &opts, &error, &help_only);
+    if (help_only == 1) {
+        sparc64_host_usage((argc > 0) ? argv[0] : "sparc64rt", 1);
+        return 0;
     }
-
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--version") == 0) {
-            (void)printf("sparc64rt %s\n", SPARC64RT_VERSION);
-            return 0;
-        }
-        if (strcmp(argv[i], "--help") == 0) {
-            usage(argv[0], stdout);
-            return 0;
-        }
-        if (strcmp(argv[i], "--interp") == 0) {
-            engine = SPARC64_ENGINE_INTERP;
-            continue;
-        }
-        if (strcmp(argv[i], "--dbt") == 0) {
-            engine = SPARC64_ENGINE_DBT;
-            continue;
-        }
-        if (strcmp(argv[i], "--difftest") == 0) {
-            difftest = 1;
-            continue;
-        }
-        if (strcmp(argv[i], "--trace") == 0) {
-            trace = 1;
-            continue;
-        }
-        if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] != '\0') {
-            (void)fprintf(stderr, "sparc64rt: unknown option %s\n", argv[i]);
-            usage(argv[0], stderr);
-            return 2;
-        }
-        guest = argv[i];
-        guest_index = i;
-        break;
+    if (help_only != 0) {
+        return 0;
     }
-
-    if (guest == NULL) {
-        (void)fprintf(stderr, "sparc64rt: no guest image\n");
-        usage(argv[0], stderr);
+    if (code != 0) {
+        (void)fprintf(stderr, "sparc64rt: %s\n",
+            (error != NULL) ? error : "invalid options");
+        sparc64_host_usage((argc > 0) ? argv[0] : "sparc64rt", 0);
         return 2;
     }
-
-    /* Engine dispatch: --dbt runs the AArch64 DBT, --difftest the
-     * lockstep harness, anything else (or --interp) the interpreter. */
-    (void)trace;
-    if (difftest) {
-        return sparc64_guest_run_engine(guest, &argv[guest_index], 2);
+    if (opts.selftest) {
+        return sparc64_host_selftest();
     }
-    if (engine == SPARC64_ENGINE_DBT) {
-        return sparc64_guest_run_engine(guest, &argv[guest_index], 1);
+    code = sparc64_host_check_authorities(&opts);
+    if (code != 0) {
+        if (opts.stats) {
+            sparc64_host_report_stats(&opts, &cache, "none", code);
+        }
+        return code;
     }
-    return sparc64_guest_run(guest, &argv[guest_index], 1);
+    if (sparc64_host_apply_sysroot(&opts) != 0) {
+        (void)fprintf(stderr,
+            "sparc64rt: cannot normalize SPARC64RT_SYSROOT\n");
+        if (opts.stats) {
+            sparc64_host_report_stats(&opts, &cache, "none", 1);
+        }
+        return 1;
+    }
+    code = sparc64_host_resolve_image(&opts, &eff_fd, &error);
+    if (code != 0) {
+        (void)fprintf(stderr, "sparc64rt: %s\n",
+            (error != NULL) ? error : "invalid executable descriptor");
+        if (opts.stats) {
+            sparc64_host_report_stats(&opts, &cache, "none", code);
+        }
+        return code;
+    }
+    /* Image source: borrowed fd wins; otherwise execfn, otherwise the
+     * positional path token (also argv[0] when --execfn is absent). */
+    exec_path = (opts.execfn != NULL) ? opts.execfn : opts.image_path;
+    loader_path = (eff_fd >= 0) ? opts.image_path : exec_path;
+    if (loader_path == NULL && eff_fd < 0) {
+        (void)fprintf(stderr, "sparc64rt: no guest image\n");
+        if (opts.stats) {
+            sparc64_host_report_stats(&opts, &cache, "none", 2);
+        }
+        return 2;
+    }
+    if (opts.cache_dir != NULL) {
+        (void)sparc64_host_cache_admit(&opts, eff_fd,
+            (eff_fd >= 0) ? NULL : exec_path, &cache);
+    }
+    if (opts.difftest) {
+        engine_id = 2;
+        engine_name = "difftest";
+    } else if (opts.engine == SPARC64_HOST_ENGINE_DBT) {
+        engine_id = 1;
+        engine_name = "dbt";
+    }
+    if (opts.trace) {
+        (void)fprintf(stderr, "sparc64rt: --trace is accepted "
+            "(per-instruction tracing not wired)\n");
+    }
+    if (opts.guest_argv == NULL) {
+        synthetic[0] = (char *)((exec_path != NULL) ? exec_path :
+            loader_path);
+        synthetic[1] = NULL;
+        rc = sparc64_guest_run_full(loader_path, eff_fd, opts.execfn,
+            synthetic, engine_id);
+    } else {
+        rc = sparc64_guest_run_full(loader_path, eff_fd, opts.execfn,
+            opts.guest_argv, engine_id);
+    }
+    if (opts.stats) {
+        sparc64_host_report_stats(&opts, &cache, engine_name,
+            rc < 0 ? 1 : rc);
+    }
+    return rc < 0 ? 1 : rc;
 }
