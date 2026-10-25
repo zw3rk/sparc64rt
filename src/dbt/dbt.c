@@ -35,6 +35,7 @@
 
 #include "a32host.h"
 #include "dbt/dbt.h"
+#include "dbt/emit_fp.h"
 #include "dbt/emit_int.h"
 #include "interp/interp.h"
 
@@ -298,7 +299,11 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
          * (plain insns, never-trapping Tcc) needs a fall-through exit
          * at the range end. */
         term_here = d.cls == (uint8_t)SPARC64_ICLS_TCC && d.cond != 0U;
-        if (!sparc64_emit_int(&ec, &d)) {
+        if (d.cls == (uint8_t)SPARC64_ICLS_FPU) {
+            if (!sparc64_emit_fp(&ec, &d)) {
+                goto fail;
+            }
+        } else if (!sparc64_emit_int(&ec, &d)) {
             goto fail;
         }
         a += 4U;
@@ -426,7 +431,6 @@ static const sparc64_dbt_block_t *dbt_translate(
             stop = true;
             break;
         case SPARC64_ICLS_PRIV:
-        case SPARC64_ICLS_FPU:
         case SPARC64_ICLS_FBR:
         case SPARC64_ICLS_ILLEGAL:
             /* Rare/system/privileged: pristine interpreter fallback. */
