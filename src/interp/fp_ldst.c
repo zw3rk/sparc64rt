@@ -66,6 +66,15 @@ static sparc64_step_result_t fp_zero(sparc64_cpu_t *cpu, uint64_t pc,
     return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
 }
 
+/* VIS FSRC2D: 64-bit copy d[rs2 field] to d[rd] (oracle-probed identity
+ * on live glibc VIS memcpy data, all bit patterns). Never touches FSR. */
+static sparc64_step_result_t fp_fsrc2d(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d)
+{
+    cpu->fp.d[fp_pair(d->rd)] = cpu->fp.d[fp_pair(d->raw & 31U)];
+    return sparc64_step_ok(pc);
+}
+
 /* VIS FALIGNDATA data path: eight bytes splice with GSR bits 2:0 as
  * the offset (src1[off..7] ++ src2[0..off-1]). Never touches FSR. */
 static sparc64_step_result_t fp_aligndata(sparc64_cpu_t *cpu, uint64_t pc,
@@ -92,6 +101,9 @@ sparc64_step_result_t sparc64_fp_vis(sparc64_cpu_t *cpu, uint64_t pc,
     }
     if (d->opf == SPARC64_OPF_FALIGNDATA) {
         return fp_aligndata(cpu, pc, d);
+    }
+    if (d->opf == SPARC64_OPF_FSRC2D) {
+        return fp_fsrc2d(cpu, pc, d);
     }
     return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
 }

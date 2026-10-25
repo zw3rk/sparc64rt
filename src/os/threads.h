@@ -73,8 +73,12 @@ void sparc64_threads_boot(const sparc64_syscall_mem_t *ops, int engine,
 void sparc64_thread_big_lock(void);
 void sparc64_thread_big_unlock(void);
 
-/* Group-exit state (first terminal thread exit wins the status). */
+/* Group-exit state (first exit_group wins the status). */
 int sparc64_threads_group_exiting(long *status_out);
+/* Record an exit_group syscall: arms group exit (first status wins) so
+ * threads blocked in futex WAIT abort. A plain thread exit (NR exit)
+ * must NOT call this; it ends only its own thread. */
+void sparc64_threads_note_group_exit(long status);
 
 /* Thread entry (defined in guest_engines.c): runs the slot's engine loop
  * on its own ctx, then finalizes (CLEARTID + wake, group-exit record). */
@@ -83,8 +87,10 @@ void *sparc64_thread_entry(void *arg);
 /* Publish that a slot's host thread has started (entry bookkeeping). */
 void sparc64_thread_entry_started(sparc64_thread_t *slot);
 
-/* Finalize a slot after its engine loop returns (CLEARTID + wake, group
- * record, mark done). status is the engine loop's exit status. */
+/* Finalize a slot after its engine loop returns (CLEARTID + wake, mark
+ * done). status is the engine loop's exit status. Never arms group
+ * exit: a thread returning here ended itself (NR exit); only an
+ * exit_group syscall (via sparc64_threads_note_group_exit) ends all. */
 void sparc64_thread_entry_done(sparc64_thread_t *slot, long status);
 
 /* Syscall bodies (host-style results: >= 0 value, negative host errno). */

@@ -46,6 +46,9 @@ struct sparc64_syscall_mem {
 
 /* Nonzero when nr names a terminal exit (exit/exit_group). */
 int sparc64_syscall_is_exit(long nr);
+/* Nonzero only for exit_group (whole-process exit). A plain exit from a
+ * CLONE_VM thread ends just that thread and must not arm group exit. */
+int sparc64_syscall_is_group_exit(long nr);
 
 /* Short name for nr, or NULL when out of range. */
 const char *sparc64_syscall_name(long nr);

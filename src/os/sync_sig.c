@@ -147,6 +147,11 @@ void sparc64_sync_sig_blocked_set(uint64_t mask)
     sync_blocked = mask;
 }
 
+uint64_t sparc64_sync_sig_pending_get(void)
+{
+    return sync_pending;
+}
+
 long sparc64_sync_sig_altstack_set(uint64_t sp, uint64_t flags,
     uint64_t size)
 {
@@ -170,13 +175,24 @@ long sparc64_sync_sig_altstack_set(uint64_t sp, uint64_t flags,
 }
 
 void sparc64_sync_sig_altstack_get(uint64_t *sp, uint64_t *flags,
-    uint64_t *size)
+    uint64_t *size, uint64_t cur_sp_unbiased)
 {
     if (sp != NULL) {
         *sp = sync_ss_sp;
     }
     if (flags != NULL) {
-        *flags = sync_ss_flags;
+        uint64_t f = sync_ss_flags;
+        /* SS_ONSTACK is dynamic: report it when the stack is enabled
+         * and the current stack pointer is inside its range. */
+        if ((f & (uint64_t)SPARC64_SS_DISABLE) == UINT64_C(0) &&
+            sync_ss_sp != UINT64_C(0)) {
+            uint64_t end = sync_ss_sp + sync_ss_size;
+            if (end >= sync_ss_sp && cur_sp_unbiased >= sync_ss_sp &&
+                cur_sp_unbiased < end) {
+                f |= (uint64_t)SPARC64_SS_ONSTACK;
+            }
+        }
+        *flags = f;
     }
     if (size != NULL) {
         *size = sync_ss_size;

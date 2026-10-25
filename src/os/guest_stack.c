@@ -191,11 +191,16 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
         return -E2BIG;
     }
     frame = align_down(str_base - words * UINT64_C(8) - UINT64_C(128), 16U);
-    stack_base = align_down(frame, GUEST_PAGE_SIZE);
-    stack_size = GUEST_STACK_TOP - stack_base;
-    if (stack_size == 0U || stack_size > GUEST_STACK_MAX) {
+    /* Linux gives the main thread an 8 MB stack growing down on demand;
+     * glibc stdio/pthread startup faults well below the initial frame,
+     * so reserve the whole window up front instead of only the frame
+     * pages (oracle-probed: faults tracked ~1 KB past a frame-only base
+     * for guests needing ~7 KB). TOP and MAX are both page-aligned. */
+    stack_base = GUEST_STACK_TOP - GUEST_STACK_MAX;
+    if (frame < stack_base) {
         return -ENOMEM;
     }
+    stack_size = GUEST_STACK_TOP - stack_base;
     if (!sparc64_space_map(&g->space, stack_base, stack_size,
                            SPARC64_MEM_READ | SPARC64_MEM_WRITE, false)) {
         return -ENOMEM;

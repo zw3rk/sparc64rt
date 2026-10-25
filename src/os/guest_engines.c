@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "core/cpu.h"
@@ -21,6 +22,7 @@
 #include "os/guest_run_priv.h"
 #include "os/sync_sig.h"
 #include "os/syscalls_min.h"
+#include "os/syscalls_sig.h"
 #include "os/threads.h"
 
 /* ---- Engine runners ------------------------------------------------------- */
@@ -91,12 +93,19 @@ static uint64_t engine_get64(const uint8_t *p)
 static int engine_setjmp_trap(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *ops, guest_state_t *g, uint64_t pc)
 {
-    uint8_t jb[0x90];
+    /* Snapshot layout (base = glibc jmp_buf). Slots +0x40 (longjmp
+     * return value) and +0x200 (savemask flag) belong to glibc and are
+     * never written here; everything else is engine-private. The full
+     * out/local/in banks are captured so longjmp can snap back
+     * directly instead of walking the window chain (which a signal
+     * delivery's fresh stack link would otherwise break). */
+    uint8_t jb[0x170];
     uint64_t base = ctx->r[SPARC64_O0];
     sparc64_step_result_t res;
+    unsigned i;
     (void)memset(jb, 0, sizeof(jb));
-    /* Mirror every outstanding image into its home slot first: longjmp
-     * pops below this point refill from these slots, and post-flush
+    /* Mirror every outstanding image into its home slot first: fills
+     * after a longjmp snap refill from these slots, and post-flush
      * fills are idempotent by construction. Only valid (outstanding)
      * images are written; dead images' homes are live stack space. */
     if (!sparc64_win_flush_all(ctx, &guest_mem_ops, g, &res, pc)) {
@@ -116,6 +125,18 @@ static int engine_setjmp_trap(sparc64_ctx_t *ctx,
     engine_put64(&jb[0x78], ctx->asi);
     engine_put64(&jb[0x80], ctx->ccr);
     engine_put64(&jb[0x88], ctx->y);
+    for (i = 0U; i < 8U; i++) {
+        engine_put64(&jb[0x90] + (uint64_t)i * 8U,
+            ctx->r[SPARC64_O0 + i]);
+        engine_put64(&jb[0xD0] + (uint64_t)i * 8U,
+            ctx->r[SPARC64_L0 + i]);
+        engine_put64(&jb[0x110] + (uint64_t)i * 8U,
+            ctx->r[SPARC64_I0 + i]);
+    }
+    engine_put64(&jb[0x150], sparc64_sync_sig_blocked_get());
+    engine_put64(&jb[0x158], (uint64_t)ctx->cansave);
+    engine_put64(&jb[0x160], (uint64_t)ctx->canrestore);
+    engine_put64(&jb[0x168], (uint64_t)ctx->otherwin);
     if (!ops->write(ops->context, base, jb, (uint64_t)sizeof(jb))) {
         return 1;
     }
@@ -129,49 +150,44 @@ static int engine_setjmp_trap(sparc64_ctx_t *ctx,
 static int engine_longjmp_trap(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *ops, guest_state_t *g, uint64_t pc)
 {
-    uint8_t jb[0x90];
-    uint8_t valw[8];
+    /* Snapshot layout is defined by engine_setjmp_trap; +0x40 (glibc
+     * return value) and +0x200 (glibc savemask flag) are read here. */
+    uint8_t jb[0x170];
+    uint8_t w8[8];
     uint64_t base = ctx->r[SPARC64_O0];
     uint64_t val;
-    uint64_t sp;
+    uint64_t flag;
     uint64_t rpc;
     uint64_t cwp;
-    sparc64_step_result_t res;
-    unsigned guard;
+    unsigned i;
+    (void)g;
+    (void)pc;
     if (!ops->read(ops->context, base, jb, (uint64_t)sizeof(jb))) {
         return 1;
     }
     if (engine_get64(&jb[0x00]) != ENGINE_SETJMP_MAGIC) {
         return 1;
     }
-    if (!ops->read(ops->context, base + UINT64_C(0x40), valw,
-            (uint64_t)sizeof(valw))) {
-        return 1;
-    }
-    val = engine_get64(valw);
-    sp = engine_get64(&jb[0x08]);
+    val = engine_get64(&jb[0x40]);
     rpc = engine_get64(&jb[0x10]);
     cwp = engine_get64(&jb[0x18]);
-    if (cwp >= (uint64_t)SPARC64_NWINDOWS || rpc == UINT64_C(0)) {
+    if (cwp >= (uint64_t)SPARC64_NWINDOWS || rpc == UINT64_C(0) ||
+        (rpc & UINT64_C(3)) != UINT64_C(0)) {
         return 1;
     }
-    /* The handler frames clobbered winfile: drop the cache so the unwind
-     * below refills every reactivated window from its flushed home slot.
-     * Unwind to the setjmp window (flat trap: no window change of its
-     * own); the (cwp, sp) pair identifies the target frame. */
-    sparc64_win_invalidate_all();
-    for (guard = 0U; guard < 64U; guard++) {
-        if ((uint64_t)ctx->cwp == cwp && ctx->r[SPARC64_SP] == sp) {
-            break;
-        }
-        if (!sparc64_win_restore(ctx, &guest_mem_ops, g, UINT64_C(0), 0U,
-                &res, pc)) {
-            return 1;
-        }
-    }
-    if (guard >= 64U) {
+    if (!ops->read(ops->context, base + UINT64_C(0x200), w8,
+            (uint64_t)sizeof(w8))) {
         return 1;
     }
+    flag = engine_get64(w8);
+    /* Direct snap back to the setjmp state: restore the full register
+     * file from the snapshot and drop the window cache so later
+     * fills rebuild from the flushed home slots. Walking the window
+     * chain instead cannot work across a signal delivery, whose
+     * handler frame links back through a fresh stack link rather than
+     * the interrupted stack pointer. */
+    ctx->r[SPARC64_SP] = engine_get64(&jb[0x08]);
+    ctx->cwp = (unsigned)cwp;
     ctx->r[SPARC64_G1] = val;
     ctx->r[SPARC64_G2] = engine_get64(&jb[0x28]);
     ctx->r[SPARC64_G3] = engine_get64(&jb[0x30]);
@@ -179,16 +195,29 @@ static int engine_longjmp_trap(sparc64_ctx_t *ctx,
     ctx->r[SPARC64_G5] = engine_get64(&jb[0x48]);
     ctx->r[SPARC64_G6] = engine_get64(&jb[0x50]);
     ctx->r[SPARC64_G7] = engine_get64(&jb[0x58]);
+    for (i = 0U; i < 8U; i++) {
+        ctx->r[SPARC64_O0 + i] = engine_get64(&jb[0x90] +
+            (uint64_t)i * 8U);
+        ctx->r[SPARC64_L0 + i] = engine_get64(&jb[0xD0] +
+            (uint64_t)i * 8U);
+        ctx->r[SPARC64_I0 + i] = engine_get64(&jb[0x110] +
+            (uint64_t)i * 8U);
+    }
     ctx->asi = engine_get64(&jb[0x78]);
     ctx->ccr = engine_get64(&jb[0x80]);
     ctx->y = engine_get64(&jb[0x88]);
+    ctx->cansave = (unsigned)engine_get64(&jb[0x158]);
+    ctx->canrestore = (unsigned)engine_get64(&jb[0x160]);
+    ctx->otherwin = (unsigned)engine_get64(&jb[0x168]);
+    sparc64_win_invalidate_all();
+    if (flag != UINT64_C(0)) {
+        uint64_t saved = engine_get64(&jb[0x150]);
+        /* SIGKILL/SIGSTOP can never be blocked. */
+        saved &= ~(SPARC64_SIGKILL_BIT | SPARC64_SIGSTOP_BIT);
+        sparc64_sync_sig_blocked_set(saved);
+    }
     ctx->pc = rpc;
     ctx->npc = rpc + 4U;
-    /* Images are resident again (rebuilt from flushed slots): serve pops
-     * from winfile, and force spill-always so a deep post-longjmp nest
-     * re-homes images instead of stranding them. */
-    ctx->canrestore = SPARC64_NWINDOWS - 1U;
-    ctx->cansave = 0U;
     return 0;
 }
 
@@ -222,6 +251,9 @@ int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,
                 long nr = (long)ctx->r[SPARC64_G1];
                 long status = sparc64_handle_syscall(ctx, ops);
                 if (sparc64_syscall_is_exit(nr)) {
+                    if (sparc64_syscall_is_group_exit(nr)) {
+                        sparc64_threads_note_group_exit(status);
+                    }
                     sparc64_thread_big_unlock();
                     return (int)(status & 0xffL);
                 }
@@ -246,10 +278,14 @@ int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,
 int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *ops)
 {
-    sparc64_dbt_t dbt;
+    /* Heap, not stack: sparc64_dbt_t is ~70KB and CLONE_VM children run
+     * on host threads with musl's 80KB default stack. A stack instance
+     * overflowed the child stack on entry (SIGSEGV before first insn). */
+    sparc64_dbt_t *dbt = calloc(1U, sizeof(*dbt));
     int rc;
-    if (sparc64_dbt_init(&dbt) != 0) {
+    if (dbt == NULL || sparc64_dbt_init(dbt) != 0) {
         (void)fprintf(stderr, "sparc64rt: cannot init DBT\n");
+        free(dbt);
         return 1;
     }
     /* L4b: same boot/serialization as run_interp. DBT instances stay
@@ -260,12 +296,12 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
     sparc64_thread_big_lock();
     /* Same clean-cache rule as the interp loop (shared winfile). */
     sparc64_win_invalidate_all();
-    g->dbt = &dbt;
+    g->dbt = dbt;
     rc = 1;
     for (;;) {
         sparc64_step_result_t step;
-        g->dbt = &dbt;
-        step = sparc64_dbt_run(ctx, &guest_mem_ops, g, &dbt);
+        g->dbt = dbt;
+        step = sparc64_dbt_run(ctx, &guest_mem_ops, g, dbt);
         if (step.kind == SPARC64_STEP_SYSCALL) {
             unsigned trapno = engine_trapno(ops, step.pc);
             if (trapno == 0x6eU) {
@@ -280,6 +316,9 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
                 long nr = (long)ctx->r[SPARC64_G1];
                 long status = sparc64_handle_syscall(ctx, ops);
                 if (sparc64_syscall_is_exit(nr)) {
+                    if (sparc64_syscall_is_group_exit(nr)) {
+                        sparc64_threads_note_group_exit(status);
+                    }
                     rc = (int)(status & 0xffL);
                     break;
                 }
@@ -298,7 +337,8 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
     }
     g->dbt = NULL;
     sparc64_thread_big_unlock();
-    sparc64_dbt_fini(&dbt);
+    sparc64_dbt_fini(dbt);
+    free(dbt);
     return rc;
 }
 
@@ -306,9 +346,9 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
 
 /* Host-thread entry for one CLONE_VM thread: reuse the engine loop the
  * process booted with (interp or DBT) on the slot's own ctx, then
- * finalize through threads.c (CLEARTID + wake, group-exit record). The
- * engine loop re-acquires the big guest lock; a terminal exit there is
- * a group exit per the lane contract. */
+ * finalize through threads.c (CLEARTID + wake, mark done). The engine
+ * loop re-acquires the big guest lock; only exit_group arms the group
+ * flag, a plain thread exit ends just this slot. */
 void *sparc64_thread_entry(void *arg)
 {
     sparc64_thread_t *slot = (sparc64_thread_t *)arg;

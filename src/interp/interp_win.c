@@ -861,3 +861,20 @@ sparc64_step_result_t sparc64_exec_align(sparc64_cpu_t *cpu, uint64_t pc,
     sparc64_wreg(cpu, d->rd, sum & ~(UINT64_C(7)));
     return sparc64_step_ok(pc);
 }
+
+/* Privileged-class execution. FLUSHW is the V9 exception: it is
+ * unprivileged and only spills outstanding windows to their homes
+ * (glibc issues it around clone); occupancy is unchanged. */
+sparc64_step_result_t sparc64_exec_priv(sparc64_cpu_t *cpu,
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t pc,
+    const sparc64_dec_t *d)
+{
+    sparc64_step_result_t res;
+    if (d->op3 == SPARC64_OP3_FLUSHW) {
+        if (!sparc64_win_flush_all(cpu, mem, mc, &res, pc)) {
+            return res;
+        }
+        return sparc64_step_ok(pc);
+    }
+    return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
+}

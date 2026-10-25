@@ -605,7 +605,7 @@ static sparc64_step_result_t exec_single(sparc64_cpu_t *cpu,
         }
         return sparc64_step_ok(pc);
     case SPARC64_ICLS_PRIV:
-        return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
+        return sparc64_exec_priv(cpu, mem, mc, pc, d);
     case SPARC64_ICLS_FPU:
         return sparc64_exec_fpu(cpu, mem, mc, pc, d);
     case SPARC64_ICLS_FBR:

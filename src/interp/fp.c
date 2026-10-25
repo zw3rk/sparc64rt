@@ -35,9 +35,9 @@
  *
  * VIS (op3 0x36) routes to fp_ldst.c: FZERO 0x60 (double zero) /
  * 0x61 (single zero), FONE 0x7E (double ones), FALIGNDATA 0x48 with
- * GSR bits 2:0 as the byte offset; ALIGNADDR stays integer-classed
- * (interp_win.c). All other VIS opfs (0x62 fnord, 0x63 fnors,
- * 0x7A fornot1d, ...) trap ILLEGAL.
+ * GSR bits 2:0 as the byte offset, FSRC2D 0x78 (64-bit copy, glibc VIS
+ * memcpy); ALIGNADDR stays integer-classed (interp_win.c). All other
+ * VIS opfs (0x62 fnord, 0x63 fnors, 0x7A fornot1d, ...) trap ILLEGAL.
  *
  * FSR model: cexc bits 4:0 = NV/OF/UF/DZ/NX (bit 4 = NV), aexc bits 9:5
  * same order, fcc0 at 11:10, fcc1..3 at 33:32/35:34/37:36, RD at 31:30

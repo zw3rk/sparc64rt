@@ -46,8 +46,10 @@ typedef enum {
     SPARC64_ICLS_LDSTUB,
     SPARC64_ICLS_SWAP,
     SPARC64_ICLS_ATOMIC, /* CASA / CASXA. */
-    SPARC64_ICLS_PRIV,   /* RDPR/WRPR/RDHPR/WRHPR/FLUSHW/SAVED/RESTORED/
-                          * DONE/RETRY/SIR/RDPC/RDTICK/priv-ASR access. */
+    SPARC64_ICLS_PRIV,   /* RDPR/WRPR/RDHPR/WRHPR/SAVED/RESTORED/
+                          * DONE/RETRY/SIR/RDPC/RDTICK/priv-ASR access.
+                          * FLUSHW decodes here too but executes as an
+                          * unprivileged window spill (V9). */
     SPARC64_ICLS_FPU     /* FPop1/FPop2, FP loads/stores, FALIGNDATA. */
 } sparc64_icls_t;
 
@@ -181,6 +183,7 @@ typedef enum {
 #define SPARC64_OPF_ALIGNADDR 0x18U
 #define SPARC64_OPF_ALIGNADDRL 0x1AU
 #define SPARC64_OPF_FALIGNDATA 0x48U
+#define SPARC64_OPF_FSRC2D 0x78U
 
 /* Decoded instruction: every field reads 0 unless the class sets it. */
 typedef struct {
@@ -329,6 +332,9 @@ sparc64_step_result_t sparc64_exec_rdasr(sparc64_cpu_t *cpu, uint64_t pc,
 sparc64_step_result_t sparc64_exec_wrasr(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d);
 sparc64_step_result_t sparc64_exec_align(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d);
+sparc64_step_result_t sparc64_exec_priv(sparc64_cpu_t *cpu,
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t pc,
     const sparc64_dec_t *d);
 /* Minimal RC2 FPU kernel (interp/fp.c); Phase 3 subsumes it. */
 sparc64_step_result_t sparc64_exec_fpu(sparc64_ctx_t *cpu,

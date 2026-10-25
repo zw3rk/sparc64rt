@@ -36,6 +36,11 @@
  * shows WAIT-FAIL + P4-FAIL n=1 (exit 1). The EXEC/WAIT leg is
  * verified on the translator instead, where execve is implemented.
  *
+ * Difftest limitation (grounded): the lockstep harness is single-
+ * threaded by design (clone returns ENOSYS under engine 2), so the
+ * THREADS leg shows THREADS-FAIL under --difftest with 0 divergences.
+ * Thread behavior is verified by --interp vs --dbt output parity.
+ *
  * Expected stdout (working kernel / translator with lanes L4a+L4b):
  *   PIPE-OK
  *   DUP-OK

@@ -95,8 +95,9 @@ void sparc64_sync_sig_blocked_set(uint64_t mask);
 /* Store (0) or report (-EFAULT on bad guest address) the altstack. */
 long sparc64_sync_sig_altstack_set(uint64_t sp, uint64_t flags,
     uint64_t size);
+uint64_t sparc64_sync_sig_pending_get(void);
 void sparc64_sync_sig_altstack_get(uint64_t *sp, uint64_t *flags,
-    uint64_t *size);
+    uint64_t *size, uint64_t cur_sp_unbiased);
 
 /* Deliver the lowest pending unblocked signal with a handler.
  * Returns 0 on delivery, 1 when nothing is deliverable, -1 when the
@@ -132,6 +133,10 @@ long sparc64_sig_rt_sigaction(sparc64_ctx_t *ctx,
 long sparc64_sig_rt_sigprocmask(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *mem, uint64_t how, uint64_t set_va,
     uint64_t oset_va, uint64_t sigsetsize, int *delivered);
+
+long sparc64_sig_rt_sigpending(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t set_va,
+    uint64_t sigsetsize);
 
 long sparc64_sig_sigaltstack(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *mem, uint64_t uss_va,

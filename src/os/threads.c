@@ -199,6 +199,16 @@ int sparc64_threads_group_exiting(long *status_out)
     return exiting;
 }
 
+void sparc64_threads_note_group_exit(long status)
+{
+    (void)pthread_mutex_lock(&thr_table_lock);
+    if (!thr_group_exiting) {
+        thr_group_exiting = 1;
+        thr_group_status = status & 0xffL;
+    }
+    (void)pthread_mutex_unlock(&thr_table_lock);
+}
+
 /* Count live peers (table lock held). */
 static unsigned thr_live_locked(void)
 {
@@ -692,6 +702,7 @@ void sparc64_thread_entry_started(sparc64_thread_t *slot)
 void sparc64_thread_entry_done(sparc64_thread_t *slot, long status)
 {
     const sparc64_syscall_mem_t *ops;
+    (void)status;
     if (slot == NULL) {
         return;
     }
@@ -711,10 +722,8 @@ void sparc64_thread_entry_done(sparc64_thread_t *slot, long status)
     }
     slot->running = 0;
     slot->done = 1;
-    if (!thr_group_exiting) {
-        thr_group_exiting = 1;
-        thr_group_status = status & 0xffL;
-    }
+    /* No group-exit arming here: this slot ended only itself (NR exit).
+     * exit_group arms it via sparc64_threads_note_group_exit instead. */
     (void)pthread_mutex_unlock(&thr_table_lock);
     sparc64_thread_big_unlock();
 }

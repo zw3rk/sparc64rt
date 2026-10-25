@@ -243,6 +243,11 @@ int sparc64_syscall_is_exit(long nr)
             nr == (long)SPARC64__NR_exit_group) ? 1 : 0;
 }
 
+int sparc64_syscall_is_group_exit(long nr)
+{
+    return (nr == (long)SPARC64__NR_exit_group) ? 1 : 0;
+}
+
 const char *sparc64_syscall_name(long nr)
 {
     if (nr < 0L || nr >= (long)SPARC64_NR_MAX) {
@@ -362,6 +367,9 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         }
         break;
     }
+    case (long)SPARC64__NR_rt_sigpending:
+        ret = sparc64_sig_rt_sigpending(ctx, mem, o0, o1);
+        break;
     case (long)SPARC64__NR_ioctl:
         ret = sparc64_l2a_ioctl(ctx, mem, o0, o1, o2);
         break;
