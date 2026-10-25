@@ -202,7 +202,7 @@ typedef struct {
 
 /* Pure word classifier: fills *out for any raw word (illegal words yield
  * SPARC64_ICLS_ILLEGAL). No memory access, no state change. */
-void sparc64_decode_word(uint32_t word, sparc64_dec_t *out);
+void sparc64_classify_word(uint32_t word, sparc64_dec_t *out);
 
 /* Register access: r[0] (%g0) reads as 0, writes to rd == 0 are dropped.
  * Guest addresses and operands are full 64-bit, never truncated. */
@@ -265,8 +265,8 @@ sparc64_step_result_t sparc64_mem_trap(const sparc64_mem_fault_t *fault,
     uint64_t pc, bool is_store);
 
 /* Guest memory internals (interp_mem.c). All multi-byte integer traffic is
- * big-endian; single-byte reads never fault on alignment; wider accesses
- * are emulated byte-wise so unaligned loads/stores never fault. The asi
+ * big-endian; single-byte accesses never fault on alignment; misaligned
+ * multi-byte accesses trap (LOAD/STORE_MISALIGNED, qemu parity). The asi
  * argument selects byte order (bit 3 set: little-endian). */
 bool sparc64_mem_read(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
     uint8_t *out, unsigned n, sparc64_step_result_t *res, uint64_t pc);

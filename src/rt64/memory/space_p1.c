@@ -610,7 +610,10 @@ bool sparc64_space_atomic(sparc64_space_t *space, const sparc64_atomic_request_t
     if (space == NULL || request == NULL || result == NULL)
         return false;
     memset(result, 0, sizeof(*result));
-    if ((request->width != 4 && request->width != 8) ||
+    /* Widths 1/2/4/8 (LDSTUB/SWAP/CASA/CASXA); wider or misaligned
+     * requests are guest errors, not substrate failures. */
+    if ((request->width != 1 && request->width != 2 &&
+            request->width != 4 && request->width != 8) ||
         (request->address & (request->width - 1u)) != 0 ||
         request->op < SPARC64_ATOMIC_LR || request->op > SPARC64_ATOMIC_MAXU)
         return fail(space, request->address, SPARC64_FAULT_INTERNAL);
@@ -630,15 +633,18 @@ bool sparc64_space_atomic(sparc64_space_t *space, const sparc64_atomic_request_t
          request->reservation.binding_id != current.binding_id ||
          request->reservation.write_epoch != current.write_epoch))
         return true;
+    /* Big-endian guest: byte 0 is the most significant. */
     uint64_t old = 0;
     for (unsigned int i = 0; i < request->width; ++i)
-        old |= (uint64_t)page->backing->bytes[offset + i] << (i * 8);
+        old |= (uint64_t)page->backing->bytes[offset + i] <<
+            ((request->width - 1u - i) * 8);
     if (request->op == SPARC64_ATOMIC_LR) {
         result->old_value = old;
         result->reservation = current;
         return true;
     }
-    uint64_t mask = request->width == 4 ? UINT32_MAX : UINT64_MAX;
+    uint64_t mask = request->width == 8 ? UINT64_MAX :
+        (UINT64_C(1) << (request->width * 8U)) - UINT64_C(1);
     uint64_t sign = UINT64_C(1) << (request->width * 8 - 1);
     uint64_t value = request->value & mask, replacement = value;
     switch (request->op) {
@@ -655,7 +661,8 @@ bool sparc64_space_atomic(sparc64_space_t *space, const sparc64_atomic_request_t
     }
     unsigned char bytes[8];
     for (unsigned int i = 0; i < request->width; ++i)
-        bytes[i] = (unsigned char)(replacement >> (i * 8));
+        bytes[i] = (unsigned char)(replacement >>
+            ((request->width - 1u - i) * 8));
     if (!sparc64_space_write(space, request->address, bytes, request->width))
         return false;
     result->old_value = old;

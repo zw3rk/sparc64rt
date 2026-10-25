@@ -163,9 +163,17 @@ bool sparc64_win_restore(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     return true;
 }
 
-/* ---- Dual-width condition codes (E02: icc from low32, xcc from full64) -- */
+/* ---- Architectural condition codes (E02 + RC1 probes) --------------------
+ * V9 integer ops set icc from the low 32 bits and xcc from the full 64
+ * bits (E02 FINDINGS: addcc(0xffffffff,1) -> ccr 0x05; addcc(-1,1) ->
+ * 0x55; subcc(0,1) -> 0x99). Plain Bicc/BPcc test icc, Bcc %xcc tests
+ * xcc (micro-probes t2/t6: cmp(0x100000002,0x2) is Z=1 under plain be
+ * because low32 halves are equal, and N=0/C=0 likewise from low32).
+ * SLL/SRL (x=0) shift the full 64 bits (raw-byte probes t.S/t5), while
+ * SRA (x=0) sign-extends bit 31. */
 
-/* Logic ops clear V/C; N/Z come from the result at the operand width. */
+/* Logic ops clear V/C; N/Z come from bit 31/low32-zero (icc) and bit 63 /
+ * full-zero (xcc). */
 static void cc_logic(sparc64_ctx_t *ctx, uint64_t res)
 {
     unsigned icc = 0U;
@@ -285,9 +293,10 @@ static uint64_t popcount64(uint64_t v)
     return n;
 }
 
-/* Integer ALU (op3 dispatch). Dual-width cc on every *cc op. ADDX/SUBX
- * carry in from icc.C (oracle-verified). Integer divide by zero traps;
- * 64-bit SDIVX overflow saturates to INT64_MIN (oracle-verified). */
+/* Integer ALU (op3 dispatch). Architectural cc: icc from low32, xcc from
+ * full64 (see note above cc_logic). ADDX/SUBX carry in from icc.C
+ * (oracle-verified). Integer divide by zero traps; 64-bit SDIVX overflow
+ * saturates to INT64_MIN (oracle-verified). */
 sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
@@ -573,8 +582,9 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
     }
 }
 
-/* Shifts (op3 0x25-0x27). Plain forms are 32-bit with the upper half
- * zeroed; X forms are full 64-bit. Count masks to 5/6 bits. */
+/* Shifts (op3 0x25-0x27). Oracle parity: SLL/SRL always shift the full
+ * 64 bits; SRA sign-extends (bit 31 for plain, bit 63 for X forms).
+ * Count masks to 5/6 bits. */
 sparc64_step_result_t sparc64_exec_shift(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
@@ -595,15 +605,17 @@ sparc64_step_result_t sparc64_exec_shift(sparc64_cpu_t *cpu, uint64_t pc,
             sparc64_wreg(cpu, d->rd, (uint64_t)(((int64_t)a) >> count));
         }
     } else {
+        /* Oracle parity: SLL/SRL shift the full 64 bits (x ignored);
+         * SRA sign-extends bit 31 into the upper half. */
         uint32_t a32 = (uint32_t)a;
         unsigned c = (unsigned)(count & UINT64_C(31));
         if (d->op3 == SPARC64_OP3_SLL) {
-            sparc64_wreg(cpu, d->rd, (uint64_t)(a32 << c));
+            sparc64_wreg(cpu, d->rd, a << c);
         } else if (d->op3 == SPARC64_OP3_SRL) {
-            sparc64_wreg(cpu, d->rd, (uint64_t)(a32 >> c));
+            sparc64_wreg(cpu, d->rd, a >> c);
         } else {
             sparc64_wreg(cpu, d->rd,
-                (uint64_t)(uint32_t)(((int32_t)a32) >> c));
+                (uint64_t)((int64_t)((int32_t)a32 >> (int)c)));
         }
     }
     return sparc64_step_ok(pc);

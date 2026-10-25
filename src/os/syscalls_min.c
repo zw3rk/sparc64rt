@@ -37,6 +37,8 @@
 #include <unistd.h>
 
 #include "core/cpu.h"
+#include "os/sigframe_sparc64rt.h"
+#include "os/sync_sig.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
 
@@ -120,7 +122,7 @@ static void sparc64_commit(sparc64_ctx_t *ctx, long ret)
 static long sys_read(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
                      uint64_t fd, uint64_t buf_va, uint64_t count)
 {
-    uint8_t chunk[SPARC64_IO_CHUNK];
+    uint8_t chunk[SPARC64_IO_CHUNK] = { 0 };
     uint64_t done = 0;
     (void)ctx;
     if (count == 0U) {
@@ -161,7 +163,7 @@ static long sys_read(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
 static long sys_write(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
                       uint64_t fd, uint64_t buf_va, uint64_t count)
 {
-    uint8_t chunk[SPARC64_IO_CHUNK];
+    uint8_t chunk[SPARC64_IO_CHUNK] = { 0 };
     uint64_t done = 0;
     (void)ctx;
     if (count == 0U) {
@@ -257,6 +259,60 @@ const char *sparc64_syscall_name(long nr)
 #endif
 }
 
+/* rt_sigaction(102): 5-arg SPARC form (sig, act, oact, restorer,
+ * sigsetsize). Only the 8-byte sigset form is accepted; act/oact are
+ * the 32-byte kernel structs (handler/flags/restorer/mask). */
+static long sys_rt_sigaction(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t sig, uint64_t act_va,
+    uint64_t oact_va, uint64_t restorer, uint64_t sigsetsize)
+{
+    uint8_t raw[32];
+    uint64_t handler;
+    uint64_t flags;
+    unsigned i;
+    long rc;
+    (void)ctx;
+    if (sig == 0U || sig > 64U || sigsetsize != 8U) {
+        return -EINVAL;
+    }
+    if (act_va != UINT64_C(0)) {
+        if (!mem->read(mem->context, act_va, raw, sizeof(raw))) {
+            return -EFAULT;
+        }
+        handler = UINT64_C(0);
+        flags = UINT64_C(0);
+        for (i = 0U; i < 8U; i++) {
+            handler = (handler << 8U) | (uint64_t)raw[i];
+            flags = (flags << 8U) | (uint64_t)raw[8U + i];
+        }
+        if ((flags & ~(uint64_t)SPARC64_SA_SIGINFO) != UINT64_C(0)) {
+            return -EINVAL;
+        }
+        if (restorer == UINT64_C(0)) {
+            return -EINVAL;
+        }
+        rc = (long)sparc64_sync_sig_install(sig, handler, restorer);
+        if (rc != 0) {
+            return rc;
+        }
+    } else {
+        rc = (long)sparc64_sync_sig_install(sig, UINT64_C(0),
+            UINT64_C(0));
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    if (oact_va != UINT64_C(0)) {
+        for (i = 0U; i < (unsigned)sizeof(raw); i++) {
+            raw[i] = 0U;
+        }
+        if (!mem->write(mem->context, oact_va, raw, sizeof(raw))) {
+            return -EFAULT;
+        }
+    }
+    return 0L;
+}
+
 /* Dispatch the syscall in %g1 (args %o0..%o5), commit the dual-carry
  * convention, and advance pc = npc; npc += 4. Returns the guest exit
  * status for exit/exit_group (terminal), 0 otherwise. */
@@ -295,6 +351,21 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         return ret;
     case (long)SPARC64__NR_read:
         ret = sys_read(ctx, mem, o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_close:
+        ret = host_ret(close((int)o0));
+        break;
+    case (long)SPARC64__NR_rt_sigreturn:
+        /* Absolute resume: the frame sets pc/npc, so the common tail
+         * advance must not run on success. */
+        ret = sparc64_sync_sig_return(ctx, mem);
+        if (ret == 0L) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
+        break;
+    case (long)SPARC64__NR_rt_sigaction:
+        ret = sys_rt_sigaction(ctx, mem, o0, o1, o2, o3, o4);
         break;
     case (long)SPARC64__NR_write:
         ret = sys_write(ctx, mem, o0, o1, o2);

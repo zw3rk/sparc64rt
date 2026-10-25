@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "os/guest_run.h"
+
 #define SPARC64RT_VERSION "0.0.0-phase0"
 
 typedef enum {
@@ -43,6 +45,7 @@ int main(int argc, char **argv)
     int difftest = 0;
     int trace = 0;
     const char *guest = NULL;
+    int guest_index = 0;
 
     const char *env = getenv("SPARC64RT_ENGINE");
     if (env != NULL) {
@@ -88,6 +91,7 @@ int main(int argc, char **argv)
             return 2;
         }
         guest = argv[i];
+        guest_index = i;
         break;
     }
 
@@ -97,12 +101,14 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* Phase 0 stub-run: guest loading lands in Phase 1. Report the
-     * resolved configuration so CLI plumbing is observable now. */
-    const char *name = engine == SPARC64_ENGINE_DBT ? "dbt" : "interp";
-    (void)fprintf(stderr,
-                  "sparc64rt: engine=%s difftest=%d trace=%d guest=%s "
-                  "(guest execution lands in Phase 1)\n",
-                  name, difftest, trace, guest);
-    return 2;
+    /* Phase 1: run the guest through the reference interpreter.
+     * The DBT engine lands in Phase 2; --dbt/--difftest without it is
+     * an error, not a silent fallback. */
+    if (engine == SPARC64_ENGINE_DBT || difftest) {
+        (void)fprintf(stderr,
+                      "sparc64rt: dbt engine not yet available (Phase 2)\n");
+        return 2;
+    }
+    (void)trace;
+    return sparc64_guest_run(guest, &argv[guest_index], 1);
 }

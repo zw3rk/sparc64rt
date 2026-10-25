@@ -27,6 +27,7 @@
 
 #include "core/cpu.h"
 #include "os/guest_run.h"
+#include "os/sync_sig.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
 #include "rt64/memory/space.h"
@@ -862,6 +863,23 @@ int sparc64_guest_run(const char *path, char **argv, int interp_only)
                 sparc64_space_destroy(&g.space);
                 return (int)(status & 0xffL);
             }
+        } else if (step.kind == SPARC64_STEP_TRAP) {
+            /* Synchronous signal delivery (Phase 1): faults with an
+             * installed handler resume in the handler; anything else
+             * (and internal/retry states) is fatal. */
+            int code = 0;
+            int signo = sparc64_sync_sig_for_trap(step.cause, &code);
+            if (signo > 0 &&
+                sparc64_sync_sig_deliver(&ctx, ops, signo, code,
+                    step.tval) == 0) {
+                continue;
+            }
+            (void)fprintf(stderr,
+                          "sparc64rt: unhandled guest trap: cause=%d pc=0x%llx tval=0x%llx\n",
+                          (int)step.cause,
+                          (unsigned long long)step.pc,
+                          (unsigned long long)step.tval);
+            goto fail;
         } else if (step.kind != SPARC64_STEP_CONTINUE) {
             (void)fprintf(stderr,
                           "sparc64rt: guest stopped: kind=%d cause=%d pc=0x%llx\n",

@@ -54,9 +54,23 @@ all: build ## Build the translator (default cross target)
 
 build: $(BUILD_DIR)/sparc64rt ## Cross-compile _build/sparc64rt (static-PIE aarch64-musl)
 
-$(BUILD_DIR)/sparc64rt: $(SRCS) Makefile | $(BUILD_DIR)
+# Per-object compilation: one translation unit per cc1 keeps host memory
+# bounded (the single-shot link of ~150 TUs OOMs the compiler).
+OBJ_DIR := $(BUILD_DIR)/obj
+OBJS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(filter %.c,$(SRCS))) \
+        $(patsubst src/%.S,$(OBJ_DIR)/%.o,$(filter %.S,$(SRCS)))
+
+$(BUILD_DIR)/sparc64rt: $(OBJS)
 	$(A64_CC) $(CFLAGS) $(CPPFLAGS) -fPIE $(LDFLAGS_STATIC_PIE) \
-		$(SRCS) -o $@
+		$(OBJS) -o $@
+
+$(OBJ_DIR)/%.o: src/%.c Makefile
+	@mkdir -p $(dir $@)
+	$(A64_CC) $(CFLAGS) $(CPPFLAGS) -fPIE -c $< -o $@
+
+$(OBJ_DIR)/%.o: src/%.S Makefile
+	@mkdir -p $(dir $@)
+	$(A64_CC) $(CFLAGS) $(CPPFLAGS) -fPIE -c $< -o $@
 
 $(BUILD_DIR):
 	mkdir -p $@

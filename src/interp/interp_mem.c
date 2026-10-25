@@ -80,8 +80,8 @@ sparc64_step_result_t sparc64_mem_trap(const sparc64_mem_fault_t *fault,
     return r;
 }
 
-/* Byte-wise checked read: single-byte guest reads never fault on alignment,
- * so unaligned multi-byte accesses emulate without traps. */
+/* Byte-wise checked access: single-byte accesses never fault on alignment;
+ * multi-byte alignment traps are raised by ld_int/st_int (qemu parity). */
 bool sparc64_mem_read(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
     uint8_t *out, unsigned n, sparc64_step_result_t *res, uint64_t pc)
 {
@@ -140,6 +140,13 @@ bool sparc64_ld_int(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
         return false;
     }
+    /* SPARC V9 traps on misaligned multi-byte accesses (qemu-sparc64
+     * raises SIGBUS; single bytes never trap). Gate RC1 parity depends
+     * on this: the guest test expects the trap, not silent emulation. */
+    if (size > 1U && (va & (uint64_t)(size - 1U)) != UINT64_C(0)) {
+        *res = sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
+        return false;
+    }
     if (!sparc64_mem_read(mem, mc, va, b, size, res, pc)) {
         return false;
     }
@@ -169,6 +176,10 @@ bool sparc64_st_int(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
     if (size == 0U || size > 8U) {
         *res = sparc64_trap(SPARC64_TRAP_STORE_ACCESS, pc, va);
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
+        return false;
+    }
+    if (size > 1U && (va & (uint64_t)(size - 1U)) != UINT64_C(0)) {
+        *res = sparc64_trap(SPARC64_TRAP_STORE_MISALIGNED, pc, va);
         return false;
     }
     if (little) {

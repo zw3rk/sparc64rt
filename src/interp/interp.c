@@ -107,7 +107,7 @@ static bool rcond_valid(unsigned rcond)
 
 /* Pure word classifier: fills *out for any raw word. Illegal words yield
  * SPARC64_ICLS_ILLEGAL; execution traps them in step. */
-void sparc64_decode_word(uint32_t word, sparc64_dec_t *d)
+void sparc64_classify_word(uint32_t word, sparc64_dec_t *d)
 {
     unsigned op;
     d->raw = word;
@@ -535,6 +535,7 @@ static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
     case SPARC64_OP3_STB:
     case SPARC64_OP3_STH:
     case SPARC64_OP3_STD:
+    case SPARC64_OP3_STX:
     case SPARC64_OP3_STA:
     case SPARC64_OP3_STBA:
     case SPARC64_OP3_STHA:
@@ -631,7 +632,7 @@ static bool exec_delay(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     if (!sparc64_fetch_word(mem, mc, delay_pc, &raw, res)) {
         return false;
     }
-    sparc64_decode_word(raw, &dd);
+    sparc64_classify_word(raw, &dd);
     if (dd.cls == (uint8_t)SPARC64_ICLS_CALL ||
         dd.cls == (uint8_t)SPARC64_ICLS_JMPL ||
         dd.cls == (uint8_t)SPARC64_ICLS_RETURN ||
@@ -826,7 +827,7 @@ sparc64_step_result_t sparc64_step_with_insn(sparc64_cpu_t *cpu,
         cpu->r[0] = UINT64_C(0);
         return res;
     }
-    sparc64_decode_word(in.raw, &d);
+    sparc64_classify_word(in.raw, &d);
     if (executed != NULL) {
         *executed = in;
     }
@@ -854,6 +855,12 @@ sparc64_step_result_t sparc64_step_with_insn(sparc64_cpu_t *cpu,
             cpu->npc += 4U;
         }
         break;
+    }
+    if (res.kind == SPARC64_STEP_TRAP) {
+        /* Trap context is precise: TPC names the faulting instruction
+         * (the delay slot when the delay faults), TNPC its successor. */
+        cpu->pc = res.pc;
+        cpu->npc = res.pc + 4U;
     }
     cpu->r[0] = UINT64_C(0);
     return res;
