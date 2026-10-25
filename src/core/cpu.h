@@ -72,8 +72,12 @@
 
 /* Register-window constants (8 windows, Oracle M8 / SPARC64 XII). */
 #define SPARC64_NWINDOWS 8U
-/* Mandatory stack bias: rwindow save area lives at [%sp + 2047]. */
+/* Mandatory stack bias: rwindow save area lives at [%sp + 2047].
+ * Guarded so src/os/sigframe_sparc64rt.h (same value, 2047U) can be
+ * included in either order without -Werror=macro-redefined. */
+#ifndef SPARC64_STACK_BIAS
 #define SPARC64_STACK_BIAS 2047ULL
+#endif
 /* 16 x 64-bit spill/fill area (SPEC 2.1 struct rwindow_64, 128 bytes). */
 #define SPARC64_RWINDOW_SIZE 128ULL
 

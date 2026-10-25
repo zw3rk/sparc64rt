@@ -6,21 +6,13 @@
  *
  * Lane L0b (Phase 0, RC0): compile-time _Static_assert plus runtime
  * offsetof/sizeof checks for every field offset and struct size in
- * src/os/sigframe_sparc64rt.h (SPEC section 2.1) and, once lane L0a lands
- * src/core/cpu.h, sparc64_ctx_t.
+ * src/os/sigframe_sparc64rt.h (SPEC section 2.1) and src/core/cpu.h
+ * (sparc64_ctx_t, frozen by lane L0a; this test follows that header).
  *
- * Parallel-lane note: src/core/cpu.h is owned by lane L0a and does not exist
- * yet in this worktree. It is included only when present
- * (__has_include): without it the ctx section reports SKIP and the process
- * still exits 0, because every lane-L0b-owned invariant is verified. After
- * the merge the ctx section is fully active.
- *
- * Assumed sparc64_ctx_t layout (must be reconciled with L0a's
- * src/core/cpu.h at merge; any divergence fails loudly here with exact
- * got/want numbers): mechanical 64-bit widening of the frozen sparc32rt.h
- * ABI-locked prefix, same field order and names, V9 register state per
- * SPEC section 2.1 (tstate carries CCR icc/xcc, f is 32 x u64 doubles,
- * gsr holds VIS alignaddr/faligndata state).
+ * Coordinator reconciliation (RC0 merge): RAS/IBTC/guest_base live in the
+ * Phase-2 DBT dispatcher, not in frozen sparc64_ctx_t, so this test pins
+ * only the frozen ABI-locked prefix (r..exit_dest) plus the C-only tail
+ * offsets it shares with the trampoline contract.
  *
  * Build: cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
  *          -Iinclude -Isrc tests/check_abi_invariants.c \
@@ -32,13 +24,7 @@
 #include <stdio.h>
 
 #include "os/sigframe_sparc64rt.h"
-
-#if defined(__has_include)
-#  if __has_include("core/cpu.h")
-#    include "core/cpu.h"
-#    define HAVE_SPARC64_CTX 1
-#  endif
-#endif
+#include "core/cpu.h"
 
 static int failures = 0;
 
@@ -79,50 +65,50 @@ _Static_assert(sizeof(sparc64_stat_t) == 104, "stat 104");
 _Static_assert(sizeof(sparc64_stat64_t) == 144, "stat64 144");
 _Static_assert(sizeof(sparc64_ucontext_t) == 216, "ucontext 216");
 
-#ifdef HAVE_SPARC64_CTX
-/* Consumer-side pins for the assumed L0a layout (see file header). */
-_Static_assert(offsetof(sparc64_ctx_t, r) == 0, "ctx.r");
+/* Consumer-side pins for the frozen L0a layout (src/core/cpu.h). */
+_Static_assert(offsetof(sparc64_ctx_t, r) == 0x000, "ctx.r");
 _Static_assert(offsetof(sparc64_ctx_t, pc) == 0x100, "ctx.pc");
-_Static_assert(offsetof(sparc64_ctx_t, guest_base) == 0x250, "ctx.guest_base");
-_Static_assert(offsetof(sparc64_ctx_t, ras) == 0x2b8, "ctx.ras");
-_Static_assert(offsetof(sparc64_ctx_t, ibtc) == 0xcb8, "ctx.ibtc");
-#endif
+_Static_assert(offsetof(sparc64_ctx_t, npc) == 0x108, "ctx.npc");
+_Static_assert(offsetof(sparc64_ctx_t, y) == 0x110, "ctx.y");
+_Static_assert(offsetof(sparc64_ctx_t, ccr) == 0x118, "ctx.ccr");
+_Static_assert(offsetof(sparc64_ctx_t, fsr) == 0x120, "ctx.fsr");
+_Static_assert(offsetof(sparc64_ctx_t, gsr) == 0x128, "ctx.gsr");
+_Static_assert(offsetof(sparc64_ctx_t, fprs) == 0x130, "ctx.fprs");
+_Static_assert(offsetof(sparc64_ctx_t, asi) == 0x138, "ctx.asi");
+_Static_assert(offsetof(sparc64_ctx_t, pil) == 0x13c, "ctx.pil");
+_Static_assert(offsetof(sparc64_ctx_t, fp) == 0x140, "ctx.fp");
+_Static_assert(offsetof(sparc64_ctx_t, fcc) == 0x240, "ctx.fcc");
+_Static_assert(offsetof(sparc64_ctx_t, cwp) == 0x250, "ctx.cwp");
+_Static_assert(offsetof(sparc64_ctx_t, nwindows) == 0x268, "ctx.nwindows");
+_Static_assert(offsetof(sparc64_ctx_t, exit_reason) == 0x270, "ctx.exit_reason");
+_Static_assert(offsetof(sparc64_ctx_t, fault_addr) == 0x278, "ctx.fault_addr");
+_Static_assert(offsetof(sparc64_ctx_t, exit_dest) == 0x280, "ctx.exit_dest");
 
-#ifdef HAVE_SPARC64_CTX
 static void check_ctx(void)
 {
     CHECK_OFF(sparc64_ctx_t, r, 0x000);
     CHECK_OFF(sparc64_ctx_t, pc, 0x100);
     CHECK_OFF(sparc64_ctx_t, npc, 0x108);
     CHECK_OFF(sparc64_ctx_t, y, 0x110);
-    CHECK_OFF(sparc64_ctx_t, tstate, 0x118);
+    CHECK_OFF(sparc64_ctx_t, ccr, 0x118);
     CHECK_OFF(sparc64_ctx_t, fsr, 0x120);
-    CHECK_OFF(sparc64_ctx_t, f, 0x128);
-    CHECK_OFF(sparc64_ctx_t, gsr, 0x228);
-    CHECK_OFF(sparc64_ctx_t, cwp, 0x230);
-    CHECK_OFF(sparc64_ctx_t, cansave, 0x234);
-    CHECK_OFF(sparc64_ctx_t, canrestore, 0x238);
-    CHECK_OFF(sparc64_ctx_t, otherwin, 0x23c);
-    CHECK_OFF(sparc64_ctx_t, cleanwin, 0x240);
-    CHECK_OFF(sparc64_ctx_t, nwindows, 0x244);
-    CHECK_OFF(sparc64_ctx_t, guest_base, 0x250);
-    CHECK_OFF(sparc64_ctx_t, exit_reason, 0x258);
-    CHECK_OFF(sparc64_ctx_t, exit_arg, 0x25c);
-    CHECK_OFF(sparc64_ctx_t, fault_addr, 0x260);
-    CHECK_OFF(sparc64_ctx_t, exit_dest, 0x268);
-    CHECK_OFF(sparc64_ctx_t, sig_mask, 0x270);
-    CHECK_OFF(sparc64_ctx_t, pending_signals, 0x278);
-    CHECK_OFF(sparc64_ctx_t, trace_enabled, 0x280);
-    CHECK_OFF(sparc64_ctx_t, gdb_enabled, 0x281);
-    CHECK_OFF(sparc64_ctx_t, single_step, 0x282);
-    CHECK_OFF(sparc64_ctx_t, blocks_executed, 0x288);
-    CHECK_OFF(sparc64_ctx_t, chain_hits, 0x290);
-    CHECK_OFF(sparc64_ctx_t, last_exec_entry, 0x298);
-    CHECK_OFF(sparc64_ctx_t, ibtc_hits, 0x2a0);
-    CHECK_OFF(sparc64_ctx_t, ras_hits, 0x2a8);
-    CHECK_OFF(sparc64_ctx_t, ras_top, 0x2b0);
-    CHECK_OFF(sparc64_ctx_t, ras, 0x2b8);
-    CHECK_OFF(sparc64_ctx_t, ibtc, 0xcb8);
+    CHECK_OFF(sparc64_ctx_t, gsr, 0x128);
+    CHECK_OFF(sparc64_ctx_t, fprs, 0x130);
+    CHECK_OFF(sparc64_ctx_t, asi, 0x138);
+    CHECK_OFF(sparc64_ctx_t, pil, 0x13c);
+    CHECK_OFF(sparc64_ctx_t, fp, 0x140);
+    CHECK_OFF(sparc64_ctx_t, fcc, 0x240);
+    CHECK_OFF(sparc64_ctx_t, cwp, 0x250);
+    CHECK_OFF(sparc64_ctx_t, cansave, 0x254);
+    CHECK_OFF(sparc64_ctx_t, canrestore, 0x258);
+    CHECK_OFF(sparc64_ctx_t, otherwin, 0x25c);
+    CHECK_OFF(sparc64_ctx_t, cleanwin, 0x260);
+    CHECK_OFF(sparc64_ctx_t, wim, 0x264);
+    CHECK_OFF(sparc64_ctx_t, nwindows, 0x268);
+    CHECK_OFF(sparc64_ctx_t, exit_reason, 0x270);
+    CHECK_OFF(sparc64_ctx_t, exit_arg, 0x274);
+    CHECK_OFF(sparc64_ctx_t, fault_addr, 0x278);
+    CHECK_OFF(sparc64_ctx_t, exit_dest, 0x280);
 
     /* ABI-locked constants (SPEC sections 2.1 and 3). */
     CHECK_CONST("SPARC64_NWINDOWS", SPARC64_NWINDOWS, 8);
@@ -130,17 +116,10 @@ static void check_ctx(void)
     CHECK_CONST("SPARC64_RAS_SIZE", SPARC64_RAS_SIZE, 64);
     CHECK_CONST("SPARC64_IBTC_SIZE", SPARC64_IBTC_SIZE, 4096);
     CHECK_CONST("SPARC64_STACK_BIAS", SPARC64_STACK_BIAS, 2047);
-    CHECK_CONST("SPARC64_TASK_SIZE_TOP", SPARC64_TASK_SIZE_TOP, 0x800000000000ULL);
+    CHECK_CONST("SPARC64_TASK_SIZE", SPARC64_TASK_SIZE, 0x800000000000ULL);
     CHECK_CONST("sizeof(r)", sizeof(((sparc64_ctx_t *)0)->r), 256);
-    CHECK_CONST("sizeof(f)", sizeof(((sparc64_ctx_t *)0)->f), 256);
-    CHECK_CONST("sizeof(ibtc_entry)", sizeof(sparc64_ibtc_entry_t), 40);
+    CHECK_CONST("sizeof(fp)", sizeof(((sparc64_ctx_t *)0)->fp), 256);
 }
-#else
-static void check_ctx(void)
-{
-    printf("SKIP sparc64_ctx_t (core/cpu.h not present in this worktree)\n");
-}
-#endif
 
 static void check_sigframe(void)
 {

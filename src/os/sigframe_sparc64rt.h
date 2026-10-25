@@ -57,8 +57,12 @@
 #define SPARC64_RT_OFF_MASK      0x200U
 #define SPARC64_RT_OFF_RWIN_SAVE 0x208U
 
-/* Stack bias, syscall + signal constants (SPEC 2.1, E04, uapi). */
+/* Stack bias, syscall + signal constants (SPEC 2.1, E04, uapi).
+ * SPARC64_STACK_BIAS is frozen in src/core/cpu.h; reuse it here so the
+ * two headers agree without a duplicate definition. */
+#ifndef SPARC64_STACK_BIAS
 #define SPARC64_STACK_BIAS       2047U /* 0x7ff: unbiased_sp = %sp + 2047 */
+#endif
 #define SPARC64_NR_RT_SIGRETURN  101U
 #define SPARC64_NR_RT_SIGACTION  102U
 #define SPARC64_TA_6D            0x91d0206dU /* ta 0x6d */
