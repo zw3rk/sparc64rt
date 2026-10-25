@@ -864,7 +864,8 @@ static bool e_emit_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     }
 }
 
-/* Shifts: SLL/SRL shift the full 64 bits; SRA sign-extends bit 31
+/* Shifts: SLL shifts the full 64 bits; SRL with x==0 shifts only low32
+ * and zero-extends (V9 A.48, E02/E04 oracle); SRA sign-extends bit 31
  * (plain) or bit 63 (X forms). Counts mask to 5/6 bits. */
 static bool e_emit_shift(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
@@ -883,7 +884,7 @@ static bool e_emit_shift(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     if (d->op3 == SPARC64_OP3_SLL) {
         sb_lslv(b, true, ES0, ES0, ES1);
     } else if (d->op3 == SPARC64_OP3_SRL) {
-        sb_lsrv(b, true, ES0, ES0, ES1);
+        sb_lsrv(b, d->xbit != 0U, ES0, ES0, ES1);
     } else if (d->op3 == SPARC64_OP3_SRA) {
         if (d->xbit != 0U) {
             sb_asrv(b, true, ES0, ES0, ES1);

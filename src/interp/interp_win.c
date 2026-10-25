@@ -250,7 +250,8 @@ void sparc64_win_invalidate_all(void)
  * 0x55; subcc(0,1) -> 0x99). Plain Bicc/BPcc test icc, Bcc %xcc tests
  * xcc (micro-probes t2/t6: cmp(0x100000002,0x2) is Z=1 under plain be
  * because low32 halves are equal, and N=0/C=0 likewise from low32).
- * SLL/SRL (x=0) shift the full 64 bits (raw-byte probes t.S/t5), while
+ * SLL (x=0) shifts the full 64 bits (raw-byte probes t.S/t5), SRL
+ * (x=0) shifts only low32 and zero-extends (V9 A.48, E02/E04), while
  * SRA (x=0) sign-extends bit 31. */
 
 /* Bicc/BPcc/Ticc/MOVcc condition over one 4-bit N/Z/V/C nibble
@@ -728,9 +729,10 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
     }
 }
 
-/* Shifts (op3 0x25-0x27). Oracle parity: SLL/SRL always shift the full
- * 64 bits; SRA sign-extends (bit 31 for plain, bit 63 for X forms).
- * Count masks to 5/6 bits. */
+/* Shifts (op3 0x25-0x27). Oracle parity (V9 A.48, E02/E04): SLL
+ * shifts the full 64 bits; SRL with x==0 shifts only r[rs1][31:0] and
+ * zero-extends bits 63:32; SRA sign-extends (bit 31 for plain, bit 63
+ * for X forms). Count masks to 5/6 bits. */
 sparc64_step_result_t sparc64_exec_shift(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
@@ -751,14 +753,16 @@ sparc64_step_result_t sparc64_exec_shift(sparc64_cpu_t *cpu, uint64_t pc,
             sparc64_wreg(cpu, d->rd, (uint64_t)(((int64_t)a) >> count));
         }
     } else {
-        /* Oracle parity: SLL/SRL shift the full 64 bits (x ignored);
-         * SRA sign-extends bit 31 into the upper half. */
+        /* V9 A.48: 32-bit SRL shifts only the low 32 bits and
+         * zero-extends (E02/E04 oracle: srl %g1,0,%g1 clears high32).
+         * SLL keeps the historical full-64 shift; SRA sign-extends
+         * bit 31 into the upper half. */
         uint32_t a32 = (uint32_t)a;
         unsigned c = (unsigned)(count & UINT64_C(31));
         if (d->op3 == SPARC64_OP3_SLL) {
             sparc64_wreg(cpu, d->rd, a << c);
         } else if (d->op3 == SPARC64_OP3_SRL) {
-            sparc64_wreg(cpu, d->rd, a >> c);
+            sparc64_wreg(cpu, d->rd, (uint64_t)(a32 >> c));
         } else {
             sparc64_wreg(cpu, d->rd,
                 (uint64_t)((int64_t)((int32_t)a32 >> (int)c)));
