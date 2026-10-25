@@ -154,78 +154,12 @@ static int copy_from_fd(guest_state_t *g, int fd, uint64_t offset,
     return LOAD_OK;
 }
 
-/* ---- sparc64_mem_ops_t bridge over the rt64 substrate ------------------- */
-static void record_fault(const guest_state_t *g, sparc64_mem_fault_t *fault)
-{
-    sparc64_mem_fault_reason_t reason = SPARC64_MEM_FAULT_INTERNAL;
-    if (fault == NULL) {
-        return;
-    }
-    switch (g->space.fault_reason) {
-    case SPARC64_FAULT_UNMAPPED: reason = SPARC64_MEM_FAULT_UNMAPPED; break;
-    case SPARC64_FAULT_PERMISSION: reason = SPARC64_MEM_FAULT_PERMISSION; break;
-    case SPARC64_FAULT_RANGE: reason = SPARC64_MEM_FAULT_RANGE; break;
-    case SPARC64_FAULT_BUS: reason = SPARC64_MEM_FAULT_BUS; break;
-    case SPARC64_FAULT_RESOURCE: reason = SPARC64_MEM_FAULT_RESOURCE; break;
-    case SPARC64_FAULT_RETRY: reason = SPARC64_MEM_FAULT_RETRY; break;
-    default: break;
-    }
-    fault->address = g->space.fault_address;
-    fault->reason = reason;
-}
+/* Memory bridges (guest_mem_ops and the byte-level read/write/atomic
+ * helpers) live in src/os/guest_run_mem.c (Phase 6, L6a split for the
+ * line limit); the syscall read/write/prepare_write helpers stay here
+ * next to sysmem_ops. */
 
-static bool guest_mem_read(void *context, uint64_t address, void *bytes,
-                           size_t size, sparc64_access_t access,
-                           sparc64_mem_fault_t *fault)
-{
-    guest_state_t *g = (guest_state_t *)context;
-    unsigned perm = (access == SPARC64_ACCESS_FETCH) ? SPARC64_MEM_EXEC :
-                                                       SPARC64_MEM_READ;
-    if (g == NULL ||
-        !sparc64_space_read(&g->space, address, bytes, size, perm)) {
-        if (g != NULL) {
-            record_fault(g, fault);
-        }
-        return false;
-    }
-    return true;
-}
-
-static bool guest_mem_write(void *context, uint64_t address,
-                            const void *bytes, size_t size,
-                            sparc64_mem_fault_t *fault)
-{
-    guest_state_t *g = (guest_state_t *)context;
-    if (g == NULL || !sparc64_space_write(&g->space, address, bytes, size)) {
-        if (g != NULL) {
-            record_fault(g, fault);
-        }
-        return false;
-    }
-    return true;
-}
-
-static bool guest_mem_atomic(void *context,
-                             const sparc64_atomic_request_t *request,
-                             sparc64_atomic_result_t *result,
-                             sparc64_mem_fault_t *fault)
-{
-    guest_state_t *g = (guest_state_t *)context;
-    if (g == NULL || request == NULL || result == NULL ||
-        !sparc64_space_atomic(&g->space, request, result)) {
-        if (g != NULL && request != NULL && result != NULL) {
-            record_fault(g, fault);
-        }
-        return false;
-    }
-    return true;
-}
-
-const sparc64_mem_ops_t guest_mem_ops = {
-    guest_mem_read, guest_mem_write, guest_mem_atomic,
-};
-
-/* ---- sparc64_syscall_mem_t implementation over the same space ----------- */
+/* ---- sparc64_syscall_mem_t read/write helpers over the same space ------ */
 static bool sysmem_read(void *context, uint64_t va, void *host,
                         uint64_t len)
 {
@@ -680,6 +614,18 @@ int sparc64_guest_run(const char *path, char **argv, int interp_only)
 
 int sparc64_guest_run_engine(const char *path, char **argv, int engine)
 {
+    return sparc64_guest_run_full(path, -1, NULL, argv, engine);
+}
+
+/* Phase 6 (L6a) host-contract entry: image_fd >= 0 loads the ELF via
+ * position-independent reads from the borrowed descriptor (never closed,
+ * so guest fds 0,1,2 and inherited >= 3 are untouched); otherwise path is
+ * opened and the loader-private fd is closed after mapping. execfn NULL
+ * keeps argv[0] as AT_EXECFN and path as /proc/self/exe; otherwise both
+ * name the execfn path while argv stays verbatim. */
+int sparc64_guest_run_full(const char *path, int image_fd,
+    const char *execfn, char **argv, int engine)
+{
     guest_state_t g;
     guest_image_t img;
     sparc64_ctx_t ctx;
@@ -690,13 +636,15 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
     char interp[SPARC64RT_INTERP_PATH_MAX];
     char resolved[SPARC64RT_INTERP_PATH_MAX];
     char *synthetic[2];
+    const char *display;
+    int owned;
     int fd = -1;
     int rc;
     memset(&g, 0, sizeof(g));
     memset(&img, 0, sizeof(img));
     memset(interp, 0, sizeof(interp));
     memset(resolved, 0, sizeof(resolved));
-    if (path == NULL) {
+    if (path == NULL && image_fd < 0 && execfn == NULL) {
         (void)fprintf(stderr, "sparc64rt: no guest image\n");
         return 1;
     }
@@ -704,19 +652,30 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
         (void)fprintf(stderr, "sparc64rt: unknown engine %d\n", engine);
         return 1;
     }
+    display = (execfn != NULL) ? execfn :
+        ((path != NULL) ? path : "guest image");
     if (argv == NULL || argv[0] == NULL) {
-        synthetic[0] = (char *)path;
+        synthetic[0] = (char *)((path != NULL) ? path : display);
         synthetic[1] = NULL;
         argv = synthetic;
         argc = 1;
     } else {
         argc = count_strings(argv, GUEST_MAX_ARGC + 1U);
     }
-    fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        (void)fprintf(stderr, "sparc64rt: cannot open '%s': %s\n", path,
-                      strerror(errno));
-        return 1;
+    owned = (image_fd < 0);
+    if (owned) {
+        if (path == NULL) {
+            (void)fprintf(stderr, "sparc64rt: no guest image\n");
+            return 1;
+        }
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            (void)fprintf(stderr, "sparc64rt: cannot open '%s': %s\n", path,
+                          strerror(errno));
+            return 1;
+        }
+    } else {
+        fd = image_fd;
     }
     sparc64_space_init(&g.space, 64);
     g.space_live = 1;
@@ -724,13 +683,13 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
     rc = load_ehdr(fd, &img, &bias);
     if (rc != 0) {
         (void)fprintf(stderr, "sparc64rt: '%s' is not a SPARC64 ELF\n",
-                      path);
+                      display);
         goto fail;
     }
     rc = load_segments(fd, &g, bias, img.phoff, img.phnum, img.phoff,
-                       &heap_hi, &guest_phdr, interp, path);
+                       &heap_hi, &guest_phdr, interp, display);
     if (rc != 0) {
-        (void)fprintf(stderr, "sparc64rt: cannot load '%s'\n", path);
+        (void)fprintf(stderr, "sparc64rt: cannot load '%s'\n", display);
         goto fail;
     }
     start_entry = img.entry;
@@ -739,7 +698,8 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
         rc = load_interp(&g, interp, &ld_entry, &ld_base, resolved);
         if (rc != 0) {
             (void)fprintf(stderr,
-                          "sparc64rt: cannot map interpreter '%s'\n", path);
+                          "sparc64rt: cannot map interpreter '%s'\n",
+                          display);
             goto fail;
         }
         start_entry = ld_entry;
@@ -749,18 +709,21 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
     g.brk_cur = g.brk_base;
     if (interp_base != UINT64_C(0)) {
         rc = build_stack_dyn(&g, guest_phdr, img.entry, img.phnum,
-                             img.phent, interp_base, argv, argc, &sp);
+                             img.phent, interp_base, argv, argc, execfn,
+                             &sp);
     } else {
         rc = build_stack(&g, guest_phdr, img.entry, img.phnum, img.phent,
-                         argv, argc, &sp);
+                         argv, argc, execfn, &sp);
     }
     if (rc != 0) {
         (void)fprintf(stderr, "sparc64rt: cannot build the guest stack\n");
         goto fail;
     }
-    sparc64_guest_proc_note_exec(&g, path);
-    (void)close(fd);
-    fd = -1;
+    sparc64_guest_proc_note_exec(&g, display);
+    if (owned) {
+        (void)close(fd);
+        fd = -1;
+    }
     sparc64_ctx_init(&ctx, start_entry);
     ctx.r[SPARC64_SP] = sp;
     /* Fresh windows (E01): CWP 0, no invalid windows, so the first
@@ -780,7 +743,7 @@ int sparc64_guest_run_engine(const char *path, char **argv, int engine)
         g.space_live = 0;
     }
 fail:
-    if (fd >= 0) {
+    if (owned && fd >= 0) {
         (void)close(fd);
     }
     if (g.space_live) {
@@ -861,10 +824,10 @@ int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
     ng.brk_cur = ng.brk_base;
     if (interp_base != UINT64_C(0)) {
         rc = build_stack_dyn(&ng, guest_phdr, img.entry, img.phnum,
-            img.phent, interp_base, argv, argc, &sp);
+            img.phent, interp_base, argv, argc, NULL, &sp);
     } else {
         rc = build_stack(&ng, guest_phdr, img.entry, img.phnum, img.phent,
-            argv, argc, &sp);
+            argv, argc, NULL, &sp);
     }
     if (rc != 0) {
         sparc64_space_destroy(&ng.space);

@@ -53,6 +53,10 @@ int sparc64_syscall_is_group_exit(long nr);
 /* Short name for nr, or NULL when out of range. */
 const char *sparc64_syscall_name(long nr);
 
+/* Process-wide guest syscall dispatch count for --stats (Phase 6, L6a):
+ * every sparc64_handle_syscall dispatch (all engines, all threads). */
+unsigned long long sparc64_syscalls_dispatched(void);
+
 /* Dispatch the syscall in %g1 (args %o0..%o5), commit the SPARC64 carry
  * convention (E02/SPEC section 2.2: success clears both icc.C and xcc.C,
  * error sets both, other CCR bits preserved; %o0 carries the value or

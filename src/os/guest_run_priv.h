@@ -61,13 +61,14 @@ extern const sparc64_mem_ops_t guest_mem_ops;
 uint64_t count_strings(char **vec, uint64_t max);
 int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
     uint64_t phnum, uint64_t phent, char **argv, uint64_t argc,
-    uint64_t *sp_out);
+    const char *execfn_override, uint64_t *sp_out);
 
 /* Dynamic stack (Phase 5, L5a): app phdr/entry plus the ld.so load
- * bias (AT_BASE); interp_base 0 selects the static auxv subset. */
+ * bias (AT_BASE); interp_base 0 selects the static auxv subset.
+ * execfn_override NULL keeps argv[0] as AT_EXECFN (Phase 6, L6a). */
 int build_stack_dyn(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
     uint64_t phnum, uint64_t phent, uint64_t interp_base, char **argv,
-    uint64_t argc, uint64_t *sp_out);
+    uint64_t argc, const char *execfn_override, uint64_t *sp_out);
 
 /* Syscall memory/file/map layer over the same space. */
 const sparc64_syscall_mem_t *sysmem_ops(guest_state_t *g,

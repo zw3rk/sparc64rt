@@ -24,4 +24,13 @@ int sparc64_guest_run(const char *path, char **argv, int interp_only);
  * guest exit status on a divergence-free run). */
 int sparc64_guest_run_engine(const char *path, char **argv, int engine);
 
+/* Host-contract entry (Phase 6, L6a): image_fd >= 0 loads the ELF via
+ * position-independent reads from the borrowed descriptor (never closed);
+ * otherwise path is opened (loader-private, closed after mapping). execfn
+ * NULL keeps argv[0] as AT_EXECFN and path as /proc/self/exe; otherwise
+ * both name the execfn path while argv stays verbatim. engine matches
+ * sparc64_guest_run_engine. */
+int sparc64_guest_run_full(const char *path, int image_fd,
+    const char *execfn, char **argv, int engine);
+
 #endif /* SPARC64RT_OS_GUEST_RUN_H */

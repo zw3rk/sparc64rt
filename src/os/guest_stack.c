@@ -183,10 +183,11 @@ static int put_vec(guest_state_t *g, uint64_t *cursor, const uint64_t *v,
 static int build_stack_core(guest_state_t *g, uint64_t phdr_va,
                 uint64_t entry, uint64_t phnum, uint64_t phent,
                 uint64_t interp_base, char **argv, uint64_t argc,
-                uint64_t *sp_out)
+                const char *execfn_override, uint64_t *sp_out)
 {
     uint64_t envc = count_strings(environ, GUEST_MAX_ENVC);
     uint64_t argv_bytes = 0, env_bytes = 0, str_size, str_base;
+    uint64_t override_bytes = 0;
     uint64_t cursor, frame, stack_base, stack_size, execfn = 0, words, at;
     unsigned nkeys, i;
     const uint64_t *keys;
@@ -210,7 +211,21 @@ static int build_stack_core(guest_state_t *g, uint64_t phdr_va,
         string_bytes(environ, envc, &env_bytes) != 0) {
         return -E2BIG;
     }
-    str_size = argv_bytes + env_bytes + (uint64_t)GUEST_AT_RANDOM_BYTES;
+    /* Phase 6 (L6a): --execfn carries its own stack string so AT_EXECFN
+     * names the executable path even when guest argv[0] is custom. */
+    if (execfn_override != NULL) {
+        size_t extra = strlen(execfn_override);
+        if (extra > (size_t)65536) {
+            return -E2BIG;
+        }
+        override_bytes = (uint64_t)extra + UINT64_C(1);
+    }
+    if (override_bytes > GUEST_MAX_STRING_BYTES - argv_bytes - env_bytes -
+        (uint64_t)GUEST_AT_RANDOM_BYTES) {
+        return -E2BIG;
+    }
+    str_size = argv_bytes + env_bytes + (uint64_t)GUEST_AT_RANDOM_BYTES +
+        override_bytes;
     /* Reserve: argc + argv+NULL + envp+NULL + auxv pairs + AT_NULL. */
     words = UINT64_C(1) + (argc + UINT64_C(1)) + (envc + UINT64_C(1)) +
         (uint64_t)(nkeys + 1U) * UINT64_C(2);
@@ -264,7 +279,15 @@ static int build_stack_core(guest_state_t *g, uint64_t phdr_va,
         push_vec(g, &cursor, environ, envc, env_addr) != 0) {
         return -ENOMEM;
     }
-    execfn = (argc != 0U) ? argv_addr[0] : 0U;
+    if (execfn_override != NULL) {
+        uint64_t override_addr = 0;
+        if (push_string(g, &cursor, execfn_override, &override_addr) != 0) {
+            return -ENOMEM;
+        }
+        execfn = override_addr;
+    } else {
+        execfn = (argc != 0U) ? argv_addr[0] : 0U;
+    }
     memset(zeros, 0, sizeof(zeros)); /* Zero the rwindow_64 [F, F+128). */
     if (!sparc64_space_write_initial(&g->space, frame, zeros,
                                      sizeof(zeros))) {
@@ -311,20 +334,22 @@ static int build_stack_core(guest_state_t *g, uint64_t phdr_va,
         *sp_out, stack_base, GUEST_STACK_TOP);
 }
 
-/* Static entry (Phase 1): the 12-key auxv subset, unchanged. */
+/* Static entry (Phase 1): the 12-key auxv subset, unchanged.
+ * execfn_override NULL keeps argv[0] as AT_EXECFN. */
 int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
                 uint64_t phnum, uint64_t phent, char **argv, uint64_t argc,
-                uint64_t *sp_out)
+                const char *execfn_override, uint64_t *sp_out)
 {
     return build_stack_core(g, phdr_va, entry, phnum, phent,
-        UINT64_C(0), argv, argc, sp_out);
+        UINT64_C(0), argv, argc, execfn_override, sp_out);
 }
 
 /* Dynamic entry (Phase 5): full auxv with AT_BASE (ld.so bias). */
 int build_stack_dyn(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
                 uint64_t phnum, uint64_t phent, uint64_t interp_base,
-                char **argv, uint64_t argc, uint64_t *sp_out)
+                char **argv, uint64_t argc, const char *execfn_override,
+                uint64_t *sp_out)
 {
     return build_stack_core(g, phdr_va, entry, phnum, phent, interp_base,
-        argv, argc, sp_out);
+        argv, argc, execfn_override, sp_out);
 }

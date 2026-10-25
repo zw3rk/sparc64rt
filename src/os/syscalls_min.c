@@ -36,6 +36,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <stdatomic.h>
+
 #include "core/cpu.h"
 #include "os/proc.h"
 #include "os/sigframe_sparc64rt.h"
@@ -53,6 +55,22 @@
 #define SPARC64_MAP_PRIVATE 0x02U
 #define SPARC64_MAP_FIXED 0x10U
 #define SPARC64_MAP_ANONYMOUS 0x20U
+
+/* Process-wide dispatch tally for --stats (Phase 6, L6a). Guest
+ * execution is serialized under the big lock, but blocking syscalls
+ * may run on worker threads, so the tally is atomic. */
+static _Atomic unsigned long long dispatched_total =
+    (_Atomic unsigned long long)0;
+
+unsigned long long sparc64_syscalls_dispatched(void)
+{
+    return atomic_load(&dispatched_total);
+}
+
+static void note_dispatched(void)
+{
+    (void)atomic_fetch_add(&dispatched_total, 1ULL);
+}
 
 /* SPARC errnos are the asm-generic numbers except where arch/sparc
  * overrides them; ENOSYS is 90 on SPARC (E02), not asm-generic 38. Only
@@ -303,6 +321,7 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         ctx->pc = ctx->npc;
         ctx->npc += 4U;
         ctx->syscalls_executed++;
+        note_dispatched();
         return ret;
     case (long)SPARC64__NR_read:
         ret = sys_read(ctx, mem, o0, o1, o2);
@@ -501,6 +520,7 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         long erc = sparc64_proc_execve(ctx, mem, o0, o1, o2);
         if (erc == 0L) {
             ctx->syscalls_executed++;
+            note_dispatched();
             return 0;
         }
         ret = erc;
@@ -539,5 +559,6 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
     ctx->pc = ctx->npc;
     ctx->npc += 4U;
     ctx->syscalls_executed++;
+    note_dispatched();
     return 0;
 }
