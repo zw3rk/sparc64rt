@@ -246,6 +246,9 @@ static inline unsigned sparc64_cc_xcc(const sparc64_ctx_t *ctx)
  * N/Z/V/C nibbles (bit 3 N, bit 2 Z, bit 1 V, bit 0 C). */
 bool sparc64_eval_cond(unsigned cond, unsigned nibble);
 
+/* FBfcc condition over one fcc field (0 eq, 1 lt, 2 gt, 3 unordered). */
+bool sparc64_eval_fcond(unsigned cond, uint32_t fcc);
+
 /* Clean-completion step result (caller advances pc/npc). */
 static inline sparc64_step_result_t sparc64_step_ok(uint64_t pc)
 {

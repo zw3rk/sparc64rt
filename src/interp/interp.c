@@ -137,11 +137,16 @@ void sparc64_classify_word(uint32_t word, sparc64_dec_t *d)
             d->uimm = fld(word, 21U, 0U);
             return;
         }
-        if (op2 == 6U) {
+        if (op2 == 5U) {
+            /* FBfcc: a(29) cond(28:25) fcc(21:20); bit 19 is the static
+             * prediction hint (ignored, like BPcc pred); disp19 is
+             * bits 18:0 (oracle-probed). op2 == 6 stays ILLEGAL:
+             * qemu-sparc64 kills it, so it never decodes as a branch. */
             d->cls = SPARC64_ICLS_FBR;
             d->annul = (uint8_t)fld(word, 29U, 29U);
             d->cond = (uint8_t)fld(word, 28U, 25U);
-            d->disp = (int64_t)sx(fld(word, 21U, 0U), 22U) << 2;
+            d->cc = (uint8_t)fld(word, 21U, 20U);
+            d->disp = (int64_t)sx(fld(word, 18U, 0U), 19U) << 2;
             return;
         }
         return;
@@ -317,6 +322,7 @@ static void sparc64_decode_op2(sparc64_dec_t *d, uint32_t word, unsigned op3,
     case SPARC64_OP3_FPOP2:
         d->cls = SPARC64_ICLS_FPU;
         d->opf = fld(word, 13U, 5U);
+        d->rs2 = (uint8_t)fld(word, 4U, 0U);
         return;
     case SPARC64_OP3_VIS: {
         uint32_t opf = fld(word, 13U, 5U);
@@ -602,10 +608,12 @@ static sparc64_step_result_t exec_single(sparc64_cpu_t *cpu,
         return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
     case SPARC64_ICLS_FPU:
         return sparc64_exec_fpu(cpu, mem, mc, pc, d);
-    case SPARC64_ICLS_ILLEGAL:
     case SPARC64_ICLS_FBR:
+        /* Unreachable: FBR commits through exec_cti above. */
+        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+    case SPARC64_ICLS_ILLEGAL:
     default:
-        /* FBR (Phase 3 owns fcc) and unknown markers trap like EXIT_UNDEF. */
+        /* Unknown markers trap like EXIT_UNDEF. */
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
     }
 }
@@ -628,7 +636,8 @@ static bool exec_delay(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
         dd.cls == (uint8_t)SPARC64_ICLS_RETURN ||
         dd.cls == (uint8_t)SPARC64_ICLS_BICC ||
         dd.cls == (uint8_t)SPARC64_ICLS_BPCC ||
-        dd.cls == (uint8_t)SPARC64_ICLS_BPR) {
+        dd.cls == (uint8_t)SPARC64_ICLS_BPR ||
+        dd.cls == (uint8_t)SPARC64_ICLS_FBR) {
         *res = exec_cti(cpu, mem, mc, delay_pc, &dd);
         if (res->kind != SPARC64_STEP_CONTINUE) {
             return false;
@@ -715,6 +724,8 @@ static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
         unsigned nib = (d->cc == 2U) ? sparc64_cc_xcc(cpu)
                                      : sparc64_cc_icc(cpu);
         taken = sparc64_eval_cond(d->cond, nib);
+    } else if (d->cls == (uint8_t)SPARC64_ICLS_FBR) {
+        taken = sparc64_eval_fcond(d->cond, cpu->fcc[d->cc & 3U]);
     } else {
         taken = sparc64_eval_rcond(d->cond, sparc64_rreg(cpu, d->rs1));
     }
@@ -852,6 +863,7 @@ sparc64_step_result_t sparc64_step_with_insn(sparc64_cpu_t *cpu,
     case SPARC64_ICLS_BICC:
     case SPARC64_ICLS_BPCC:
     case SPARC64_ICLS_BPR:
+    case SPARC64_ICLS_FBR:
         /* exec_cti commits the final pc/npc itself. */
         res = exec_cti(cpu, memory, context, pc, &d);
         break;
