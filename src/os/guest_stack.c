@@ -45,15 +45,19 @@
 #define GUEST_AT_EUID 12U
 #define GUEST_AT_GID 13U
 #define GUEST_AT_EGID 14U
+#define GUEST_AT_HWCAP 16U
+/* Oracle AT_HWCAP (qemu-sparc64 7.2.22 auxv probe): FLUSH|STBAR|SWAP|
+ * MULDIV|V9 baseline. */
+#define GUEST_AT_HWCAP_BITS UINT64_C(0x1f)
 #define GUEST_AT_RANDOM 25U
 #define GUEST_AT_RANDOM_BYTES 16U
 #define GUEST_AT_EXECFN 31U
 
 /* AT_* keys carried in the initial stack, in auxv order. */
-static const unsigned aux_keys[11] = {
+static const unsigned aux_keys[12] = {
     GUEST_AT_PHDR, GUEST_AT_PHENT, GUEST_AT_PHNUM, GUEST_AT_PAGESZ,
     GUEST_AT_ENTRY, GUEST_AT_UID, GUEST_AT_EUID, GUEST_AT_GID,
-    GUEST_AT_EGID, GUEST_AT_EXECFN, GUEST_AT_RANDOM,
+    GUEST_AT_EGID, GUEST_AT_HWCAP, GUEST_AT_EXECFN, GUEST_AT_RANDOM,
 };
 
 extern char **environ;
@@ -165,7 +169,7 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
     uint64_t argv_bytes = 0, env_bytes = 0, str_size, str_base;
     uint64_t cursor, frame, stack_base, stack_size, execfn = 0, words, at, i;
     uint64_t argv_addr[GUEST_MAX_ARGC], env_addr[GUEST_MAX_ENVC];
-    uint64_t auxv[24], vals[11];
+    uint64_t auxv[26], vals[12];
     uint64_t rnd_addr = UINT64_C(0);
     uint8_t zeros[128];
     uint8_t rnd[GUEST_AT_RANDOM_BYTES];
@@ -178,9 +182,9 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
         return -E2BIG;
     }
     str_size = argv_bytes + env_bytes + (uint64_t)GUEST_AT_RANDOM_BYTES;
-    /* Reserve: argc + argv+NULL + envp+NULL + 12 auxv pairs. */
+    /* Reserve: argc + argv+NULL + envp+NULL + 13 auxv pairs. */
     words = UINT64_C(1) + (argc + UINT64_C(1)) + (envc + UINT64_C(1)) +
-        UINT64_C(24);
+        UINT64_C(26);
     str_base = GUEST_STACK_TOP - str_size;
     if (str_size > GUEST_MAX_STRING_BYTES || str_size >= GUEST_STACK_TOP ||
         str_base < words * UINT64_C(8) + UINT64_C(128)) {
@@ -236,8 +240,8 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
     vals[3] = GUEST_PAGE_SIZE; vals[4] = entry;
     vals[5] = (uint64_t)getuid(); vals[6] = (uint64_t)geteuid();
     vals[7] = (uint64_t)getgid(); vals[8] = (uint64_t)getegid();
-    vals[9] = execfn; vals[10] = rnd_addr;
-    for (i = 0; i < 11U; i++) {
+    vals[9] = GUEST_AT_HWCAP_BITS; vals[10] = execfn; vals[11] = rnd_addr;
+    for (i = 0; i < 12U; i++) {
         auxv[2U * i] = aux_keys[i];
         auxv[2U * i + 1U] = vals[i];
     }
@@ -247,7 +251,7 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
         put64(g, &at, 0U) != 0 ||
         put_vec(g, &at, env_addr, envc) != 0 ||
         put64(g, &at, 0U) != 0 ||
-        put_vec(g, &at, auxv, 22U) != 0 ||
+        put_vec(g, &at, auxv, 24U) != 0 ||
         put64(g, &at, GUEST_AT_NULL) != 0 ||
         put64(g, &at, 0U) != 0) {
         return -ENOMEM;
