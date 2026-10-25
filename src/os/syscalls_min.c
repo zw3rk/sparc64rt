@@ -40,6 +40,7 @@
 #include "os/sigframe_sparc64rt.h"
 #include "os/sync_sig.h"
 #include "os/syscall_nr.h"
+#include "os/syscalls_ext.h"
 #include "os/syscalls_min.h"
 
 /* SPARC Linux prot/flag ABI (asm/mman.h, arch 64-bit). Defined locally so
@@ -354,6 +355,74 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     case (long)SPARC64__NR_close:
         ret = host_ret(close((int)o0));
+        break;
+    /* Phase-2 static-libc set (src/os/syscalls_ext.c, additive cases). */
+    case (long)SPARC64__NR_getpid:
+        ret = sparc64_l2a_getpid();
+        break;
+    case (long)SPARC64__NR_getuid:
+        ret = sparc64_l2a_getuid();
+        break;
+    case (long)SPARC64__NR_getgid:
+        ret = sparc64_l2a_getgid();
+        break;
+    case (long)SPARC64__NR_stat:
+        ret = sparc64_l2a_stat(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_lstat:
+        ret = sparc64_l2a_lstat(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_fstat:
+        ret = sparc64_l2a_fstat(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_stat64:
+        ret = sparc64_l2a_stat64(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_lstat64:
+        ret = sparc64_l2a_lstat64(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_fstat64:
+        ret = sparc64_l2a_fstat64(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_fstatat64:
+        ret = sparc64_l2a_fstatat64(ctx, mem, o0, o1, o2, o3);
+        break;
+    case (long)SPARC64__NR_statx:
+        ret = sparc64_l2a_statx(ctx, mem, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC64__NR_readv:
+        ret = sparc64_l2a_readv(ctx, mem, o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_writev:
+        ret = sparc64_l2a_writev(ctx, mem, o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_openat:
+        ret = sparc64_l2a_openat(ctx, mem, o0, o1, o2, o3);
+        break;
+    case (long)SPARC64__NR_fcntl:
+    case (long)SPARC64__NR_fcntl64:
+        ret = sparc64_l2a_fcntl(o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_rt_sigprocmask:
+        ret = sparc64_l2a_rt_sigprocmask(ctx, mem, o0, o1, o2, o3);
+        break;
+    case (long)SPARC64__NR_ioctl:
+        ret = sparc64_l2a_ioctl(ctx, mem, o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_clock_gettime:
+        ret = sparc64_l2a_clock_gettime(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_clock_getres:
+        ret = sparc64_l2a_clock_getres(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_gettimeofday:
+        ret = sparc64_l2a_gettimeofday(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_getrandom:
+        ret = sparc64_l2a_getrandom(ctx, mem, o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_futex:
+        ret = sparc64_l2a_futex(ctx, mem, o0, o1, o2, o3);
         break;
     case (long)SPARC64__NR_rt_sigreturn:
         /* Absolute resume: the frame sets pc/npc, so the common tail
