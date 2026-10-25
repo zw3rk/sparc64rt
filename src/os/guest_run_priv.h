@@ -60,6 +60,17 @@ int build_stack(guest_state_t *g, uint64_t phdr_va, uint64_t entry,
 const sparc64_syscall_mem_t *sysmem_ops(guest_state_t *g,
     sparc64_syscall_mem_t *ops);
 
+/* Full image replacement for execve(59) (guest_run.c, Phase 4 lane
+ * L4c): destroys the current space, loads path with host argv (the
+ * caller swaps the translator's environ to the guest envp across the
+ * call; build_stack consumes it), and re-inits ctx at the new entry
+ * with a fresh biased %sp and leaf windows. Keeps the host pid;
+ * brk/tids reset; signals are the caller's job. Returns 0 or a
+ * negative errno-style code (-ENOENT open, -ENOEXEC bad image,
+ * -E2BIG/-ENOMEM stack/load limits, -EFAULT bad pointers). */
+int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
+    const char *path, char **argv);
+
 /* Engine run loops (guest_engines.c). Each returns the guest exit
  * status, or 1 when the runner itself fails. */
 int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,
