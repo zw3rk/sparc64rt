@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "core/cpu.h"
+#include "os/proc.h"
 #include "os/sigframe_sparc64rt.h"
 #include "os/sync_sig.h"
 #include "os/syscall_nr.h"
@@ -454,6 +455,49 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     case (long)SPARC64__NR_set_tid_address:
         ret = mem->set_tid_address(mem->context, o0);
+        break;
+    /* Phase-4 lifecycle set (src/os/proc.c, lane L4c, additive cases).
+     * fork/vfork set %o1 in the handler; execve resumes absolutely
+     * (fresh pc/npc, no advance), like rt_sigreturn. clone with
+     * CLONE_VM fails here; lane L4b owns host-threaded threads. */
+    case (long)SPARC64__NR_fork:
+        ret = sparc64_proc_fork(ctx, mem);
+        break;
+    case (long)SPARC64__NR_vfork:
+        ret = sparc64_proc_vfork(ctx, mem);
+        break;
+    case (long)SPARC64__NR_clone:
+        ret = sparc64_proc_clone(ctx, mem, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC64__NR_execve: {
+        long erc = sparc64_proc_execve(ctx, mem, o0, o1, o2);
+        if (erc == 0L) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
+        ret = erc;
+        break;
+    }
+    case (long)SPARC64__NR_wait4:
+        ret = sparc64_proc_wait4(ctx, mem, o0, o1, o2, o3);
+        break;
+    case (long)SPARC64__NR_waitid:
+        ret = sparc64_proc_waitid(ctx, mem, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC64__NR_pipe:
+        ret = sparc64_proc_pipe(ctx, mem);
+        break;
+    case (long)SPARC64__NR_pipe2:
+        ret = sparc64_proc_pipe2(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_dup:
+        ret = sparc64_proc_dup(o0);
+        break;
+    case (long)SPARC64__NR_dup2:
+        ret = sparc64_proc_dup2(o0, o1);
+        break;
+    case (long)SPARC64__NR_dup3:
+        ret = sparc64_proc_dup3(o0, o1, o2);
         break;
     default:
         ret = -ENOSYS;

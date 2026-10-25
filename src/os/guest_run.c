@@ -694,3 +694,80 @@ fail:
      * (including difftest's 2 = agreement without exit) pass through. */
     return rc < 0 ? 1 : rc;
 }
+
+/* ---- Phase 4 (L4c): full image replacement for execve(59) -------------- */
+/* Loads path with host argv into a scratch state, then commits it over
+ * the current space and re-inits ctx at the new entry. A bad image
+ * leaves the old space intact (Linux execve atomicity); only a fully
+ * stacked image commits. The caller swaps the translator's environ to
+ * the guest envp across this call (build_stack consumes it) and resets
+ * signal state afterwards. */
+int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
+    const char *path, char **argv)
+{
+    guest_state_t ng;
+    guest_image_t img;
+    uint64_t bias = 0, guest_phdr = 0, heap_hi = 0, sp = 0, argc = 0;
+    int fd = -1;
+    int rc;
+    if (g == NULL || ctx == NULL || path == NULL || argv == NULL) {
+        return -EFAULT;
+    }
+    argc = count_strings(argv, GUEST_MAX_ARGC + 1U);
+    if (argc == 0U || argc > (uint64_t)GUEST_MAX_ARGC) {
+        return -E2BIG;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -errno;
+    }
+    memset(&img, 0, sizeof(img));
+    rc = load_ehdr(fd, &img, &bias);
+    if (rc != 0) {
+        (void)close(fd);
+        return -ENOEXEC;
+    }
+    memset(&ng, 0, sizeof(ng));
+    sparc64_space_init(&ng.space, 64);
+    ng.space_live = 1;
+    ng.dbt = g->dbt;
+    ng.host_tid = (long)getpid();
+    ng.tid_addr = 0U;
+    rc = load_segments(fd, &ng, bias, img.phoff, img.phnum, img.phoff,
+        &heap_hi, &guest_phdr);
+    (void)close(fd);
+    fd = -1;
+    if (rc != 0) {
+        sparc64_space_destroy(&ng.space);
+        return (rc == -LOAD_NOMEM) ? -ENOMEM : -ENOEXEC;
+    }
+    ng.brk_base = align_up(heap_hi, GUEST_PAGE_SIZE);
+    ng.brk_cur = ng.brk_base;
+    rc = build_stack(&ng, guest_phdr, img.entry, img.phnum, img.phent,
+        argv, argc, &sp);
+    if (rc != 0) {
+        sparc64_space_destroy(&ng.space);
+        return rc;
+    }
+    /* Commit: move the fresh registry over the old space. Both spaces
+     * use the default heap factory (no external managed context), so
+     * the struct move transfers ownership cleanly. */
+    if (g->space_live) {
+        sparc64_space_destroy(&g->space);
+        g->space_live = 0;
+    }
+    g->space = ng.space;
+    g->space_live = 1;
+    ng.space_live = 0;
+    g->brk_base = ng.brk_base;
+    g->brk_cur = ng.brk_cur;
+    g->tid_addr = 0U;
+    g->host_tid = (long)getpid();
+    sparc64_ctx_init(ctx, img.entry);
+    ctx->r[SPARC64_SP] = sp;
+    /* Fresh windows (E01): CWP 0, no invalid windows, so the first
+     * SAVE/RESTORE pair rotates in-register without spill/fill. */
+    ctx->cwp = 0U;
+    ctx->cansave = (uint32_t)(SPARC64_NWINDOWS - 1U);
+    return 0;
+}
