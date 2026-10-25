@@ -276,16 +276,16 @@ static void sparc64_decode_op2(sparc64_dec_t *d, uint32_t word, unsigned op3,
             d->cls = SPARC64_ICLS_MEMBAR;
             return;
         }
+        /* L5a: user rd %tick is emulated (oracle/hardware admit
+         * it in _dl_start); SOFTINT..STICK_CMPR stay supervisor. */
         if (rs1 == SPARC64_ASR_Y || rs1 == SPARC64_ASR_CCR ||
             rs1 == SPARC64_ASR_ASI || rs1 == SPARC64_ASR_PC ||
-            rs1 == SPARC64_ASR_FPRS || rs1 == SPARC64_ASR_GSR) {
+            rs1 == SPARC64_ASR_FPRS || rs1 == SPARC64_ASR_GSR ||
+            rs1 == SPARC64_ASR_TICK) {
             d->cls = SPARC64_ICLS_RDASR;
             return;
         }
-        if (rs1 == SPARC64_ASR_TICK ||
-            (rs1 >= 20U && rs1 <= 25U)) {
-            /* TICK/SOFTINT/TICK_CMPR/STICK are supervisor-only
-             * (RDPC reads the instruction address in user mode). */
+        if (rs1 >= 20U && rs1 <= 25U) {
             d->cls = SPARC64_ICLS_PRIV;
             return;
         }

@@ -63,10 +63,10 @@ typedef enum {
     SPARC64_OP_PRIV,    /* Privileged state/trap: RDHPR (0x29), RDPR (0x2a),
                          * FLUSHW (0x2b), SAVED/RESTORED (0x31, rd 0/1),
                          * WRPR (0x32), WRHPR (0x33), DONE/RETRY (0x3e,
-                         * rd 0/1), SIR (0x30, rd 15), RDTICK (RDASR asr 4
-                         * folds here at execution), CASA/CASXA with
+                         * rd 0/1), SIR (0x30, rd 15), CASA/CASXA with
                          * (i == 0, ASI < 0x80) (E03 trap 0x37).
-                         * User-mode execution traps (L1b). */
+                         * User-mode execution traps (L1b). RDASR asr 4
+                         * (RDTICK) is user-emulated, not folded here. */
     SPARC64_OP_FPU,     /* FPop1/FPop2/IMPDEP2-VIS pass-through marker for
                          * Phase 3, incl. integer-shaped FMOVcc/FMOVr
                          * (opf/rs1/rs2/rd recorded; interp: EXIT_UNDEF). */
