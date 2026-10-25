@@ -70,3 +70,28 @@ green on both hosts, both engines. `echo L6B-PARITY-PASS`.
 - L6a owns `src/main.c` + `src/rt64/*` wiring; L6b owns only
   `tests/` + `docs/rc6-parity.md`. Merge `--no-ff` L6a then L6b.
 - Coordinator runs gate `RC6`.
+
+## Gate RC6 (coordinator record, master post-merge)
+
+- Merged `--no-ff` L6a (`bbc59c6`) then L6b (`ca3a1aa`); disjoint
+  files, no conflicts. `make build`, `make check`, line limits pass.
+- Linux container: all Phase 1–5 suites green on both engines
+  (P1-ISA-PASS, P3-PASS, P4-PASS, P5-PASS, BusyBox == golden),
+  `check_host_contract.sh` 92 pass / 0 fail (`L6A-HOST-PASS`),
+  difftest 0 divergences on all single-threaded legs.
+- `hl` on this Mac: every leg matches the container bit-for-bit on
+  both engines, except the exact BusyBox probe (G4 below).
+- Coordinator rulings on recorded gaps (see `docs/rc6-parity.md`):
+  G1 (qemu 10 vs 7.2 SIGBUS/FSR drift), G2 (qemu execve ENOEXEC),
+  G3 (qemu cannot nested-exec SPARC; translator does) are oracle
+  limitations — engines agree, accepted.
+- G4 (HOST GAP, hl-side follow-up): under `hl`, guest `execve` of a
+  host-foreign (Mach-O) binary traps deterministically
+  (`cause=2 pc=0x60006a9b04`, 3/3) instead of failing cleanly; single
+  execs fail clean ("not an ELF file" via the hl VFS layer). Only the
+  forked-exec path traps, and only under `hl` (Linux runtime runs the
+  host binary natively, qemu parity). Accepted for RC6 with the
+  adapted SPARC-only BusyBox leg green cross-host (`3`, exit 0);
+  follow-up belongs to the `hl` track (VFS identity mapping +
+  foreign-binary exec policy; translator must fail closed there
+  rather than trap). Translator-side fail-closed checks stay.
