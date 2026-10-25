@@ -560,6 +560,7 @@ static inline uint32_t s64_rt_mem(sparc64_ctx_t *ctx,
     case SPARC64_OP3_LDSBA:
     case SPARC64_OP3_LDSHA:
     case SPARC64_OP3_LDXA:
+    case SPARC64_OP3_LDFSR:
         d.cls = SPARC64_ICLS_LOAD;
         r = sparc64_exec_load(ctx, mem, mc, pc, &d);
         break;
@@ -573,6 +574,7 @@ static inline uint32_t s64_rt_mem(sparc64_ctx_t *ctx,
     case SPARC64_OP3_STHA:
     case SPARC64_OP3_STDA:
     case SPARC64_OP3_STXA:
+    case SPARC64_OP3_STFSR:
         d.cls = SPARC64_ICLS_STORE;
         r = sparc64_exec_store(ctx, mem, mc, pc, &d);
         break;

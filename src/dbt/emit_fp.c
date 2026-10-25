@@ -17,9 +17,11 @@
  * rs1 (bits 18:14, decoded) + rs2 (bits 4:0, re-read from raw: the
  * classifier leaves d->rs2 zero for FPOP); all unary FPOP1 ops (FSQRT,
  * moves, neg/abs, FP-source conversions) read the rs2 field;
- * integer-source conversions read the integer register named by rs2;
- * F{S,D}TO{I,X} write the integer register named by rd. AArch64 scalar
- * FP words below were verified word-for-word with the cross-assembler.
+ * every FPOP1 conversion reads and writes the FP file (integer values
+ * transfer through f/d regs; `ld [c5i], %f0` stages the int in an F-reg).
+ * Slot mapping mirrors interp (single N in slot N^1, double field v in
+ * d[v>>1] / d[16+(v>>1)]) or difftest diverges. AArch64 scalar FP words
+ * below were verified word-for-word with the cross-assembler.
  */
 
 #include "dbt/emit_fp.h"
@@ -46,10 +48,10 @@
 #define FP_FNEG_D UINT32_C(0x1e614000)
 #define FP_FABS_S UINT32_C(0x1e20c000)
 #define FP_FABS_D UINT32_C(0x1e60c000)
-#define FP_FCVTNS_W_S UINT32_C(0x1e200000)
-#define FP_FCVTNS_X_S UINT32_C(0x9e200000)
-#define FP_FCVTNS_W_D UINT32_C(0x1e600000)
-#define FP_FCVTNS_X_D UINT32_C(0x9e600000)
+#define FP_FCVTZS_W_S UINT32_C(0x1e380000)
+#define FP_FCVTZS_X_S UINT32_C(0x9e380000)
+#define FP_FCVTZS_W_D UINT32_C(0x1e780000)
+#define FP_FCVTZS_X_D UINT32_C(0x9e780000)
 #define FP_SCVTF_S_W UINT32_C(0x1e220000)
 #define FP_SCVTF_D_W UINT32_C(0x1e620000)
 #define FP_SCVTF_S_X UINT32_C(0x9e220000)
@@ -57,6 +59,11 @@
 #define FP_FCVT_D_S UINT32_C(0x1e22c000)
 #define FP_FCVT_S_D UINT32_C(0x1e624000)
 #define FP_FMOV_X_D UINT32_C(0x9e660000)
+#define FP_FMOV_W_S UINT32_C(0x1e260000)
+#define FP_FMOV_S_W UINT32_C(0x1e270000)
+#define FP_FMOV_D_X UINT32_C(0x9e670000)
+#define FP_FCMP_S UINT32_C(0x1e202000)
+#define FP_FCMP_D UINT32_C(0x1e602000)
 
 /* Guest FP file base (ctx + 0x140); FSR at ctx + 0x120. */
 #define FP_FILE_OFF 0x140U
@@ -72,32 +79,44 @@ static inline void fp_alu(sparc64_dbt_buf_t *b, uint32_t base, unsigned vd,
         ((vm & 31U) << 16));
 }
 
-/* LDR St,[x19,#off] / STR St,[x19,#off]: single f[idx]. */
-static inline void fp_ld_s(sparc64_dbt_buf_t *b, unsigned vt, unsigned idx)
+/* Guest FP slot of single arch f[arch] (slot arch^1) and double
+ * field (d[field>>1], upper bank at d[16+(field>>1)] when odd). */
+static inline unsigned fp_slot_s(unsigned arch)
 {
-    uint32_t off = FP_FILE_OFF + (idx & 31U) * 4U;
+    return (arch ^ 1U) & 31U;
+}
+
+static inline unsigned fp_pair_d(unsigned field)
+{
+    return ((field & 1U) != 0U) ? (16U + (field >> 1U)) : (field >> 1U);
+}
+
+/* LDR St,[x19,#off] / STR St,[x19,#off]: single arch f[arch]. */
+static inline void fp_ld_s(sparc64_dbt_buf_t *b, unsigned vt, unsigned arch)
+{
+    uint32_t off = FP_FILE_OFF + fp_slot_s(arch) * 4U;
     sb_word(b, UINT32_C(0xbd400000) | (vt & 31U) | (19U << 5) |
         ((off / 4U) << 10));
 }
 
-static inline void fp_st_s(sparc64_dbt_buf_t *b, unsigned vt, unsigned idx)
+static inline void fp_st_s(sparc64_dbt_buf_t *b, unsigned vt, unsigned arch)
 {
-    uint32_t off = FP_FILE_OFF + (idx & 31U) * 4U;
+    uint32_t off = FP_FILE_OFF + fp_slot_s(arch) * 4U;
     sb_word(b, UINT32_C(0xbd000000) | (vt & 31U) | (19U << 5) |
         ((off / 4U) << 10));
 }
 
-/* LDR Dt,[x19,#off] / STR Dt,[x19,#off]: double d[di]. */
-static inline void fp_ld_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned di)
+/* LDR Dt,[x19,#off] / STR Dt,[x19,#off]: double field (even/odd). */
+static inline void fp_ld_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned field)
 {
-    uint32_t off = FP_FILE_OFF + (di & 31U) * 8U;
+    uint32_t off = FP_FILE_OFF + fp_pair_d(field) * 8U;
     sb_word(b, UINT32_C(0xfd400000) | (vt & 31U) | (19U << 5) |
         ((off / 8U) << 10));
 }
 
-static inline void fp_st_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned di)
+static inline void fp_st_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned field)
 {
-    uint32_t off = FP_FILE_OFF + (di & 31U) * 8U;
+    uint32_t off = FP_FILE_OFF + fp_pair_d(field) * 8U;
     sb_word(b, UINT32_C(0xfd000000) | (vt & 31U) | (19U << 5) |
         ((off / 8U) << 10));
 }
@@ -120,6 +139,31 @@ static bool fp_guard_rd0(sparc64_emit_ctx_t *ec)
     return !b->overflow;
 }
 
+/* NaN detour: FCMP Vt,Vt sets V iff Vt is NaN; B.VS exits UNDEF so
+ * the interpreter reproduces the oracle's NaN payload, quieting, and
+ * NV exactly. Finite results stay native and bit-exact (IEEE); the FSR
+ * flags they raise are observed through the interpreter copy. */
+static bool fp_nan_check(sparc64_emit_ctx_t *ec, bool is_double,
+    unsigned vt)
+{
+    sparc64_dbt_buf_t *b = ec->buf;
+    size_t p_vs;
+    size_t p_end;
+    fp_alu(b, is_double ? FP_FCMP_D : FP_FCMP_S, 0U, vt, vt);
+    p_vs = sb_b_cond_placeholder(b, 6U);
+    if (p_vs == SPARC64_DBT_NOPOS) {
+        return false;
+    }
+    p_end = sb_b_placeholder(b);
+    if (p_end == SPARC64_DBT_NOPOS) {
+        return false;
+    }
+    sb_patch_b_cond(b, p_vs, 6U, b->count);
+    e_fault_here(b, ec->fault_pc);
+    sb_patch_b(b, p_end, b->count);
+    return !b->overflow;
+}
+
 /* Binary arith (FADD/FSUB/FMUL/FDIV, single or double). */
 static bool fp_emit_arith(sparc64_emit_ctx_t *ec, uint32_t base,
     const sparc64_dec_t *d, bool is_double)
@@ -132,14 +176,20 @@ static bool fp_emit_arith(sparc64_emit_ctx_t *ec, uint32_t base,
         return false;
     }
     if (is_double) {
-        fp_ld_d(b, 0U, (rs1 >> 1U) & 31U);
-        fp_ld_d(b, 1U, (rs2 >> 1U) & 31U);
+        fp_ld_d(b, 0U, rs1);
+        fp_ld_d(b, 1U, rs2);
         fp_alu(b, base, 2U, 0U, 1U);
-        fp_st_d(b, 2U, (rd >> 1U) & 31U);
+        if (!fp_nan_check(ec, true, 2U)) {
+            return false;
+        }
+        fp_st_d(b, 2U, rd);
     } else {
         fp_ld_s(b, 0U, rs1);
         fp_ld_s(b, 1U, rs2);
         fp_alu(b, base, 2U, 0U, 1U);
+        if (!fp_nan_check(ec, false, 2U)) {
+            return false;
+        }
         fp_st_s(b, 2U, rd);
     }
     return !b->overflow;
@@ -157,12 +207,18 @@ static bool fp_emit_sqrt(sparc64_emit_ctx_t *ec, uint32_t base,
         return false;
     }
     if (is_double) {
-        fp_ld_d(b, 0U, (rs2 >> 1U) & 31U);
+        fp_ld_d(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
-        fp_st_d(b, 1U, (rd >> 1U) & 31U);
+        if (!fp_nan_check(ec, true, 1U)) {
+            return false;
+        }
+        fp_st_d(b, 1U, rd);
     } else {
         fp_ld_s(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
+        if (!fp_nan_check(ec, false, 1U)) {
+            return false;
+        }
         fp_st_s(b, 1U, rd);
     }
     return !b->overflow;
@@ -176,8 +232,8 @@ static bool fp_emit_mov(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     unsigned rs2 = d->raw & 31U;
     unsigned rd = d->rd & 31U;
     if (is_double) {
-        fp_ld_d(b, 0U, (rs2 >> 1U) & 31U);
-        fp_st_d(b, 0U, (rd >> 1U) & 31U);
+        fp_ld_d(b, 0U, rs2);
+        fp_st_d(b, 0U, rd);
     } else {
         fp_ld_s(b, 0U, rs2);
         fp_st_s(b, 0U, rd);
@@ -193,9 +249,9 @@ static bool fp_emit_unary(sparc64_emit_ctx_t *ec, uint32_t base,
     unsigned rs2 = d->raw & 31U;
     unsigned rd = d->rd & 31U;
     if (is_double) {
-        fp_ld_d(b, 0U, (rs2 >> 1U) & 31U);
+        fp_ld_d(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
-        fp_st_d(b, 1U, (rd >> 1U) & 31U);
+        fp_st_d(b, 1U, rd);
     } else {
         fp_ld_s(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
@@ -204,34 +260,42 @@ static bool fp_emit_unary(sparc64_emit_ctx_t *ec, uint32_t base,
     return !b->overflow;
 }
 
-/* F{S,D}TO{I,X}: FP source, integer rd (sign-extended 32-bit results,
- * matching the oracle's `ld`-style sign extension). SPARC conversions
- * round per FSR.RD, so this uses FCVTNS (host FPCR rounding, reset RN
- * and untouched anywhere in tree) under the RD == 0 guard prologue;
- * a fixed toward-zero FCVTZS would be wrong for RD = RN. */
+/* F{S,D}TO{I,X}: FP source, FP rd (the integer result bit pattern
+ * lands in f[rd]/d[rd]; the test reads it back with st/std). Truncates
+ * toward zero like hardware (RD only matters via the guard: conversions
+ * that need another mode exit UNDEF for interpreter replay). */
 static bool fp_emit_f2i(sparc64_emit_ctx_t *ec, uint32_t base,
     const sparc64_dec_t *d, bool from_double, bool to_64)
 {
     sparc64_dbt_buf_t *b = ec->buf;
     unsigned rs2 = d->raw & 31U;
+    unsigned rd = d->rd & 31U;
     if (!fp_guard_rd0(ec)) {
         return false;
     }
     if (from_double) {
-        fp_ld_d(b, 0U, (rs2 >> 1U) & 31U);
+        fp_ld_d(b, 0U, rs2);
     } else {
         fp_ld_s(b, 0U, rs2);
     }
-    fp_alu(b, base, ES1, 0U, 0U);
-    if (!to_64) {
-        sb_sbfm64(b, ES1, ES1, 0U, 31U);
+    if (!fp_nan_check(ec, from_double, 0U)) {
+        return false;
     }
-    e_st64(b, d->rd & 31U, ES1);
+    fp_alu(b, base, ES1, 0U, 0U);
+    if (to_64) {
+        fp_alu(b, FP_FMOV_D_X, ES1, ES1, 0U);
+        fp_st_d(b, ES1, rd);
+    } else {
+        fp_alu(b, FP_FMOV_S_W, ES1, ES1, 0U);
+        fp_st_s(b, ES1, rd);
+    }
     return !b->overflow;
 }
 
-/* FITOS/FITOD: 32-bit integer rs2 source, FP rd. (FXTOS/FXTOD take
- * their 64-bit source from a double FP register: fp_emit_x2f.) */
+/* FITOS/FITOD: the 32-bit integer source lives in single f[rs2]
+ * (oracle/test: `ld [c5i], %f0` stages it before `fitos %f0, %f2`).
+ * (FXTOS/FXTOD take their 64-bit source from a double FP register:
+ * fp_emit_x2f.) */
 static bool fp_emit_i2f(sparc64_emit_ctx_t *ec, uint32_t base,
     const sparc64_dec_t *d, bool to_double)
 {
@@ -241,10 +305,11 @@ static bool fp_emit_i2f(sparc64_emit_ctx_t *ec, uint32_t base,
     if (!fp_guard_rd0(ec)) {
         return false;
     }
-    e_ld64(b, ES0, rs2);
+    fp_ld_s(b, 0U, rs2);
+    fp_alu(b, FP_FMOV_W_S, ES0, 0U, 0U);
     fp_alu(b, base, 0U, ES0, 0U);
     if (to_double) {
-        fp_st_d(b, 0U, (rd >> 1U) & 31U);
+        fp_st_d(b, 0U, rd);
     } else {
         fp_st_s(b, 0U, rd);
     }
@@ -262,11 +327,11 @@ static bool fp_emit_x2f(sparc64_emit_ctx_t *ec, uint32_t base,
     if (!fp_guard_rd0(ec)) {
         return false;
     }
-    fp_ld_d(b, 0U, (rs2 >> 1U) & 31U);
+    fp_ld_d(b, 0U, rs2);
     fp_alu(b, FP_FMOV_X_D, ES0, 0U, 0U);
     fp_alu(b, base, 0U, ES0, 0U);
     if (to_double) {
-        fp_st_d(b, 0U, (rd >> 1U) & 31U);
+        fp_st_d(b, 0U, rd);
     } else {
         fp_st_s(b, 0U, rd);
     }
@@ -284,13 +349,19 @@ static bool fp_emit_f2f(sparc64_emit_ctx_t *ec, uint32_t base,
         return false;
     }
     if (from_double) {
-        fp_ld_d(b, 0U, (rs2 >> 1U) & 31U);
+        fp_ld_d(b, 0U, rs2);
+        if (!fp_nan_check(ec, true, 0U)) {
+            return false;
+        }
         fp_alu(b, base, 1U, 0U, 0U);
         fp_st_s(b, 1U, rd);
     } else {
         fp_ld_s(b, 0U, rs2);
+        if (!fp_nan_check(ec, false, 0U)) {
+            return false;
+        }
         fp_alu(b, base, 1U, 0U, 0U);
-        fp_st_d(b, 1U, (rd >> 1U) & 31U);
+        fp_st_d(b, 1U, rd);
     }
     return !b->overflow;
 }
@@ -370,14 +441,17 @@ static bool fp_emit_fpop1(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         return fp_emit_unary(ec, FP_FABS_S, d, false);
     case 0x0AU:
         return fp_emit_unary(ec, FP_FABS_D, d, true);
+    /* Toward-zero: SPARC float-to-int always truncates (RD only gates
+     * which mode may run natively; exceptional inputs trap to the
+     * interpreter via the caller's fallback paths). */
     case 0xD1U:
-        return fp_emit_f2i(ec, FP_FCVTNS_W_S, d, false, false);
+        return fp_emit_f2i(ec, FP_FCVTZS_W_S, d, false, false);
     case 0xD2U:
-        return fp_emit_f2i(ec, FP_FCVTNS_W_D, d, true, false);
+        return fp_emit_f2i(ec, FP_FCVTZS_W_D, d, true, false);
     case 0x81U:
-        return fp_emit_f2i(ec, FP_FCVTNS_X_S, d, false, true);
+        return fp_emit_f2i(ec, FP_FCVTZS_X_S, d, false, true);
     case 0x82U:
-        return fp_emit_f2i(ec, FP_FCVTNS_X_D, d, true, true);
+        return fp_emit_f2i(ec, FP_FCVTZS_X_D, d, true, true);
     case 0xC4U:
         return fp_emit_i2f(ec, FP_SCVTF_S_W, d, false);
     case 0xC8U:

@@ -47,18 +47,18 @@ Write `docs/lanes/phase-1.md` and run concurrent lanes `L1a..L1d`:
 
 ### Phase 2 — Static Libc Syscalls & Base Integer AArch64 DBT (`src/dbt/`) (`RC2`)
 Write `docs/lanes/phase-2.md` and run concurrent lanes `L2a..L2d`:
-- [ ] **Lane `L2a`**: Complete static-libc Linux syscall & struct conversion layer (`src/os/syscalls.c`, `stat`/`stat64`/`statx`, `iovec`, `openat`, `fcntl`, `clock_gettime`, `getrandom`, `futex`, `rt_sigprocmask`, `ioctl`).
-- [ ] **Lane `L2b`**: AArch64 DBT core (`src/dbt/dbt.c`, `src/dbt/trampoline_a64.S`, direct block chaining, 4096-entry IBTC, RAS, D2 `EXIT_UNDEF`/`EXIT_SINGLE_STEP` interpreter fallback).
-- [ ] **Lane `L2c`**: AArch64 integer instruction emitter (`src/dbt/emit_int.c`).
-- [ ] **Lane `L2d`**: Differential harness (`--difftest`) + static libc test suite (`hello`, `printf`, `malloc`, `qsort`, file I/O).
-- [ ] **Gate `RC2`**: `--difftest` reports `0` register/PC mismatches between `interp` and `dbt` on `test_p1_isa` and static libc binaries; outputs match `qemu-sparc64`.
+- [x] **Lane `L2a`**: Complete static-libc Linux syscall & struct conversion layer (`src/os/syscalls.c`, `stat`/`stat64`/`statx`, `iovec`, `openat`, `fcntl`, `clock_gettime`, `getrandom`, `futex`, `rt_sigprocmask`, `ioctl`).
+- [x] **Lane `L2b`**: AArch64 DBT core (`src/dbt/dbt.c`, `src/dbt/trampoline_a64.S`, direct block chaining, 4096-entry IBTC, RAS, D2 `EXIT_UNDEF`/`EXIT_SINGLE_STEP` interpreter fallback).
+- [x] **Lane `L2c`**: AArch64 integer instruction emitter (`src/dbt/emit_int.c`).
+- [x] **Lane `L2d`**: Differential harness (`--difftest`) + static libc test suite (`hello`, `printf`, `malloc`, `qsort`, file I/O).
+- [x] **Gate `RC2`**: `--difftest` reports `0` register/PC mismatches between `interp` and `dbt` on `test_p1_isa` and static libc binaries; outputs match `qemu-sparc64`.
 
 ### Phase 3 — Floating-Point & SIMD (`src/interp/fp.c`, `src/dbt/emit_fp.c`) (`RC3`)
 Write `docs/lanes/phase-3.md` and run concurrent lanes `L3a..L3c`:
-- [ ] **Lane `L3a`**: Complete FPU & SIMD reference interpreter (`src/interp/fp.c`) implementing all `SPEC.md` §2 FP/SIMD instructions, NaN rules, condition codes, and status registers.
-- [ ] **Lane `L3b`**: AArch64 FP & NEON emitter (`src/dbt/emit_fp.c`) + phase-gated `AT_HWCAP` activation.
-- [ ] **Lane `L3c`**: `tests/test_p3_fp_simd.c` covering scalar FP, SIMD lanes, NaN propagation, rounding modes, and conversions.
-- [ ] **Gate `RC3`**: `test_p3_fp_simd` matches `qemu-sparc64` golden output bit-for-bit on both `interp` and `dbt` with `0` `--difftest` divergences.
+- [x] **Lane `L3a`**: Complete FPU & SIMD reference interpreter (`src/interp/fp.c`) implementing all `SPEC.md` §2 FP/SIMD instructions, NaN rules, condition codes, and status registers.
+- [x] **Lane `L3b`**: AArch64 FP & NEON emitter (`src/dbt/emit_fp.c`) + phase-gated `AT_HWCAP` activation.
+- [x] **Lane `L3c`**: `tests/test_p3_fp_simd.c` covering scalar FP, SIMD lanes, NaN propagation, rounding modes, and conversions.
+- [x] **Gate `RC3`**: `test_p3_fp_simd` matches `qemu-sparc64` golden output bit-for-bit on both `interp` and `dbt` with `0` `--difftest` divergences.
 
 ### Phase 4 — Signals (`rt_sigframe`), Threads (`clone`/`futex`/TLS), & Process Lifecycle (`fork`/`execve`) (`RC4`)
 Write `docs/lanes/phase-4.md` and run concurrent lanes `L4a..L4c`:
