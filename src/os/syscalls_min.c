@@ -42,6 +42,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
 #include "os/syscalls_min.h"
+#include "os/syscalls_sig.h"
 
 /* SPARC Linux prot/flag ABI (asm/mman.h, arch 64-bit). Defined locally so
  * this TU compiles identically on any build host. */
@@ -260,60 +261,6 @@ const char *sparc64_syscall_name(long nr)
 #endif
 }
 
-/* rt_sigaction(102): 5-arg SPARC form (sig, act, oact, restorer,
- * sigsetsize). Only the 8-byte sigset form is accepted; act/oact are
- * the 32-byte kernel structs (handler/flags/restorer/mask). */
-static long sys_rt_sigaction(sparc64_ctx_t *ctx,
-    const sparc64_syscall_mem_t *mem, uint64_t sig, uint64_t act_va,
-    uint64_t oact_va, uint64_t restorer, uint64_t sigsetsize)
-{
-    uint8_t raw[32];
-    uint64_t handler;
-    uint64_t flags;
-    unsigned i;
-    long rc;
-    (void)ctx;
-    if (sig == 0U || sig > 64U || sigsetsize != 8U) {
-        return -EINVAL;
-    }
-    if (act_va != UINT64_C(0)) {
-        if (!mem->read(mem->context, act_va, raw, sizeof(raw))) {
-            return -EFAULT;
-        }
-        handler = UINT64_C(0);
-        flags = UINT64_C(0);
-        for (i = 0U; i < 8U; i++) {
-            handler = (handler << 8U) | (uint64_t)raw[i];
-            flags = (flags << 8U) | (uint64_t)raw[8U + i];
-        }
-        if ((flags & ~(uint64_t)SPARC64_SA_SIGINFO) != UINT64_C(0)) {
-            return -EINVAL;
-        }
-        if (restorer == UINT64_C(0)) {
-            return -EINVAL;
-        }
-        rc = (long)sparc64_sync_sig_install(sig, handler, restorer);
-        if (rc != 0) {
-            return rc;
-        }
-    } else {
-        rc = (long)sparc64_sync_sig_install(sig, UINT64_C(0),
-            UINT64_C(0));
-        if (rc != 0) {
-            return rc;
-        }
-    }
-    if (oact_va != UINT64_C(0)) {
-        for (i = 0U; i < (unsigned)sizeof(raw); i++) {
-            raw[i] = 0U;
-        }
-        if (!mem->write(mem->context, oact_va, raw, sizeof(raw))) {
-            return -EFAULT;
-        }
-    }
-    return 0L;
-}
-
 /* Dispatch the syscall in %g1 (args %o0..%o5), commit the dual-carry
  * convention, and advance pc = npc; npc += 4. Returns the guest exit
  * status for exit/exit_group (terminal), 0 otherwise. */
@@ -403,9 +350,16 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
     case (long)SPARC64__NR_fcntl64:
         ret = sparc64_l2a_fcntl(o0, o1, o2);
         break;
-    case (long)SPARC64__NR_rt_sigprocmask:
-        ret = sparc64_l2a_rt_sigprocmask(ctx, mem, o0, o1, o2, o3);
+    case (long)SPARC64__NR_rt_sigprocmask: {
+        int delivered = 0;
+        ret = sparc64_sig_rt_sigprocmask(ctx, mem, o0, o1, o2, o3,
+            &delivered);
+        if (delivered) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
         break;
+    }
     case (long)SPARC64__NR_ioctl:
         ret = sparc64_l2a_ioctl(ctx, mem, o0, o1, o2);
         break;
@@ -434,8 +388,38 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         }
         break;
     case (long)SPARC64__NR_rt_sigaction:
-        ret = sys_rt_sigaction(ctx, mem, o0, o1, o2, o3, o4);
+        ret = sparc64_sig_rt_sigaction(ctx, mem, o0, o1, o2, o3, o4);
         break;
+    case (long)SPARC64__NR_sigaltstack:
+        ret = sparc64_sig_sigaltstack(ctx, mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_kill: {
+        int delivered = 0;
+        ret = sparc64_sig_kill(ctx, mem, o0, o1, &delivered);
+        if (delivered) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
+        break;
+    }
+    case (long)SPARC64__NR_tkill: {
+        int delivered = 0;
+        ret = sparc64_sig_tkill(ctx, mem, o0, o1, &delivered);
+        if (delivered) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
+        break;
+    }
+    case (long)SPARC64__NR_tgkill: {
+        int delivered = 0;
+        ret = sparc64_sig_tgkill(ctx, mem, o0, o1, o2, &delivered);
+        if (delivered) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
+        break;
+    }
     case (long)SPARC64__NR_write:
         ret = sys_write(ctx, mem, o0, o1, o2);
         break;
