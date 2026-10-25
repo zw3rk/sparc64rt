@@ -84,6 +84,13 @@ const sparc64_syscall_mem_t *sysmem_ops(guest_state_t *g,
 int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
     const char *path, char **argv);
 
+/* Image open for exec_image (proc.c): /proc/self/exe resolves to the
+ * running guest image, absolute paths go through the sysroot (qemu
+ * -L, miss is ENOENT), relative paths open raw. Returns the fd or a
+ * negative errno; *opened_path is what /proc/self/exe records. */
+int sparc64_proc_open_exec(void *guest, const char *path,
+    char *img_path, const char **opened_path);
+
 /* Engine run loops (guest_engines.c). Each returns the guest exit
  * status, or 1 when the runner itself fails. */
 int run_interp(guest_state_t *g, sparc64_ctx_t *ctx,

@@ -12,7 +12,10 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -188,6 +191,29 @@ int sparc64_interp_resolve(const char *interp, const char *sysroot,
     memcpy(out, sysroot, root_len);
     memcpy(out + root_len, interp, interp_len + 1U);
     return 0;
+}
+
+bool sparc64_sysroot_try_open(int dirfd, const char *path, int flags,
+    unsigned mode, int *fd_out)
+{
+    const char *sysroot = getenv("SPARC64RT_SYSROOT");
+    char joined[SPARC64RT_INTERP_PATH_MAX];
+    int fd;
+    if (path == NULL || path[0] != '/' || fd_out == NULL ||
+            sysroot == NULL || sysroot[0] == '\0') {
+        return false;
+    }
+    /* An absolute guest path ignores dirfd per POSIX either way. */
+    if (sparc64_interp_resolve(path, sysroot, joined,
+            sizeof(joined)) != 0) {
+        return false;
+    }
+    fd = openat(dirfd, joined, flags, (mode_t)mode);
+    if (fd < 0 && (errno == ENOENT || errno == ENOTDIR)) {
+        return false;
+    }
+    *fd_out = fd;
+    return true;
 }
 
 /* One validated PT_LOAD (file offsets + mapped span + host perms). */

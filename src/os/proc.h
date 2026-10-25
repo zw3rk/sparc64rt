@@ -60,6 +60,9 @@ long sparc64_proc_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
 long sparc64_proc_execve(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t path_va, uint64_t argv_va, uint64_t envp_va);
 
+/* Image open for sparc64_guest_exec_image lives in guest_run_priv.h
+ * (implemented in proc.c) so the loader sees it without a cycle. */
+
 /* wait4(7): host waitpid with a guest-BE status word and an optional
  * guest struct rusage. Positive pids must be known guest children. */
 long sparc64_proc_wait4(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,

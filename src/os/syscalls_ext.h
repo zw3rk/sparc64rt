@@ -28,6 +28,13 @@
 /* Shared guest-access helpers (static inline so TUs that only need the
  * declarations below, such as src/os/syscalls_min.c, compile clean).
  * Big-endian words, the 47-bit guest range model, and host-time views. */
+#define L2A_PATH_MAX 4096U
+#define SP_AT_FDCWD ((int64_t)-100)
+#define SP_AT_SYMLINK_NOFOLLOW 0x100U
+#define SP_AT_EACCESS 0x200U
+#define SP_AT_NO_AUTOMOUNT 0x800U
+#define SP_AT_EMPTY_PATH 0x1000U
+#define SP_AT_STATX_SYNC_TYPE 0x6000U
 static inline void l2a_put_be16(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)(v >> 8);
@@ -90,7 +97,10 @@ static inline long l2a_store_buf(const sparc64_syscall_mem_t *mem,
     return 0;
 }
 
-/* NUL-terminated guest string -> out (0 ok, -EFAULT/-ENAMETOOLONG). */
+/* NUL-terminated guest string -> out (0 ok, -EFAULT/-ENAMETOOLONG).
+ * Fast 256 B chunks first; a chunk that faults (e.g. argv packed
+ * against the top of the stack) falls back to byte-wise reads so a
+ * string ending just before an unmapped page still copies. */
 static inline long l2a_copy_cstring(const sparc64_syscall_mem_t *mem,
     uint64_t va, char *out, uint64_t cap)
 {
@@ -108,22 +118,31 @@ static inline long l2a_copy_cstring(const sparc64_syscall_mem_t *mem,
         if (want > (uint64_t)sizeof(chunk)) {
             want = (uint64_t)sizeof(chunk);
         }
-        if (l2a_range_ok(va + done, want) != 0) {
-            out[done] = '\0';
-            return -EFAULT;
-        }
-        if (!mem->read(mem->context, va + done, chunk, want)) {
-            return -EFAULT;
-        }
-        for (i = 0U; i < want; i++) {
-            out[done] = (char)chunk[i];
-            done++;
-            if (chunk[i] == 0U) {
-                return 0;
+        if (l2a_range_ok(va + done, want) == 0 &&
+                mem->read(mem->context, va + done, chunk, want)) {
+            for (i = 0U; i < want; i++) {
+                out[done] = (char)chunk[i];
+                done++;
+                if (chunk[i] == 0U) {
+                    return 0;
+                }
+                if (done == cap) {
+                    out[cap - 1U] = '\0';
+                    return -ENAMETOOLONG;
+                }
             }
-            if (done == cap) {
-                out[cap - 1U] = '\0';
-                return -ENAMETOOLONG;
+            continue;
+        }
+        {
+            uint8_t c = 0;
+            if (!mem->read(mem->context, va + done, &c, 1U)) {
+                out[done] = '\0';
+                return -EFAULT;
+            }
+            out[done] = (char)c;
+            done++;
+            if (c == 0U) {
+                return 0;
             }
         }
     }
@@ -177,8 +196,21 @@ long sparc64_l2a_openat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
 long sparc64_l2a_open(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t path_va, uint64_t flags, uint64_t mode);
 
-/* readlinkat(294): /proc/self/exe yields argv[0]; other synthetic
- * files are EINVAL; the rest is the host readlinkat. */
+/* getdents64(154): host records with BE-swapped d_ino/d_off/d_reclen;
+ * d_type/d_name copied verbatim. Returns the byte count. */
+long sparc64_l2a_getdents64(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t fd, uint64_t buf_va,
+    uint64_t count);
+
+/* faccessat(296): mode bits match the host; AT_EACCESS accepted and
+ * ignored; absolute paths try the sysroot first (qemu -L). */
+long sparc64_l2a_faccessat(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t dirfd, uint64_t path_va,
+    uint64_t mode, uint64_t flags);
+
+/* readlinkat(294): /proc/self/exe yields the absolute load path;
+ * other synthetic files are EINVAL; the rest is the host
+ * readlinkat. */
 long sparc64_l2a_readlinkat(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *mem, uint64_t dirfd, uint64_t path_va,
     uint64_t buf_va, uint64_t bufsz);

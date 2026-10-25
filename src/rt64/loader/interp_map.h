@@ -14,6 +14,7 @@
 #ifndef SPARC64RT_LOADER_INTERP_MAP_H
 #define SPARC64RT_LOADER_INTERP_MAP_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -38,6 +39,14 @@ int sparc64_interp_read_path(int fd, char *out, size_t cap);
  * 0, -ENAMETOOLONG on overflow, -EINVAL on bad arguments. */
 int sparc64_interp_resolve(const char *interp, const char *sysroot,
     char *out, size_t cap);
+
+/* Open an absolute guest path against the translator sysroot (qemu -L
+ * semantics): SPARC64RT_SYSROOT+path first, ENOENT/ENOTDIR falls back
+ * to the raw path (serves $ORIGIN libraries outside the sysroot).
+ * Returns true with *fd_out set (errno preserved) when attempted;
+ * false means open the raw path. Reuses interp_resolve for joining. */
+bool sparc64_sysroot_try_open(int dirfd, const char *path, int flags,
+    unsigned mode, int *fd_out);
 
 /* Map the ET_DYN BE SPARC64 interpreter open on fd at a free base
  * honouring the largest PT_LOAD p_align. Returns 0 with the

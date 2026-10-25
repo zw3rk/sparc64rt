@@ -310,6 +310,12 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
     case (long)SPARC64__NR_close:
         ret = host_ret(close((int)o0));
         break;
+    case (long)SPARC64__NR_getdents64:
+        ret = sparc64_l2a_getdents64(ctx, mem, o0, o1, o2);
+        break;
+    case (long)SPARC64__NR_faccessat:
+        ret = sparc64_l2a_faccessat(ctx, mem, o0, o1, o2, o3);
+        break;
     /* Phase-2 static-libc set (src/os/syscalls_ext.c, additive cases). */
     case (long)SPARC64__NR_getpid:
         ret = sparc64_l2a_getpid();

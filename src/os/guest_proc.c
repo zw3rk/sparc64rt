@@ -122,6 +122,16 @@ void sparc64_guest_proc_note_exec(void *guest, const char *load_path)
     g->proc->load_path[len] = '\0';
 }
 
+const char *sparc64_guest_proc_exec_path(void *guest)
+{
+    guest_state_t *g = as_guest(guest);
+    if (g == NULL || g->proc == NULL ||
+            g->proc->load_path[0] == '\0') {
+        return NULL;
+    }
+    return g->proc->load_path;
+}
+
 int sparc64_guest_proc_note_stack(void *guest, char **argv, uint64_t argc,
     const uint64_t *keys, const uint64_t *vals, unsigned nkeys,
     uint64_t sp_biased, uint64_t stack_lo, uint64_t stack_hi)
@@ -614,17 +624,22 @@ long sparc64_guest_proc_readlinkat(void *guest,
     }
     if (strcmp(path, "/proc/self/exe") == 0) {
         long stored;
-        if (g == NULL || g->proc == NULL || g->proc->argv0[0] == '\0') {
+        /* Like the kernel (and the oracle), readlink reports the
+         * canonical absolute path, not argv[0] verbatim: ld.so's
+         * _dl_get_origin asserts linkval[0] == '/' and computes
+         * $ORIGIN from it. open() above serves the same load_path. */
+        if (g == NULL || g->proc == NULL ||
+                g->proc->load_path[0] == '\0') {
             return -ENOENT;
         }
         (void)dirfd;
-        len = strlen(g->proc->argv0);
+        len = strlen(g->proc->load_path);
         if (len > (size_t)bufsz) {
             len = (size_t)bufsz;
         }
         /* readlink reports the byte count, not a status code. */
         stored = l2a_store_buf(mem, buf_va,
-            (const uint8_t *)g->proc->argv0, (uint64_t)len);
+            (const uint8_t *)g->proc->load_path, (uint64_t)len);
         return (stored != 0) ? stored : (long)len;
     }
     if (sparc64_guest_proc_handles(path)) {

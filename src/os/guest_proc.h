@@ -28,6 +28,10 @@ int sparc64_guest_proc_handles(const char *path);
 /* Snapshot the host load path backing /proc/self/exe opens. */
 void sparc64_guest_proc_note_exec(void *guest, const char *load_path);
 
+/* Absolute host load path for /proc/self/exe (NULL when none): lets
+ * execve("/proc/self/exe") re-exec the running guest image. */
+const char *sparc64_guest_proc_exec_path(void *guest);
+
 /* Snapshot argv, the auxv pairs just written to the stack, the biased
  * %sp, and the stack span for [stack] labeling. Replaces any older
  * snapshot (execve). argv strings are copied (bounded). */
@@ -54,9 +58,9 @@ long sparc64_guest_proc_open(void *guest,
     const sparc64_syscall_mem_t *mem, uint64_t path_va, uint64_t flags,
     uint64_t mode);
 
-/* readlinkat body: /proc/self/exe yields argv[0] (truncated like
- * readlink, no NUL); other synthetic files are regular files
- * (EINVAL); everything else is the host readlinkat. */
+/* readlinkat body: /proc/self/exe yields the absolute load path
+ * (truncated like readlink, no NUL); other synthetic files are
+ * regular files (EINVAL); everything else is the host readlinkat. */
 long sparc64_guest_proc_readlinkat(void *guest,
     const sparc64_syscall_mem_t *mem, uint64_t dirfd, uint64_t path_va,
     uint64_t buf_va, uint64_t bufsz);

@@ -30,8 +30,12 @@
 #include <unistd.h>
 
 #include "core/cpu.h"
+#include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
 #include "os/proc.h"
+#include "rt64/loader/interp_map.h"
+
+#include <unistd.h>
 #include "os/sync_sig.h"
 #include "os/syscalls_ext.h"
 
@@ -333,6 +337,104 @@ static void proc_free_vec(char **vec, unsigned n)
     }
 }
 
+/* ELF machine check on an open fd (first 20 bytes). Returns 1 for
+ * SPARC V9 (guest-loadable), 0 otherwise (host decides). */
+static int proc_fd_is_sparc(int fd)
+{
+    uint8_t head[20];
+    uint16_t mach;
+    ssize_t n = read(fd, head, sizeof(head));
+    if (n != (ssize_t)sizeof(head) || memcmp(head, "\177ELF", 4) != 0) {
+        return 0;
+    }
+    if (head[5] == 1U) {
+        mach = (uint16_t)head[18] | ((uint16_t)head[19] << 8);
+    } else if (head[5] == 2U) {
+        mach = ((uint16_t)head[18] << 8) | (uint16_t)head[19];
+    } else {
+        return 0;
+    }
+    return mach == (uint16_t)43;
+}
+
+int sparc64_proc_open_exec(void *guest, const char *path,
+    char *img_path, const char **opened_path)
+{
+    const char *use = path;
+    int fd;
+    if (guest == NULL || path == NULL || img_path == NULL ||
+            opened_path == NULL) {
+        return -EFAULT;
+    }
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        use = sparc64_guest_proc_exec_path(guest);
+        if (use == NULL) {
+            return -ENOENT;
+        }
+    } else if (path[0] == '/') {
+        if (sparc64_interp_resolve(path, getenv("SPARC64RT_SYSROOT"),
+                img_path, SPARC64RT_INTERP_PATH_MAX) != 0) {
+            return -ENAMETOOLONG;
+        }
+        fd = open(img_path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            *opened_path = img_path;
+            return fd;
+        }
+        /* Sysroot miss: a raw SPARC image still guest-loads (qemu
+         * -L fallback); anything else is the host's call and is
+         * decided by the execve site. */
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return -errno;
+        }
+        if (!proc_fd_is_sparc(fd)) {
+            (void)close(fd);
+            return -ENOENT;
+        }
+        *opened_path = path;
+        return fd;
+    }
+    fd = open(use, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -errno;
+    }
+    *opened_path = use;
+    return fd;
+}
+
+/* Host-native exec predicate (qemu parity): absolute guest path,
+ * sysroot resolution misses, raw file exists and is not a SPARC ELF
+ * (host binary, script, or foreign image). The forked guest child is
+ * then replaced by the host program, the parent wait4s and continues
+ * exactly like under qemu-sparc64 -L. */
+static int proc_should_host_exec(const char *path)
+{
+    char resolved[SPARC64RT_INTERP_PATH_MAX];
+    int fd;
+    int sparc;
+    if (path == NULL || path[0] != '/' ||
+            strcmp(path, "/proc/self/exe") == 0) {
+        return 0;
+    }
+    if (sparc64_interp_resolve(path, getenv("SPARC64RT_SYSROOT"),
+            resolved, sizeof(resolved)) != 0) {
+        return 0;
+    }
+    fd = open(resolved, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        (void)close(fd);
+        return 0;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    sparc = proc_fd_is_sparc(fd);
+    (void)close(fd);
+    return !sparc;
+}
+
 long sparc64_proc_execve(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t path_va, uint64_t argv_va, uint64_t envp_va)
 {
@@ -382,6 +484,17 @@ long sparc64_proc_execve(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         return -EFAULT;
     }
     proc_close_cloexec();
+    /* qemu parity: sysroot misses for non-SPARC host binaries run
+     * natively (the forked guest child is replaced; the parent
+     * wait4s and continues). Only returns on host-exec failure. */
+    if (proc_should_host_exec(path)) {
+        long erc;
+        (void)execve(path, argv, envp);
+        erc = -(long)errno;
+        proc_free_vec(argv, argc);
+        proc_free_vec(envp, envc);
+        return erc;
+    }
     /* build_stack consumes the translator's environ for the new stack:
      * swap in the guest envp across the reload, then restore. */
     saved_environ = environ;

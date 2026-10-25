@@ -806,6 +806,7 @@ int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
     guest_state_t ng;
     guest_image_t img;
     uint64_t bias = 0, guest_phdr = 0, heap_hi = 0, sp = 0, argc = 0;
+    char img_path[SPARC64RT_INTERP_PATH_MAX];
     int fd = -1;
     int rc;
     if (g == NULL || ctx == NULL || path == NULL || argv == NULL) {
@@ -815,9 +816,9 @@ int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
     if (argc == 0U || argc > (uint64_t)GUEST_MAX_ARGC) {
         return -E2BIG;
     }
-    fd = open(path, O_RDONLY | O_CLOEXEC);
+    fd = sparc64_proc_open_exec(g, path, img_path, &path);
     if (fd < 0) {
-        return -errno;
+        return fd;
     }
     memset(&img, 0, sizeof(img));
     rc = load_ehdr(fd, &img, &bias);

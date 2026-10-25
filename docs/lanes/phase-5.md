@@ -78,3 +78,34 @@ AND `--difftest` 0 divergences on `test_p5_dyn` AND the BusyBox probe
   `tests/test_p5_dyn.c`, `libp5` source, BusyBox build notes in this card.
   Conflicts on `guest_stack.c` merge in `--no-ff` order L5a then L5b.
 - Coordinator merges (`--no-ff`), removes worktrees, runs gate `RC5`.
+
+## Gate RC5 (coordinator record, master post-merge)
+
+Recipes (persistent container `sparc64rt-p5`, debian:stable-slim,
+`apt-get install -y gcc-sparc64-linux-gnu qemu-user make ...`;
+`SPARC64RT_SYSROOT=/usr/sparc64-linux-gnu`, cwd `/w`):
+- `sparc64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libp5.so
+  -o _build/libp5.so tests/libp5.c`
+- `sparc64-linux-gnu-gcc -O2 -pthread "-Wl,-rpath,\$ORIGIN"
+  -o _build/guest_p5_dyn tests/test_p5_dyn.c -L_build -l:libp5.so -ldl`
+- BusyBox 1.37.0: `CROSS_COMPILE=sparc64-linux-gnu- make defconfig`
+  (disable `SHA1_HWACCEL`, `SHA256_HWACCEL`, `TC`), `make -j2`.
+- Oracle: `qemu-sparc64 -L /usr/sparc64-linux-gnu ...` →
+  `tests/test_p5_dyn.golden`, `tests/busybox_probe.golden`.
+- Engines: `./_build/sparc64rt --interp|--dbt ...` with the sysroot
+  env; `--difftest` for 0-divergence runs.
+
+Post-merge integration fixes (all covered by the RC5 matrix):
+- `readlink(/proc/self/exe)` returns the absolute load path (ld.so
+  `$ORIGIN` asserts `linkval[0] == '/'`); `openat`/`execve` apply
+  `SPARC64RT_SYSROOT` to absolute guest paths with raw fallback
+  (qemu `-L`); `execve("/proc/self/exe")` re-runs the guest image.
+- `getdents64` (NR 154) with BE-swapped record headers (new
+  `src/os/syscalls_dirent.c`); `faccessat` (NR 296) for PATH search.
+- `l2a_copy_cstring` falls back to byte-wise reads near unmapped
+  pages (argv at the stack top faulted 256 B chunk reads).
+- `execve` of a sysroot-missing non-SPARC binary runs it natively
+  (qemu parity: the BusyBox probe's `ls` is the host GNU `ls`;
+  the forked guest child is replaced, the parent `wait4`s).
+- `AT_PAGESZ` is 8192 (hardware/oracle truth; mapping granule
+  stays 4K); `rd %tick` emulated with a fixed tick (difftest-safe).

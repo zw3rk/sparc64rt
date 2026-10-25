@@ -29,6 +29,13 @@
  * (run with the worktree root as cwd so the $ORIGIN rpath and the
  * dlopen("libp5.so") lookup resolve to _build/libp5.so).
  *
+ * Engine runs need SPARC64RT_SYSROOT=/usr/sparc64-linux-gnu in the
+ * same container (ld.so + libc come from the cross sysroot).
+ * Difftest limitation (grounded): the lockstep harness is single-
+ * threaded by design (clone returns ENOSYS under engine 2), so the
+ * TLS and PTHREAD legs show FAIL under --difftest with 0 divergences;
+ * thread behavior is verified by --interp vs --dbt output parity.
+ *
  * Expected oracle stdout (golden committed as tests/test_p5_dyn.golden):
  *   DSO-CALL-OK sum=42 prod=42 name=libp5
  *   DLOPEN-OK sym=42

@@ -46,6 +46,7 @@
 
 #include "core/cpu.h"
 #include "os/guest_proc.h"
+#include "rt64/loader/interp_map.h"
 #include "os/sigframe_sparc64rt.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
@@ -90,11 +91,7 @@
 #define SP_SIG_UNBLOCK 2U
 #define SP_SIG_SETMASK 4U
 
-#define SP_AT_FDCWD ((int64_t)-100)
-#define SP_AT_SYMLINK_NOFOLLOW 0x100U
-#define SP_AT_NO_AUTOMOUNT 0x800U
-#define SP_AT_EMPTY_PATH 0x1000U
-#define SP_AT_STATX_SYNC_TYPE 0x6000U
+/* SP_AT_* live in syscalls_ext.h (shared with syscalls_dirent.c). */
 
 #define SP_CLOCK_REALTIME 0U
 #define SP_CLOCK_MONOTONIC 1U
@@ -103,7 +100,7 @@
 #define SP_GRND_RANDOM 0x0002U
 #define SP_GRND_INSECURE 0x0004U
 
-#define L2A_PATH_MAX 4096U
+/* L2A_PATH_MAX and SP_AT_* live in syscalls_ext.h now. */
 #define L2A_IOV_MAX 1024U
 #define L2A_CHUNK 4096U
 
@@ -204,6 +201,11 @@ long sparc64_l2a_openat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
             host_flags);
     }
     host_dirfd = ((int64_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd;
+    /* Absolute guest paths try SPARC64RT_SYSROOT first (qemu -L). */
+    if (sparc64_sysroot_try_open(host_dirfd, path, host_flags,
+            (unsigned)(mode & 0777U), &fd)) {
+        return (fd < 0) ? -(long)errno : (long)fd;
+    }
     fd = openat(host_dirfd, path, host_flags, (mode_t)(mode & 0777U));
     return (fd < 0) ? -(long)errno : (long)fd;
 }
