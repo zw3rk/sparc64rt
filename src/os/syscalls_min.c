@@ -381,7 +381,12 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         ret = sparc64_thread_futex(ctx, mem, o0, o1, o2, o3, o4, o5);
         break;
     case (long)SPARC64__NR_clone:
-        ret = sparc64_thread_clone(ctx, mem, o0, o1, o2, o3, o4);
+        /* L4b owns CLONE_VM threads; L4c owns fork-like clones. */
+        if ((o0 & (uint64_t)SPARC64_CLONE_VM) != UINT64_C(0)) {
+            ret = sparc64_thread_clone(ctx, mem, o0, o1, o2, o3, o4);
+        } else {
+            ret = sparc64_proc_clone(ctx, mem, o0, o1, o2, o3, o4);
+        }
         break;
     case (long)SPARC64__NR_gettid:
         ret = sparc64_thread_gettid(ctx);
@@ -458,16 +463,14 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     /* Phase-4 lifecycle set (src/os/proc.c, lane L4c, additive cases).
      * fork/vfork set %o1 in the handler; execve resumes absolutely
-     * (fresh pc/npc, no advance), like rt_sigreturn. clone with
-     * CLONE_VM fails here; lane L4b owns host-threaded threads. */
+     * (fresh pc/npc, no advance), like rt_sigreturn. clone without
+     * CLONE_VM is fork-like (L4c); with CLONE_VM it dispatches to
+     * the L4b host-thread path above. */
     case (long)SPARC64__NR_fork:
         ret = sparc64_proc_fork(ctx, mem);
         break;
     case (long)SPARC64__NR_vfork:
         ret = sparc64_proc_vfork(ctx, mem);
-        break;
-    case (long)SPARC64__NR_clone:
-        ret = sparc64_proc_clone(ctx, mem, o0, o1, o2, o3, o4);
         break;
     case (long)SPARC64__NR_execve: {
         long erc = sparc64_proc_execve(ctx, mem, o0, o1, o2);
