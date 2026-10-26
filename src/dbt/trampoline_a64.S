@@ -36,6 +36,17 @@
     /* x19 = ctx (xCtx) for exit commit. */
     mov x19, x0
 
+    /* x20 = Soft-TLB base (Lane M3): &sparc64_dbt_tlb[0] from
+     * dbt/mem_sites.c. cpu.h is frozen, so the table is process-global
+     * until the coordinator pins a per-worker tlb field in ctx. */
+#ifdef __APPLE__
+    adrp x20, _sparc64_dbt_tlb@PAGE
+    add x20, x20, _sparc64_dbt_tlb@PAGEOFF
+#else
+    adrp x20, sparc64_dbt_tlb
+    add x20, x20, :lo12:sparc64_dbt_tlb
+#endif
+
     /* Enter translated code; fragments return here via `ret`. */
     blr x1
 
@@ -73,28 +84,47 @@
     .endm
 
     .globl sparc64_dbt_enter
+/* ELF-only directive: Apple as rejects .type/.size (Lane M3 portability). */
+#ifndef __APPLE__
     .type sparc64_dbt_enter, %function
+#endif
 sparc64_dbt_enter:
     DBT_ENTER_PROLOGUE
     /* x27 = chaining entry, x28 = live epoch word (chaining allowed). */
     mov x27, x2
     mov x28, x3
     b .Ldbt_enter_go
+#ifndef __APPLE__
     .size sparc64_dbt_enter, .-sparc64_dbt_enter
+#endif
 
     .globl sparc64_dbt_enter_step
+#ifndef __APPLE__
     .type sparc64_dbt_enter_step, %function
+#endif
 sparc64_dbt_enter_step:
     DBT_ENTER_PROLOGUE
     /* x27 = chaining entry; x28 = zero epoch word so every
      * epoch-gated chain probe bails: single execution. */
     mov x27, x2
+#ifdef __APPLE__
+    adrp x28, .Ldbt_zero_epoch@PAGE
+    add x28, x28, .Ldbt_zero_epoch@PAGEOFF
+#else
     adrp x28, .Ldbt_zero_epoch
     add x28, x28, :lo12:.Ldbt_zero_epoch
+#endif
     b .Ldbt_enter_go
+#ifndef __APPLE__
     .size sparc64_dbt_enter_step, .-sparc64_dbt_enter_step
+#endif
 
+    /* Mach-O has no .rodata section name (Lane M3 portability). */
+#ifdef __APPLE__
+    .section __TEXT,__const
+#else
     .section .rodata
+#endif
     .align 2
 .Ldbt_zero_epoch:
     .word 0
