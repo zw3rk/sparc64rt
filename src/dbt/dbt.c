@@ -41,6 +41,10 @@
 #include "dbt/mem_sites.h"
 #include "interp/interp.h"
 
+/* Quiescence window publish (src/vm/vm64.c); declared locally to keep
+ * the dbt->vm edge to this single call (like the trampoline decls). */
+extern void vm64_seq_publish(uint64_t base, uint64_t size);
+
 /* Trampoline entries (trampoline_a64.S): ctx in x0, fragment entry in
  * x1, chaining entry in x2 (unused by exit-to-dispatcher fragments),
  * epoch word in x3. enter_step additionally pins x28 at a zero word
@@ -159,6 +163,10 @@ static void *dbt_stage(sparc64_dbt_t *dbt, size_t nbytes)
         }
         dbt->arena_used = 0U;
         dbt->arena_published = false;
+        /* Publish the JIT window for preempt-time sequence rewind
+         * (vm64_seq_rewind_live bounds its probe reads to it). */
+        vm64_seq_publish((uint64_t)(uintptr_t)dbt->arena_base,
+            (uint64_t)SPARC64_DBT_CODE_ARENA_SIZE);
     }
     if (dbt->arena_published) {
         size_t span = a32h_page_span(dbt->arena_used);

@@ -282,6 +282,101 @@ long vm_file_commit_resize(vm_file_table_t *t, int index,
     return host_rc;
 }
 
+/* Truncate-time interning: match (dev, ino) regardless of ctime (which
+ * truncation itself bumps), refresh ctime/fd/size, return the index or
+ * -1. Unlike vm_file_intern the caller supplies the pre-truncate size,
+ * so the table learns files it never mapped. */
+int vm_file_intern_live(vm_file_table_t *t, uint64_t st_dev,
+    uint64_t st_ino, uint64_t st_ctime_nsec, int host_fd,
+    uint64_t file_size)
+{
+    unsigned i;
+    unsigned free_slot = VMF_INODE_MAX;
+    if (t == NULL || host_fd < 0) {
+        return -1;
+    }
+    while (atomic_flag_test_and_set_explicit(&t->lock,
+        memory_order_acquire)) {
+    }
+    for (i = 0; i < VMF_INODE_MAX; ++i) {
+        unsigned v = atomic_load_explicit(&t->entries[i].valid,
+            memory_order_relaxed);
+        if (v == 0u) {
+            if (free_slot == VMF_INODE_MAX) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (t->entries[i].st_dev == st_dev &&
+            t->entries[i].st_ino == st_ino) {
+            t->entries[i].st_ctime_nsec = st_ctime_nsec;
+            if (t->entries[i].host_fd < 0) {
+                t->entries[i].host_fd = host_fd;
+            }
+            atomic_store_explicit(&t->entries[i].file_size, file_size,
+                memory_order_relaxed);
+            atomic_flag_clear_explicit(&t->lock, memory_order_release);
+            return (int)i;
+        }
+    }
+    if (free_slot < VMF_INODE_MAX) {
+        vm_inode_shared_t *e = &t->entries[free_slot];
+        e->st_dev = st_dev;
+        e->st_ino = st_ino;
+        e->st_ctime_nsec = st_ctime_nsec;
+        e->host_fd = host_fd;
+        atomic_store_explicit(&e->file_size, file_size,
+            memory_order_relaxed);
+        atomic_store_explicit(&e->resize_seq, UINT64_C(0),
+            memory_order_relaxed);
+        atomic_store_explicit(&e->min_shrunk_since_epoch, ~UINT64_C(0),
+            memory_order_relaxed);
+        atomic_store_explicit(&e->code_generation, UINT64_C(0),
+            memory_order_relaxed);
+        atomic_store_explicit(&e->futex_pin_count, UINT64_C(0),
+            memory_order_relaxed);
+        atomic_store_explicit(&e->valid, 1u, memory_order_relaxed);
+        atomic_flag_clear_explicit(&t->lock, memory_order_release);
+        return (int)free_slot;
+    }
+    atomic_flag_clear_explicit(&t->lock, memory_order_release);
+    return -1;
+}
+
+/* Syscall-layer truncate hook for engines without a live family table:
+ * interns (dev, ino) in the process table, commits the resize for
+ * epoch/size bookkeeping, and runs discard over stripped 8 KiB pages.
+ * old_size comes from the caller's pre-truncate fstat. Returns 0; never
+ * fails an already-succeeded host call (a full table just skips the
+ * bookkeeping). discard may be NULL. */
+long vm_file_truncate_hook(uint64_t st_dev, uint64_t st_ino,
+    uint64_t st_ctime_nsec, int host_fd, uint64_t old_size,
+    uint64_t new_size, int is_ftruncate,
+    void (*discard)(uint64_t discard_base, uint64_t discard_len,
+        void *discard_ctx),
+    void *discard_ctx)
+{
+    static vm_file_table_t trunc_table;
+    static atomic_flag trunc_once = ATOMIC_FLAG_INIT;
+    int index;
+    if (!atomic_flag_test_and_set_explicit(&trunc_once,
+            memory_order_acquire)) {
+        vm_file_table_init(&trunc_table);
+    }
+    if (host_fd < 0) {
+        return 0L;
+    }
+    index = vm_file_intern_live(&trunc_table, st_dev, st_ino,
+        st_ctime_nsec, host_fd, old_size);
+    if (index < 0) {
+        return 0L;
+    }
+    return vm_file_commit_resize(&trunc_table, index, new_size, 0L,
+        is_ftruncate ? VMF_OP_FTRUNCATE : VMF_OP_TRUNCATE,
+        (vm_file_discard_fn)discard, discard_ctx, NULL, NULL);
+}
+
+
 /* External non-family truncation check (fable m4): on a Soft-TLB miss
  * to a file-backed page near/past EOF, the caller passes a fresh
  * fstat size; when it differs from the cached size the entry refreshes
@@ -323,17 +418,10 @@ bool vm_file_shared_direct_ok(uint64_t gva, uint64_t file_offset,
     return ((gva ^ file_offset) & mask) == UINT64_C(0);
 }
 
-/* Cross-TU 8 KiB legs owned by src/vm/vm64.c (same binary, lane A3).
- * vm64_eof_upper_half / vm64_zero_span take plain integer and pointer
- * types. vm64_cow_promote_8k takes vm64.c-local vm64_page_state_t
- * (UNMAPPED = 0, ANON = 1, SHARED = 2, COW_CLEAN = 3, COW_DIRTY = 4,
- * declared in that order); both TUs compile the states as int-sized
- * enums, so the int-punned prototype below is representation-identical
- * and the RC-U2 gate test pins the 3 -> 4 transition at runtime. */
-extern bool vm64_cow_promote_8k(int *lower_half, int *upper_half);
-extern bool vm64_eof_upper_half(uint64_t file_size, uint64_t map_end,
-    uint64_t *zero_start_out, uint64_t *zero_len_out);
-extern void vm64_zero_span(void *host_addr, size_t len);
+/* Cross-TU 8 KiB legs owned by src/vm/vm64.c (same binary).
+ * Declared for real via src/vm/vm64.h so the compiler checks the
+ * vm64_page_state_t* signatures instead of int* punning. */
+#include "vm/vm64.h"
 
 /* Populate a mapping from the file at mmap time (H > 4096 hosts keep
  * MAP_PRIVATE | MAP_ANONYMOUS arena backing at HVA and pread the
@@ -370,9 +458,10 @@ long vm_file_populate(int host_fd, uint64_t file_offset, void *host_addr,
  * file bytes, zero the [st_size, 8 KiB) EOF tail (including the upper-half
  * materialization span reported by vm64_eof_upper_half), promote the
  * enclosing 8 KiB page COW_CLEAN -> COW_DIRTY as one unit through
- * vm64_cow_promote_8k, and report full 4 KiB pages completely beyond EOF
- * as a SIGBUS span for the caller to convert (Linux file-mmap fault
- * behavior; the loader uses sparc64_space_map_bus for this).
+ * vm64_cow_promote_8k, and report full 8 KiB ABI pages completely
+ * beyond EOF as a SIGBUS span for the caller to convert (Linux
+ * file-mmap fault behavior; the loader uses sparc64_space_map_bus
+ * for this).
  *
  * file_size is a fresh fstat st_size taken by the caller. The segment
  * covers file bytes [file_offset, file_offset + seg_len). Returns the
@@ -382,15 +471,15 @@ long vm_file_populate(int host_fd, uint64_t file_offset, void *host_addr,
  * bytes were served).
  *
  * lower_state / upper_state track the enclosing 8 KiB page halves as
- * ints (3 = COW_CLEAN, 4 = COW_DIRTY, see above); both may be NULL to
- * skip promotion (fresh anonymous pages, e.g. the ELF loader path).
+ * vm64_page_state_t (see vm64.h); both may be NULL to skip promotion
+ * (fresh anonymous pages, e.g. the ELF loader path).
  * bus_base_out / bus_len_out receive the beyond-EOF span in FILE
  * coordinates (both 0 when no full page lies beyond EOF); either may be
  * NULL. The tail zeroing runs even when the upper-half leg reports
  * nothing, so [file_size, file_offset + seg_len) always reads zero. */
 long vm_file_populate_segment(int host_fd, uint64_t file_offset,
     uint64_t file_size, void *host_addr, size_t seg_len,
-    int *lower_state, int *upper_state,
+    vm64_page_state_t *lower_state, vm64_page_state_t *upper_state,
     uint64_t *bus_base_out, uint64_t *bus_len_out)
 {
     uint64_t avail;
@@ -451,14 +540,16 @@ long vm_file_populate_segment(int host_fd, uint64_t file_offset,
     if (lower_state != NULL && upper_state != NULL && done != 0u) {
         (void)vm64_cow_promote_8k(lower_state, upper_state);
     }
-    /* Beyond-EOF SIGBUS span: full 4 KiB pages past the last populated
-     * byte, in file coordinates for the caller to convert to BUS. */
+    /* Beyond-EOF SIGBUS span: full 8 KiB ABI pages past the last
+     * populated byte, in file coordinates for the caller to convert
+     * to BUS. The 4 KiB translation granule still faults per page,
+     * but guest-observable coverage starts at the 8 KiB boundary. */
     eof_off = file_offset + (uint64_t)done;
-    bus = eof_off + (VMF_SUB_PAGE - UINT64_C(1));
+    bus = eof_off + (VMF_ABI_PAGE - UINT64_C(1));
     if (bus < eof_off) {
         bus = UINT64_MAX;
     }
-    bus &= ~(VMF_SUB_PAGE - UINT64_C(1));
+    bus &= ~VMF_ABI_MASK;
     if (bus < seg_end) {
         if (bus_base_out != NULL) {
             *bus_base_out = bus;

@@ -213,6 +213,10 @@ int rt_host_preempt_worker(uint64_t host_tid) {
         host_tid, (uint64_t)sig, 0u, 0u, 0u);
     return r == 0 ? 0 : (int)r;
 }
+uint64_t rt_host_register_self(void) {
+    /* Numeric tid doubles as the tgkill target; no table needed. */
+    return (uint64_t)(int64_t)gettid();
+}
 
 /* 5. filesystem */
 int64_t rt_host_openat(int dirfd, const char *path, int linux_flags,

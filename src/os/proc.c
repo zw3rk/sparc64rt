@@ -36,6 +36,7 @@
 #include "os/guest_interp_map.h"
 
 #include <unistd.h>
+#include "dbt/mem_sites.h"
 #include "os/sync_sig.h"
 #include "os/syscalls_ext.h"
 
@@ -145,6 +146,11 @@ static long proc_do_fork(sparc64_ctx_t *ctx,
         long rc = 0;
         /* A fresh child has no children of its own. */
         proc_nchildren = 0U;
+        /* Drop the inherited Soft-TLB: its addends address the
+         * parent's heap backings, which munmap may free and reuse.
+         * Misses re-resolve against the child's (initially shared)
+         * mappings, so this is pure correctness, not a slow path. */
+        sparc64_tlb_init();
         ctx->r[SPARC64_O1] = UINT64_C(1);
         if ((set_flags & (uint64_t)PROC_CLONE_CHILD_SETTID) != UINT64_C(0) &&
             child_tid_va != UINT64_C(0)) {

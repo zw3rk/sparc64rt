@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "dbt/mem_sites.h"
+
 /* This module only encodes and structurally validates bytes. A decoded view is
  * not trusted input and MUST NOT be executed or published RX. A later owner
  * must verify cache ownership, all opaque digests/profile values, live guest
@@ -16,6 +18,13 @@
 #define SPARC64_AOT_HEADER_BYTES 192u
 #define SPARC64_AOT_FORMAT_V2 2u
 #define SPARC64_AOT_HEADER_V2_BYTES 224u
+/* V3 keeps the V2 224-byte header (record digest included) and appends
+ * a per-block Soft-TLB site table after the relocations: site_count
+ * (u16) lives in the block header bytes formerly reserved as zero at
+ * offset 18, followed by site_count x 24-byte site records. Decoders
+ * that only know V1/V2 keep rejecting the nonzero reserved field. */
+#define SPARC64_AOT_FORMAT_V3 3u
+#define SPARC64_AOT_HEADER_V3_BYTES SPARC64_AOT_HEADER_V2_BYTES
 #define SPARC64_AOT_RECORD_DIGEST_OFFSET 192u
 #define SPARC64_AOT_BLOCK_HEADER_BYTES 24u
 #define SPARC64_AOT_RELOCATION_BYTES 24u
@@ -68,6 +77,10 @@ typedef struct sparc64_aot_block {
     uint32_t a64_size;
     const sparc64_aot_relocation_t *relocations;
     uint16_t relocation_count;
+    /* V3 only: Soft-TLB recovery records for this block's memory sites
+     * (must be empty for V1/V2 images). */
+    const sparc64_mem_site_t *sites;
+    uint16_t site_count;
 } sparc64_aot_block_t;
 
 typedef struct sparc64_aot_image {
@@ -97,6 +110,8 @@ typedef struct sparc64_aot_block_view {
     uint32_t a64_size;
     const uint8_t *relocations; /* fixed-width LE records, may be NULL if empty */
     uint16_t relocation_count;
+    const uint8_t *sites; /* fixed-width LE site records (V3 only), NULL if empty */
+    uint16_t site_count;
 } sparc64_aot_block_view_t;
 
 typedef struct sparc64_aot_view {
@@ -139,5 +154,15 @@ int sparc64_aot_view_block(const sparc64_aot_view_t *view, uint32_t index,
                       sparc64_aot_block_view_t *out);
 int sparc64_aot_view_relocation(const sparc64_aot_block_view_t *block, uint16_t index,
                            sparc64_aot_relocation_t *out);
+int sparc64_aot_encode_v3(const sparc64_aot_image_t *image,
+    const uint8_t record_digest[SPARC64_AOT_DIGEST_BYTES],
+    uint8_t *destination, size_t capacity, size_t *written);
+/* Size of the V3 encoding without writing it. */
+int sparc64_aot_encoded_size_v3(const sparc64_aot_image_t *image,
+    size_t *size);
+/* Decode one V3 site record into *out (validates wire values).
+ * Fails for V1/V2 views or out-of-range index. */
+int sparc64_aot_view_site(const sparc64_aot_block_view_t *block,
+    uint16_t index, sparc64_mem_site_t *out);
 
 #endif

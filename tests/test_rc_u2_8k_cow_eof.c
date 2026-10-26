@@ -39,24 +39,19 @@
 #include <unistd.h>
 
 #include "dbt/aot/sites.h"
+#include "dbt/aot/format.h"
 #include "os/mem_space.h"
 
-/* ---- Cross-TU declarations (lane A3) -----------------------------------
- * src/vm has no public headers; these mirror the same-binary definitions
- * in src/vm/vm64.c and src/vm/vm_file.c. Page states and the table are
- * passed as ints / opaque storage: states are int-sized enums
- * (UNMAPPED = 0, ANON = 1, SHARED = 2, COW_CLEAN = 3, COW_DIRTY = 4),
- * the file-table pointer is never dereferenced here, and the op code is
- * the small vm_file_op_t enum (FTRUNCATE = 0). */
-extern bool vm64_cow_promote_8k(int *lower_half, int *upper_half);
-extern bool vm64_cow_writable(int lower_half, int upper_half);
-extern bool vm64_eof_upper_half(uint64_t file_size, uint64_t map_end,
-    uint64_t *zero_start_out, uint64_t *zero_len_out);
+/* ---- Cross-TU declarations --------------------------------------------
+ * vm64 page states and quiescence come from src/vm/vm64.h (real
+ * declarations, not int-punned externs); the file-table pointer stays
+ * opaque and the op code is the small vm_file_op_t enum. */
+#include "vm/vm64.h"
 extern int vm64_check_mremap_args(uint64_t old_addr, uint64_t old_size,
     uint64_t new_size, unsigned flags, uint64_t new_addr);
 extern long vm_file_populate_segment(int host_fd, uint64_t file_offset,
     uint64_t file_size, void *host_addr, size_t seg_len,
-    int *lower_state, int *upper_state,
+    vm64_page_state_t *lower_state, vm64_page_state_t *upper_state,
     uint64_t *bus_base_out, uint64_t *bus_len_out);
 extern void vm_file_table_init(void *t);
 extern int vm_file_intern(void *t, uint64_t st_dev, uint64_t st_ino,
@@ -93,6 +88,11 @@ int rt_host_preempt_worker(uint64_t host_tid)
 {
     (void)host_tid;
     return 0;
+}
+
+uint64_t rt_host_register_self(void)
+{
+    return UINT64_C(1);
 }
 
 static int fails = 0;
@@ -166,27 +166,30 @@ int main(void)
     fill_pattern();
     /* A. Whole-8KiB COW promotion. */
     {
-        int lo = 3;
-        int hi = 3;
+        vm64_page_state_t lo = VM64_PAGE_COW_CLEAN;
+        vm64_page_state_t hi = VM64_PAGE_COW_CLEAN;
         check("cow-clean-clean-promotes", vm64_cow_promote_8k(&lo, &hi) &&
-            lo == 4 && hi == 4);
+            lo == VM64_PAGE_COW_DIRTY && hi == VM64_PAGE_COW_DIRTY);
     }
     {
-        int lo = 4;
-        int hi = 4;
+        vm64_page_state_t lo = VM64_PAGE_COW_DIRTY;
+        vm64_page_state_t hi = VM64_PAGE_COW_DIRTY;
         check("cow-dirty-dirty-noop", !vm64_cow_promote_8k(&lo, &hi) &&
-            lo == 4 && hi == 4);
+            lo == VM64_PAGE_COW_DIRTY && hi == VM64_PAGE_COW_DIRTY);
     }
     {
-        int lo = 3;
-        int hi = 4;
+        vm64_page_state_t lo = VM64_PAGE_COW_CLEAN;
+        vm64_page_state_t hi = VM64_PAGE_COW_DIRTY;
         check("cow-mixed-promotes", vm64_cow_promote_8k(&lo, &hi) &&
-            lo == 4 && hi == 4);
+            lo == VM64_PAGE_COW_DIRTY && hi == VM64_PAGE_COW_DIRTY);
     }
     check("cow-null-refused", !vm64_cow_promote_8k(NULL, NULL));
-    check("cow-writable-both-dirty", vm64_cow_writable(4, 4));
-    check("cow-not-writable-clean", !vm64_cow_writable(3, 4) &&
-        !vm64_cow_writable(3, 3) && !vm64_cow_writable(0, 4));
+    check("cow-writable-both-dirty",
+        vm64_cow_writable(VM64_PAGE_COW_DIRTY, VM64_PAGE_COW_DIRTY));
+    check("cow-not-writable-clean",
+        !vm64_cow_writable(VM64_PAGE_COW_CLEAN, VM64_PAGE_COW_DIRTY) &&
+        !vm64_cow_writable(VM64_PAGE_COW_CLEAN, VM64_PAGE_COW_CLEAN) &&
+        !vm64_cow_writable(VM64_PAGE_UNMAPPED, VM64_PAGE_COW_DIRTY));
 
     /* B. EOF upper-half span. */
     {
@@ -224,8 +227,8 @@ int main(void)
             check("temp-file-written",
                 write_all(fd, pattern, (size_t)FILE_LEN) == 0);
             {
-                int lo = 3;
-                int hi = 3;
+                vm64_page_state_t lo = VM64_PAGE_COW_CLEAN;
+                vm64_page_state_t hi = VM64_PAGE_COW_CLEAN;
                 uint64_t bb = 0;
                 uint64_t bl = 0;
                 long rc = vm_file_populate_segment(fd, UINT64_C(0),
@@ -236,7 +239,7 @@ int main(void)
                 check("populate-eof-tail-zero",
                     all_zero(stage + (size_t)FILE_LEN,
                         SEG_LEN - (size_t)FILE_LEN));
-                check("populate-promotes-pair", lo == 4 && hi == 4);
+                check("populate-promotes-pair", lo == VM64_PAGE_COW_DIRTY && hi == VM64_PAGE_COW_DIRTY);
                 check("populate-bus-span",
                     bb == UINT64_C(8192) && bl == UINT64_C(8192));
             }
@@ -268,8 +271,8 @@ int main(void)
                 write_all(fd, pattern + (size_t)FILE_LEN,
                     8192u - (size_t)FILE_LEN) == 0);
             {
-                int lo = 3;
-                int hi = 3;
+                vm64_page_state_t lo = VM64_PAGE_COW_CLEAN;
+                vm64_page_state_t hi = VM64_PAGE_COW_CLEAN;
                 uint64_t bb = 9;
                 uint64_t bl = 9;
                 long rc;
@@ -277,26 +280,32 @@ int main(void)
                 rc = vm_file_populate_segment(fd, UINT64_C(0),
                     UINT64_C(8192), stage, 8192u, &lo, &hi, &bb, &bl);
                 check("populate-exact-8k", rc == 8192L &&
-                    memcmp(stage, pattern, 8192u) == 0 && lo == 4 &&
-                    hi == 4 && bb == UINT64_C(0) && bl == UINT64_C(0));
+                    memcmp(stage, pattern, 8192u) == 0 && lo == VM64_PAGE_COW_DIRTY &&
+                    hi == VM64_PAGE_COW_DIRTY && bb == UINT64_C(0) && bl == UINT64_C(0));
             }
-            /* Lower-half EOF: upper-half leg fires, BUS from 4 KiB. */
+            /* Lower-half EOF: upper-half leg fires and the partial 8 KiB
+             * page is zero tail, not SIGBUS: BUS coverage starts at the
+             * next full 8 KiB page, which equals seg_end here, so no
+             * BUS span is reported. */
             check("temp-file-shrunk", ftruncate(fd, 100) == 0);
             {
-                int lo = 3;
-                int hi = 3;
-                uint64_t bb = 0;
-                uint64_t bl = 0;
+                vm64_page_state_t lo = VM64_PAGE_COW_CLEAN;
+                vm64_page_state_t hi = VM64_PAGE_COW_CLEAN;
+                uint64_t bb = 9;
+                uint64_t bl = 9;
                 long rc;
                 memset(stage, 0xa5, sizeof(stage));
                 rc = vm_file_populate_segment(fd, UINT64_C(0),
                     UINT64_C(100), stage, 8192u, &lo, &hi, &bb, &bl);
                 check("populate-lower-half-eof", rc == 100L &&
                     memcmp(stage, pattern, 100u) == 0 &&
-                    all_zero(stage + 100u, 8192u - 100u) && lo == 4 &&
-                    hi == 4 && bb == UINT64_C(4096) &&
-                    bl == UINT64_C(4096));
+                    all_zero(stage + 100u, 8192u - 100u) && lo == VM64_PAGE_COW_DIRTY &&
+                    hi == VM64_PAGE_COW_DIRTY && bb == UINT64_C(0) &&
+                    bl == UINT64_C(0));
             }
+            /* The 8 KiB BUS boundary itself is already pinned by the
+             * populate-bus-span case above (5000-byte file in a
+             * 16384-byte segment reports bb=8192, bl=8192). */
             (void)close(fd);
             (void)unlink(tmpl);
         }
@@ -485,6 +494,93 @@ int main(void)
         check("sites-zero-count-rejected",
             sparc64_aot_sites_encoded_size(0u, &size) == -1 &&
             errno == EINVAL);
+    }
+
+    /* V3 format round-trip: per-block site tables survive encode and
+     * decode; V1 refuses images that carry sites (fail-closed). */
+    {
+        static const uint8_t src_bytes[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        static const uint8_t text_bytes[8] = { 9, 10, 11, 12, 13, 14,
+            15, 16 };
+        static const uint8_t digest[32] = { 0 };
+        sparc64_mem_site_t sites[2];
+        sparc64_aot_block_t blocks[2];
+        sparc64_aot_image_t image;
+        sparc64_aot_view_t view;
+        sparc64_aot_block_view_t bv;
+        sparc64_mem_site_t back;
+        uint8_t record[8192];
+        size_t written = 0;
+        size_t sized = 0;
+        memset(sites, 0, sizeof(sites));
+        sites[0].guest_pc_delta = 4u;
+        sites[0].width = 8u;
+        sites[0].flags = (uint8_t)SPARC64_MEM_F_BE;
+        sites[0].val_or_dst_reg = 3u;
+        sites[0].addr_base_reg = 5u;
+        sites[1].guest_pc_delta = 12u;
+        sites[1].width = 4u;
+        sites[1].flags = (uint8_t)(SPARC64_MEM_F_STORE |
+            SPARC64_MEM_F_IN_DELAY_SLOT |
+            (unsigned)SPARC64_MEM_F_BE);
+        sites[1].val_or_dst_reg = 7u;
+        sites[1].addr_base_reg = 9u;
+        memset(&blocks, 0, sizeof(blocks));
+        blocks[0].source_offset = 0u;
+        blocks[0].source_bytes = src_bytes;
+        blocks[0].source_size = sizeof(src_bytes);
+        blocks[0].a64_text = text_bytes;
+        blocks[0].a64_size = sizeof(text_bytes);
+        blocks[0].sites = sites;
+        blocks[0].site_count = 2u;
+        blocks[1].source_offset = 8u;
+        blocks[1].source_bytes = src_bytes;
+        blocks[1].source_size = sizeof(src_bytes);
+        blocks[1].a64_text = text_bytes;
+        blocks[1].a64_size = sizeof(text_bytes);
+        memset(&image, 0, sizeof(image));
+        image.guest_extensions = 0u;
+        image.a64_host_requirements = 0u;
+        image.guest_page_size = 8192u;
+        image.a64_host_page_size = 4096u;
+        image.memory_model = SPARC64_AOT_MEMORY_SPARSE_CHECKED;
+        image.xlen = 64u;
+        image.abi = (uint8_t)SPARC64_AOT_ABI_LP64D;
+        image.block_count = 2u;
+        image.blocks = blocks;
+        check("v3-size-ok",
+            sparc64_aot_encoded_size_v3(&image, &sized) == 0 &&
+            sized > 0u && sized <= sizeof(record));
+        check("v3-encode-ok",
+            sparc64_aot_encode_v3(&image, digest, record,
+                sizeof(record), &written) == 0 && written == sized);
+        memset(&view, 0, sizeof(view));
+        check("v3-decode-ok",
+            sparc64_aot_decode(record, written, &view) == 0 &&
+            view.format_version == SPARC64_AOT_FORMAT_V3 &&
+            view.block_count == 2u);
+        memset(&bv, 0, sizeof(bv));
+        check("v3-view-block0",
+            sparc64_aot_view_block(&view, 0u, &bv) == 0 &&
+            bv.site_count == 2u && bv.sites != NULL);
+        memset(&back, 0, sizeof(back));
+        check("v3-view-site0",
+            sparc64_aot_view_site(&bv, 0u, &back) == 0 &&
+            memcmp(&back, &sites[0], sizeof(back)) == 0);
+        memset(&back, 0, sizeof(back));
+        check("v3-view-site1",
+            sparc64_aot_view_site(&bv, 1u, &back) == 0 &&
+            memcmp(&back, &sites[1], sizeof(back)) == 0);
+        memset(&bv, 0, sizeof(bv));
+        check("v3-view-block1-empty",
+            sparc64_aot_view_block(&view, 1u, &bv) == 0 &&
+            bv.site_count == 0u);
+        check("v3-view-site-oor",
+            sparc64_aot_view_site(&bv, 0u, &back) != 0);
+        errno = 0;
+        check("v1-with-sites-rejected",
+            sparc64_aot_encode(&image, record, sizeof(record),
+                &written) != 0 && errno == EINVAL);
     }
 
     if (fails == 0) {

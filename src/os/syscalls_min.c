@@ -27,16 +27,38 @@
  * ta 0x6d while icc.C was preserved. The frozen src/core/cpu.h contract
  * (both carry bits) governs this layer, so both bits move here; if the
  * coordinator reconciles the other way, only sparc64_commit changes.
+ *
+ * NOTE: _GNU_SOURCE must precede every #include (glibc latches the
+ * feature set on first <features.h> inclusion; truncate/ftruncate
+ * prototypes and struct st_ctim need the GNU spelling).
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <stdatomic.h>
+
+/* glibc maps the compat names st_atime/st_mtime/st_ctime to the
+ * st_*tim.tv_sec fields; that rewrite would corrupt the guest-layout
+ * struct in sigframe_sparc64rt.h below (which spells the fields out),
+ * and nothing in this TU needs the compat spellings. */
+#ifdef st_atime
+#undef st_atime
+#endif
+#ifdef st_mtime
+#undef st_mtime
+#endif
+#ifdef st_ctime
+#undef st_ctime
+#endif
 
 #include "core/cpu.h"
 #include "os/proc.h"
@@ -266,19 +288,41 @@ static long sys_uname(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     return 0;
 }
 
+/* RC-U4: Provider-A truncate wiring. The host call runs first; only
+ * host success commits state. The sysmem file-range registry converts
+ * stripped 8 KiB pages to BUS spans (and regrows extended pages back
+ * to zero pages) with paired TLB invalidation, while
+ * vm_file_truncate_hook commits epoch/size bookkeeping to the process
+ * family table. Declared locally; implementations live in
+ * src/vm/vm_file.c (hook) and src/os/guest_run_sysmem.c (registry). */
+extern long vm_file_truncate_hook(uint64_t st_dev, uint64_t st_ino,
+    uint64_t st_ctime_ns, int host_fd, uint64_t old_size,
+    uint64_t new_size, int is_ftruncate,
+    void (*discard)(uint64_t discard_base, uint64_t discard_len,
+        void *discard_ctx),
+    void *discard_ctx);
+extern void sysmem_file_resize(void *ctx, uint64_t dev, uint64_t ino,
+    uint64_t old_size, uint64_t new_size);
+
+static uint64_t trunc_ctime_ns(const struct stat *st)
+{
+#if defined(__APPLE__)
+    return (uint64_t)st->st_ctimespec.tv_nsec;
+#else
+    return (uint64_t)st->st_ctim.tv_nsec;
+#endif
+}
+
 /* Lane A2: truncate(129)/truncate64(77) by path, ftruncate(130)/
- * ftruncate64(84) by fd. The host call runs first (Step 3 of the 6-step
- * protocol); only host success would commit Provider-A file_size +
- * code_generation via vm_file_commit_resize (Step 4). No live family
- * table exists on the big-lock engine (all mappings are private heap
- * copies), so there is no (table, index) to commit; the hook point is
- * the success return below, which already carries the real host result.
- * Lengths are signed 64-bit (SPARC takes `long length`): negatives are
- * -EINVAL like Linux, and both calls exist on Linux and Darwin hosts. */
+ * ftruncate64(84) by fd. Lengths are signed 64-bit (SPARC takes
+ * `long length`): negatives are -EINVAL like Linux, and both calls
+ * exist on Linux and Darwin hosts. */
 static long sys_truncate_path(const sparc64_syscall_mem_t *mem,
     uint64_t path_va, uint64_t length)
 {
     char path[L2A_PATH_MAX];
+    struct stat stb;
+    uint64_t old_size;
     long rc;
     if (length > (uint64_t)INT64_MAX) {
         return -EINVAL;
@@ -287,19 +331,47 @@ static long sys_truncate_path(const sparc64_syscall_mem_t *mem,
     if (rc != 0) {
         return rc;
     }
+    if (stat(path, &stb) != 0) {
+        return -(long)errno;
+    }
+    old_size = (stb.st_size < 0) ? UINT64_C(0) : (uint64_t)stb.st_size;
     if (truncate(path, (off_t)(int64_t)length) != 0) {
         return -(long)errno;
+    }
+    if (S_ISREG(stb.st_mode)) {
+        /* No stable fd exists for the path form, so the family table
+         * is left alone (hook with fd -1 is a no-op); the registry
+         * still converts stripped pages to BUS spans. */
+        sysmem_file_resize(mem->context, (uint64_t)stb.st_dev,
+            (uint64_t)stb.st_ino, old_size, length);
+        (void)vm_file_truncate_hook((uint64_t)stb.st_dev,
+            (uint64_t)stb.st_ino, trunc_ctime_ns(&stb), -1, old_size,
+            length, 0, NULL, NULL);
     }
     return 0;
 }
 
-static long sys_ftruncate_fd(uint64_t fd, uint64_t length)
+static long sys_ftruncate_fd(const sparc64_syscall_mem_t *mem, uint64_t fd,
+    uint64_t length)
 {
+    struct stat stb;
+    uint64_t old_size;
     if (length > (uint64_t)INT64_MAX) {
         return -EINVAL;
     }
+    if (fstat((int)fd, &stb) != 0) {
+        return -(long)errno;
+    }
+    old_size = (stb.st_size < 0) ? UINT64_C(0) : (uint64_t)stb.st_size;
     if (ftruncate((int)fd, (off_t)(int64_t)length) != 0) {
         return -(long)errno;
+    }
+    if (S_ISREG(stb.st_mode)) {
+        sysmem_file_resize(mem->context, (uint64_t)stb.st_dev,
+            (uint64_t)stb.st_ino, old_size, length);
+        (void)vm_file_truncate_hook((uint64_t)stb.st_dev,
+            (uint64_t)stb.st_ino, trunc_ctime_ns(&stb), (int)fd,
+            old_size, length, 1, NULL, NULL);
     }
     return 0;
 }
@@ -559,7 +631,7 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     case (long)SPARC64__NR_ftruncate:
     case (long)SPARC64__NR_ftruncate64:
-        ret = sys_ftruncate_fd(o0, o1);
+        ret = sys_ftruncate_fd(mem, o0, o1);
         break;
     case (long)SPARC64__NR_uname:
         ret = sys_uname(ctx, mem, o0);

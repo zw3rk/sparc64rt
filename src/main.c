@@ -8,16 +8,23 @@
  * parsing lives in src/os/host_contract.c; this TU wires the
  * resolved options to the runner, reports --stats, and owns exit codes.
  * Unknown --options fail hard (exit 2).
+ *
+ * NOTE: _GNU_SOURCE must precede every #include: glibc latches the
+ * feature set on first <features.h> inclusion, and a late define
+ * leaves ucontext_t members underscore-prefixed (__pc) instead of
+ * the musl/glibc-GNU spelling (pc) used below.
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Needs _GNU_SOURCE: musl hides ucontext_t under -std=c11 (mirrors
- * src/os/backend_linux.c, which proves this spelling with the same
- * cross compiler). */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+#if defined(__linux__)
+/* glibc declares ucontext_t only here, never via <signal.h>. */
+#include <sys/ucontext.h>
 #endif
 
 #include "os/guest_run.h"
@@ -33,14 +40,11 @@
  * locally: the txn/seq helpers stay private to src/vm/vm64.c. */
 extern uint64_t vm64_seq_rewind(uint64_t pc, uint64_t seq_start,
     uint64_t host_insn);
-
-/* Current Soft-TLB fast-path window, published by the DBT emitter
- * (another lane owns the dbt tree). Empty until a peer table exists, so
- * vm64_seq_rewind below is the identity on the single-threaded
- * big-lock engine: no peer executes translated code concurrently, and
- * the write-back only fires inside a real window. */
-static uint64_t a2_seq_start;
-static uint64_t a2_seq_end;
+/* Live-window rewind (src/vm/vm64.c): scans back at most 6 insns for
+ * the fast-path opener and rewinds only inside a live sequence;
+ * identity anywhere else, so a stray preempt can never misdirect. */
+extern uint64_t vm64_seq_rewind_live(uint64_t pc);
+extern void vm64_stxn_register_self(void);
 
 static uint64_t a2_host_pc(void *host_ucontext)
 {
@@ -78,7 +82,7 @@ static void a2_on_async_sig(const rt_host_async_siginfo_t *sig)
 static void a2_on_preempt(void *host_ucontext)
 {
     uint64_t pc = a2_host_pc(host_ucontext);
-    uint64_t rewound = vm64_seq_rewind(pc, a2_seq_start, a2_seq_end);
+    uint64_t rewound = vm64_seq_rewind_live(pc);
     if (rewound != pc && host_ucontext != NULL) {
 #if defined(__linux__) && defined(__aarch64__)
         ((ucontext_t *)host_ucontext)->uc_mcontext.pc = rewound;
@@ -182,6 +186,10 @@ int main(int argc, char **argv)
             "sparc64rt: cannot install signal handlers\n");
         return 1;
     }
+    /* RC-U12: register this thread in the vm64 worker table so Step-2
+     * preemption has a live addressee (numeric tid on Linux,
+     * worker-table key on Darwin). */
+    vm64_stxn_register_self();
 #endif
     if (opts.guest_argv == NULL) {
         synthetic[0] = (char *)((exec_path != NULL) ? exec_path :

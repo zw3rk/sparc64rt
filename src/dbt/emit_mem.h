@@ -8,17 +8,15 @@
  * (big-endian) guests. Entry convention, established by the caller:
  * x1 holds the guest effective address; for stores x0 holds the value
  * (for 16-byte stores x5 holds the high half); x5-x8 are dead scratch.
- * 16-byte stores byte-swap x5 in place (rev x5, x5), so x5 is clobbered
- * by the fast path and callers must treat it as dead afterwards.
- * The sequence never touches PSTATE.NZCV and never reads or writes
- * host register x18.
+ * The only clobber beyond the result is x5 on 16-byte stores (high
+ * half in, byte-swapped out); every other width leaves x5-x8 alone on
+ * the hit path. The sequence never touches PSTATE.NZCV and never reads
+ * or writes host register x18.
  *
  * Loads (N in {1,2,4,8}): x0 receives the value (sign- or
  * zero-extended to 64 bits). 16-byte loads leave the low half in the
  * caller-chosen dst register and the high half in x4. Stores preserve
  * x0 on every path (the byte-swap lands in x4 after the miss check).
- * 16-byte stores additionally clobber x5 (high half in, swapped out);
- * every other width leaves x5-x8 alone on the hit path.
  *
  * Miss-path resume contract (P2): the per-block trampoline resumes
  * with 'br x0' where x0 is the HOST resume address, never the loaded

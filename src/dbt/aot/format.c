@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "dbt/aot/format.h"
+#include "dbt/aot/sites.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -171,8 +172,8 @@ static bool source_block_valid(const sparc64_aot_block_t *block,
     return true;
 }
 
-static bool image_valid(const sparc64_aot_image_t *image, size_t header_bytes,
-                         size_t *encoded_size)
+static bool image_valid(const sparc64_aot_image_t *image, uint16_t version,
+                         size_t header_bytes, size_t *encoded_size)
 {
     size_t total = header_bytes;
     uint64_t previous_start = 0;
@@ -190,6 +191,17 @@ static bool image_valid(const sparc64_aot_image_t *image, size_t header_bytes,
         const sparc64_aot_block_t *block = &image->blocks[i];
         size_t block_bytes = SPARC64_AOT_BLOCK_HEADER_BYTES;
         size_t reloc_bytes;
+        size_t site_bytes = 0u;
+        if (version == SPARC64_AOT_FORMAT_V3) {
+            if (block->site_count > SPARC64_AOT_SITES_MAX ||
+                (block->site_count != 0u && block->sites == NULL))
+                return false;
+            site_bytes = (size_t)block->site_count * SPARC64_AOT_SITE_BYTES;
+        } else if (block->site_count != 0u) {
+            /* V1/V2 predate site tables: a non-empty table would
+             * silently drop on encode, so reject instead. */
+            return false;
+        }
         if (!source_block_valid(block, image->block_count) ||
             (block->source_size & 1u) != 0 || (block->a64_size & 3u) != 0 ||
             (i != 0 && block->source_offset <= previous_start))
@@ -212,6 +224,7 @@ static bool image_valid(const sparc64_aot_image_t *image, size_t header_bytes,
         if (!add_size(block_bytes, block->source_size, &block_bytes) ||
             !add_size(block_bytes, block->a64_size, &block_bytes) ||
             !add_size(block_bytes, reloc_bytes, &block_bytes) ||
+            !add_size(block_bytes, site_bytes, &block_bytes) ||
             !add_size(total, block_bytes, &total) || total > SPARC64_AOT_MAX_FILE_BYTES)
             return false;
     }
@@ -222,7 +235,7 @@ static bool image_valid(const sparc64_aot_image_t *image, size_t header_bytes,
 int sparc64_aot_encoded_size_v2(const sparc64_aot_image_t *image, size_t *size)
 {
     size_t candidate = 0;
-    if (size == NULL || !image_valid(image, SPARC64_AOT_HEADER_V2_BYTES, &candidate)) {
+    if (size == NULL || !image_valid(image, SPARC64_AOT_FORMAT_V2, SPARC64_AOT_HEADER_V2_BYTES, &candidate)) {
         errno = EINVAL;
         return -1;
     }
@@ -246,11 +259,14 @@ static int encode(const sparc64_aot_image_t *image, uint16_t version,
 {
     size_t total = 0;
     size_t cursor;
-    uint16_t header_bytes = version == SPARC64_AOT_FORMAT_V2 ?
-        SPARC64_AOT_HEADER_V2_BYTES : SPARC64_AOT_HEADER_BYTES;
+    uint16_t header_bytes = version == SPARC64_AOT_FORMAT_VERSION ?
+        SPARC64_AOT_HEADER_BYTES : SPARC64_AOT_HEADER_V2_BYTES;
     if (written == NULL || destination == NULL ||
-        (version == SPARC64_AOT_FORMAT_V2 && record_digest == NULL) ||
-        !image_valid(image, header_bytes, &total)) {
+        (version != SPARC64_AOT_FORMAT_VERSION && record_digest == NULL) ||
+        (version != SPARC64_AOT_FORMAT_VERSION &&
+         version != SPARC64_AOT_FORMAT_V2 &&
+         version != SPARC64_AOT_FORMAT_V3) ||
+        !image_valid(image, version, header_bytes, &total)) {
         errno = EINVAL;
         return -1;
     }
@@ -278,7 +294,7 @@ static int encode(const sparc64_aot_image_t *image, uint16_t version,
     memcpy(destination + 96, image->runtime_digest, SPARC64_AOT_DIGEST_BYTES);
     memcpy(destination + 128, image->emitter_digest, SPARC64_AOT_DIGEST_BYTES);
     memcpy(destination + 160, image->profile_digest, SPARC64_AOT_DIGEST_BYTES);
-    if (version == SPARC64_AOT_FORMAT_V2)
+    if (version != SPARC64_AOT_FORMAT_VERSION)
         memcpy(destination + SPARC64_AOT_RECORD_DIGEST_OFFSET, record_digest,
                SPARC64_AOT_DIGEST_BYTES);
     cursor = header_bytes;
@@ -288,7 +304,8 @@ static int encode(const sparc64_aot_image_t *image, uint16_t version,
         put32(destination + cursor + 8, block->source_size);
         put32(destination + cursor + 12, block->a64_size);
         put16(destination + cursor + 16, block->relocation_count);
-        put16(destination + cursor + 18, 0);
+        put16(destination + cursor + 18,
+            version == SPARC64_AOT_FORMAT_V3 ? block->site_count : 0u);
         put32(destination + cursor + 20, 0);
         cursor += SPARC64_AOT_BLOCK_HEADER_BYTES;
         memcpy(destination + cursor, block->source_bytes, block->source_size);
@@ -298,6 +315,16 @@ static int encode(const sparc64_aot_image_t *image, uint16_t version,
         for (uint16_t j = 0; j < block->relocation_count; ++j) {
             encode_relocation(destination + cursor, &block->relocations[j]);
             cursor += SPARC64_AOT_RELOCATION_BYTES;
+        }
+        if (version == SPARC64_AOT_FORMAT_V3 && block->site_count != 0u) {
+            size_t wrote = 0u;
+            if (sparc64_aot_sites_encode(block->sites, block->site_count,
+                    destination + cursor, capacity - cursor,
+                    &wrote) != 0) {
+                errno = EIO;
+                return -1;
+            }
+            cursor += wrote;
         }
     }
     *written = total;
@@ -317,24 +344,52 @@ int sparc64_aot_encode_v2(const sparc64_aot_image_t *image,
     return encode(image, SPARC64_AOT_FORMAT_V2, record_digest, destination, capacity, written);
 }
 
+int sparc64_aot_encode_v3(const sparc64_aot_image_t *image,
+                      const uint8_t record_digest[SPARC64_AOT_DIGEST_BYTES],
+                      uint8_t *destination, size_t capacity, size_t *written)
+{
+    return encode(image, SPARC64_AOT_FORMAT_V3, record_digest, destination, capacity, written);
+}
+
+int sparc64_aot_encoded_size_v3(const sparc64_aot_image_t *image, size_t *size)
+{
+    size_t candidate = 0;
+    if (size == NULL || !image_valid(image, SPARC64_AOT_FORMAT_V3, SPARC64_AOT_HEADER_V3_BYTES, &candidate)) {
+        errno = EINVAL;
+        return -1;
+    }
+    *size = candidate;
+    return 0;
+}
+
 static bool parse_block_at(const uint8_t *encoded, size_t encoded_size,
                            size_t cursor, sparc64_aot_block_view_t *out,
-                           size_t *record_offset, size_t *next_offset)
+                           size_t *record_offset, size_t *next_offset,
+                           bool with_sites)
 {
     size_t end;
     size_t relocation_bytes;
+    size_t site_bytes = 0u;
     uint32_t source_size;
     uint32_t text_size;
     uint16_t relocation_count;
+    uint16_t site_count = 0u;
     if (cursor > encoded_size || encoded_size - cursor < SPARC64_AOT_BLOCK_HEADER_BYTES)
         return false;
     source_size = get32(encoded + cursor + 8);
     text_size = get32(encoded + cursor + 12);
     relocation_count = get16(encoded + cursor + 16);
+    if (with_sites) {
+        site_count = get16(encoded + cursor + 18);
+        if (site_count > SPARC64_AOT_SITES_MAX)
+            return false;
+        site_bytes = (size_t)site_count * SPARC64_AOT_SITE_BYTES;
+    }
     relocation_bytes = (size_t)relocation_count * SPARC64_AOT_RELOCATION_BYTES;
     end = cursor + SPARC64_AOT_BLOCK_HEADER_BYTES;
     if (!add_size(end, source_size, &end) || !add_size(end, text_size, &end) ||
-        !add_size(end, relocation_bytes, &end) || end > encoded_size)
+        !add_size(end, relocation_bytes, &end) ||
+        !add_size(end, site_bytes, &end) || end > encoded_size)
         return false;
     if (out != NULL) {
         out->source_offset = get64(encoded + cursor);
@@ -344,6 +399,13 @@ static bool parse_block_at(const uint8_t *encoded, size_t encoded_size,
         out->source_bytes = encoded + cursor + SPARC64_AOT_BLOCK_HEADER_BYTES;
         out->a64_text = out->source_bytes + source_size;
         out->relocations = out->a64_text + text_size;
+        if (with_sites) {
+            out->sites = out->relocations + relocation_bytes;
+            out->site_count = site_count;
+        } else {
+            out->sites = NULL;
+            out->site_count = 0u;
+        }
     }
     if (record_offset != NULL)
         *record_offset = cursor;
@@ -365,7 +427,8 @@ int sparc64_aot_decode(const uint8_t *encoded, size_t encoded_size,
         memcmp(encoded, format_magic, sizeof(format_magic)) != 0 ||
         !((get16(encoded + 8) == SPARC64_AOT_FORMAT_VERSION &&
            get16(encoded + 10) == SPARC64_AOT_HEADER_BYTES) ||
-          (get16(encoded + 8) == SPARC64_AOT_FORMAT_V2 &&
+          ((get16(encoded + 8) == SPARC64_AOT_FORMAT_V2 ||
+            get16(encoded + 8) == SPARC64_AOT_FORMAT_V3) &&
            get16(encoded + 10) == SPARC64_AOT_HEADER_V2_BYTES &&
            encoded_size >= SPARC64_AOT_HEADER_V2_BYTES)) ||
         get32(encoded + 12) != encoded_size || get32(encoded + 16) != 0 ||
@@ -378,7 +441,8 @@ int sparc64_aot_decode(const uint8_t *encoded, size_t encoded_size,
     candidate.encoded_size = encoded_size;
     candidate.format_version = get16(encoded + 8);
     candidate.header_bytes = get16(encoded + 10);
-    if (candidate.format_version == SPARC64_AOT_FORMAT_V2)
+    if (candidate.format_version == SPARC64_AOT_FORMAT_V2 ||
+        candidate.format_version == SPARC64_AOT_FORMAT_V3)
         memcpy(candidate.record_digest, encoded + SPARC64_AOT_RECORD_DIGEST_OFFSET,
                SPARC64_AOT_DIGEST_BYTES);
     candidate.block_count = get32(encoded + 20);
@@ -407,16 +471,32 @@ int sparc64_aot_decode(const uint8_t *encoded, size_t encoded_size,
         sparc64_aot_block_view_t block;
         size_t record_offset;
         size_t next_offset;
+        bool with_sites =
+            candidate.format_version == SPARC64_AOT_FORMAT_V3;
         if (!parse_block_at(encoded, encoded_size, cursor, &block,
-                            &record_offset, &next_offset) ||
-            get16(encoded + record_offset + 18) != 0 ||
-            get32(encoded + record_offset + 20) != 0 ||
+                            &record_offset, &next_offset, with_sites) ||
+            (!with_sites && (get16(encoded + record_offset + 18) != 0 ||
+                             get32(encoded + record_offset + 20) != 0)) ||
+            (with_sites && get32(encoded + record_offset + 20) != 0) ||
             block.source_size == 0 || block.source_size > SPARC64_AOT_MAX_SOURCE_BYTES ||
             block.a64_size == 0 || block.a64_size > SPARC64_AOT_MAX_BLOCK_TEXT_BYTES ||
             block.relocation_count > SPARC64_AOT_MAX_RELOCS_PER_BLOCK ||
             block.source_offset > UINT64_MAX - block.source_size) {
             errno = EINVAL;
             return -1;
+        }
+        if (with_sites && block.site_count != 0u) {
+            /* Validate every site record now: decoded views must not
+             * carry unserializable wire values. */
+            sparc64_mem_site_t probe[SPARC64_AOT_SITES_MAX];
+            if (block.site_count > SPARC64_AOT_SITES_MAX ||
+                block.sites == NULL ||
+                sparc64_aot_sites_decode(block.sites,
+                    (size_t)block.site_count * SPARC64_AOT_SITE_BYTES,
+                    probe, block.site_count) != 0) {
+                errno = EINVAL;
+                return -1;
+            }
         }
         if ((block.source_size & 1u) != 0 || (block.a64_size & 3u) != 0 ||
             (block.source_offset & 1u) != 0 ||
@@ -461,7 +541,8 @@ int sparc64_aot_decode(const uint8_t *encoded, size_t encoded_size,
         sparc64_aot_block_view_t block;
         size_t next_offset;
         if (!parse_block_at(encoded, encoded_size, cursor, &block, NULL,
-                            &next_offset)) {
+                            &next_offset,
+                            candidate.format_version == SPARC64_AOT_FORMAT_V3)) {
             errno = EINVAL;
             return -1;
         }
@@ -493,7 +574,8 @@ int sparc64_aot_view_block(const sparc64_aot_view_t *view, uint32_t index,
         index >= view->block_count ||
         !((view->format_version == SPARC64_AOT_FORMAT_VERSION &&
            view->header_bytes == SPARC64_AOT_HEADER_BYTES) ||
-          (view->format_version == SPARC64_AOT_FORMAT_V2 &&
+          ((view->format_version == SPARC64_AOT_FORMAT_V2 ||
+            view->format_version == SPARC64_AOT_FORMAT_V3) &&
            view->header_bytes == SPARC64_AOT_HEADER_V2_BYTES))) {
         errno = EINVAL;
         return -1;
@@ -502,7 +584,8 @@ int sparc64_aot_view_block(const sparc64_aot_view_t *view, uint32_t index,
     for (uint32_t i = 0; i <= index; ++i) {
         size_t next_offset;
         if (!parse_block_at(view->encoded, view->encoded_size, cursor,
-                            &candidate, NULL, &next_offset)) {
+                            &candidate, NULL, &next_offset,
+                            view->format_version == SPARC64_AOT_FORMAT_V3)) {
             errno = EINVAL;
             return -1;
         }
@@ -510,6 +593,19 @@ int sparc64_aot_view_block(const sparc64_aot_view_t *view, uint32_t index,
     }
     *out = candidate;
     return 0;
+}
+
+int sparc64_aot_view_site(const sparc64_aot_block_view_t *block,
+    uint16_t index, sparc64_mem_site_t *out)
+{
+    if (block == NULL || out == NULL || block->sites == NULL ||
+        index >= block->site_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    return sparc64_aot_sites_decode(
+        block->sites + (size_t)index * SPARC64_AOT_SITE_BYTES,
+        SPARC64_AOT_SITE_BYTES, out, 1u);
 }
 
 int sparc64_aot_view_relocation(const sparc64_aot_block_view_t *block, uint16_t index,

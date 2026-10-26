@@ -224,6 +224,19 @@ void *sparc64_mem_miss(sparc64_ctx_t *ctx, uint64_t gva, uint64_t val,
     }
     site = &blk->sites[site_idx];
     fault_pc = blk->guest_pc_base + (uint64_t)site->guest_pc_delta;
+    /* Delay-slot sites record the CTI pc (ec->fault_pc at emit time),
+     * but the memory instruction itself lives at guest_pc + 4. Replaying
+     * the CTI here would re-execute generated-code effects — for RETURN
+     * the register window restore would run twice. Execute the delay-slot
+     * instruction itself on a valid fill instead. The delay slot is
+     * always a plain (non-CTI) insn, so executing it with a sequential
+     * npc is architecturally exact for loads/stores/atomics; the site's
+     * guest_pc/next_pc deltas stay untouched for real guest fault
+     * delivery (SIGSEGV/SIGBUS replay from the CTI). */
+    if (((unsigned)site->flags &
+            (unsigned)SPARC64_MEM_F_IN_DELAY_SLOT) != 0U) {
+        fault_pc += 4U;
+    }
     if (site->sp_rollback_delta != 0 &&
         site->addr_base_reg < 32u) {
         ctx->r[site->addr_base_reg] =

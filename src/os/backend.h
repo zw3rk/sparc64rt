@@ -72,6 +72,11 @@ void  rt_host_worker_sync_destroy(rt_worker_sync_t *ws);
 void  rt_host_worker_notify_signal(rt_worker_sync_t *ws);
 /* Sends reserved preemption signal (SIGRTMIN+1 on Linux, SIGUSR2 on Darwin) to park DBT loop */
 int   rt_host_preempt_worker(uint64_t host_tid);
+/* Registers the calling thread in the backend worker table (Darwin) and
+ * returns its platform worker id: numeric tid on Linux (tgkill target),
+ * pthread_threadid_np value on Darwin (worker-table key). Used to fill
+ * the vm64 quiescence worker table for the live thread. */
+uint64_t rt_host_register_self(void);
 
 /* 5. Filesystem & descriptor operations (all potentially blocking calls take ws + expected_seq) */
 int64_t rt_host_openat(int dirfd, const char *path, int linux_flags, uint32_t mode,

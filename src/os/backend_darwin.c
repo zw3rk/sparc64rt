@@ -290,6 +290,16 @@ int rt_host_preempt_worker(uint64_t host_tid) {
     if (r == ETIMEDOUT) { return 0; }
     return -r;
 }
+uint64_t rt_host_register_self(void) {
+    /* pthread_threadid_np value doubles as the worker-table key;
+     * register self so preemption can find this thread. */
+    uint64_t tid = 0u;
+    (void)pthread_threadid_np(NULL, &tid);
+    if (tid != 0u) {
+        darwin_worker_register(tid, pthread_self());
+    }
+    return tid;
+}
 /* 5. filesystem */
 int64_t rt_host_openat(int dirfd, const char *path, int linux_flags, uint32_t mode, rt_worker_sync_t *ws, uint32_t expected_seq) {
     struct stat st; int df, was_nonblock, f; int64_t r;

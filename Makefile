@@ -9,7 +9,7 @@
 # or: nix build .#sparc64rt (uses the configured aarch64-linux builder).
 
 .DEFAULT_GOAL := help
-.PHONY: help all build check check-line-limits check-abi-invariants check-thr-granule check-rc-u2 clean
+.PHONY: help all build check check-line-limits check-abi-invariants check-thr-granule check-rc-u2 darwin-sparc64rt clean
 MAKEFLAGS += -j8
 
 BUILD_DIR := _build
@@ -117,6 +117,8 @@ DARWIN_S_SRCS := src/dbt/trampoline_a64.S
 DARWIN_OBJS := $(patsubst src/%.c,$(DARWIN_OBJ_DIR)/%.o,$(DARWIN_C_SRCS)) \
 	$(patsubst src/%.S,$(DARWIN_OBJ_DIR)/%.o,$(DARWIN_S_SRCS))
 
+darwin-sparc64rt: build-darwin ## Alias for build-darwin (RC gate name)
+
 build-darwin: $(DARWIN_BIN) ## Link _build/sparc64rt-darwin-arm64 (native macOS arm64)
 
 $(DARWIN_BIN): $(DARWIN_OBJS)
@@ -138,5 +140,6 @@ check-rc-u2: ## Build and run the RC-U2 8 KiB COW/EOF gate test (Lane A3)
 	$(HOST_CC) $(CFLAGS) -Isrc tests/test_rc_u2_8k_cow_eof.c \
 		src/vm/vm64.c src/vm/vm_file.c src/os/mem_space.c \
 		src/os/mem_space_write.c src/dbt/aot/sites.c \
+		src/dbt/aot/format.c \
 		-o $(BUILD_DIR)/test_rc_u2_8k_cow_eof && \
 	./$(BUILD_DIR)/test_rc_u2_8k_cow_eof

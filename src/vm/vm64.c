@@ -60,14 +60,10 @@
 #define VM64_MREMAP_MAYMOVE 1u
 #define VM64_MREMAP_FIXED 2u
 
-/* Per-8KiB-page states (section 5.1: in-place non-relocating COW). */
-typedef enum {
-    VM64_PAGE_UNMAPPED = 0,
-    VM64_PAGE_ANON = 1,      /* anonymous / zero-fill, writable */
-    VM64_PAGE_SHARED = 2,    /* MAP_SHARED file page, write-through */
-    VM64_PAGE_COW_CLEAN = 3, /* MAP_PRIVATE file page, not yet dirtied */
-    VM64_PAGE_COW_DIRTY = 4  /* MAP_PRIVATE file page, promoted in place */
-} vm64_page_state_t;
+/* Per-8KiB-page states live in src/vm/vm64.h (shared with
+ * src/vm/vm_file.c and the RC-U2 gate test so the compiler checks
+ * the vm64_page_state_t* signatures instead of int* punning). */
+#include "vm/vm64.h"
 
 /* Soft-TLB entry (section 4.3.1): 32 bytes, read_tag at +0, addend at
  * +8, write_tag at +16, reserved at +24. */
@@ -457,6 +453,66 @@ uint64_t vm64_seq_rewind(uint64_t pc, uint64_t seq_start,
     return pc;
 }
 
+/* ---- Live-sequence rewind (RC-U12 follow-up) -----------------------------
+ * Every emitted Soft-TLB fast path opens with `ubfm x2, x1, #12, #23`
+ * (see mem_emit_check in src/dbt/emit_mem.c; the word is written out
+ * from the encoder inputs below so drift is greppable, not magic).
+ * The 6-word check prefix has zero architectural side effects, so a
+ * worker preempted inside a live sequence may safely resume at its
+ * start and re-resolve against current TLB state. The arena window
+ * (published by the DBT when it maps the code arena) bounds the only
+ * reads this probe performs: outside JIT code, or when no sequence
+ * start is found within 6 words back, it returns pc unchanged (safe
+ * identity — never jumps somewhere unrecognized). Pre-commit
+ * idempotence is what makes re-execution safe: a preempt is always
+ * delivered before the mutation it quiesces for, while the old
+ * mapping is still live. */
+#define VM64_SEQ_START_WORD \
+    (UINT32_C(0xd3400000) | ((uint32_t)12 << 16) | \
+     ((uint32_t)23 << 10) | ((uint32_t)1 << 5) | (uint32_t)2)
+#define VM64_SEQ_SCAN_WORDS 6u
+#define VM64_SEQ_WINDOW_BYTES (7u * 4u)
+
+static uint64_t seq_arena_base;
+static uint64_t seq_arena_end;
+
+void vm64_seq_publish(uint64_t arena_base, uint64_t arena_size)
+{
+    seq_arena_base = arena_base;
+    seq_arena_end = arena_base + arena_size;
+}
+
+uint64_t vm64_seq_rewind_live(uint64_t pc)
+{
+    uint64_t cand;
+    unsigned i;
+    uint32_t w;
+    if (pc < 4u || seq_arena_base == 0u || seq_arena_end <= seq_arena_base) {
+        return pc;
+    }
+    if (pc < seq_arena_base + (uint64_t)VM64_SEQ_SCAN_WORDS * 4u ||
+        pc >= seq_arena_end) {
+        return pc;
+    }
+    cand = (pc - 4u) & ~UINT64_C(3);
+    for (i = 0u; i <= VM64_SEQ_SCAN_WORDS; i++) {
+        if (cand < seq_arena_base) {
+            break;
+        }
+        w = *(volatile const uint32_t *)(uintptr_t)cand;
+        if (w == VM64_SEQ_START_WORD &&
+            pc - cand < (uint64_t)VM64_SEQ_WINDOW_BYTES) {
+            return cand;
+        }
+        if (cand < 4u) {
+            break;
+        }
+        cand -= 4u;
+    }
+    return pc;
+}
+
+
 /* ---- 6-step Prepare -> Quiesce -> Host-Op -> Commit (section 4.5) ---------
  * Operates on a caller-supplied worker table; the coordinator wires
  * the real thread list and the rt_host_preempt_worker hook at merge.
@@ -555,6 +611,16 @@ static void a2_bind(void)
         a2_txn.preempt_ctx = NULL;
         a2_bound = 1;
     }
+}
+
+/* Register the calling thread in the quiescence worker table with its
+ * platform worker id (tgkill target on Linux, worker-table key on
+ * Darwin). Called once at engine startup for the thread that runs
+ * guest code; without it Step-2 preemption has no live addressee. */
+void vm64_stxn_register_self(void)
+{
+    a2_bind();
+    a2_self.host_tid = rt_host_register_self();
 }
 
 /* Steps 1-2: park self, announce the mutation (no peers to preempt on

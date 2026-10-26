@@ -675,6 +675,15 @@ int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
     g->brk_cur = ng.brk_cur;
     g->tid_addr = 0U;
     g->host_tid = (long)getpid();
+    /* Fresh address space: drop every cached translation. The DBT
+     * block cache and the process-global Soft-TLB still describe the
+     * old image; without a flush the new image would execute stale
+     * blocks and resolve stale host pages through the live fast
+     * path (which consults the Soft-TLB on every access). */
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+    }
+    sparc64_tlb_init();
     sparc64_ctx_init(ctx, start_entry);
     ctx->r[SPARC64_SP] = sp;
     /* Fresh windows (E01): CWP 0, no invalid windows, so the first
