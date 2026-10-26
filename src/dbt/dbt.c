@@ -359,6 +359,75 @@ fail:
     return NULL;
 }
 
+/* Delay-slot fault continuation (RC-U4 A1): a Soft-TLB miss inside a
+ * CTI delay slot reports exit_dest at the CTI (the precise fault PC)
+ * while the replayed instruction lives at dst + 4. Replaying the CTI
+ * itself would re-execute already-committed transfer effects (for
+ * RETURN the register window restore would run twice), so replay the
+ * delay slot instead, with the npc the branch continuation needs: the
+ * static target for CALL and direct branches, the register-derived
+ * target for JMPL/RETURN, the fall-through for a not-taken conditional.
+ * A taken branch therefore resumes at its target instead of
+ * sequentially past the delay slot. Returns false for non-CTI
+ * destinations (sequential replay), undecodable words, annulled-away
+ * delays, and misaligned dynamic targets; the caller then replays from
+ * dst with npc = dst + 4 exactly like before. */
+static bool dbt_delay_continuation(const sparc64_mem_ops_t *mem, void *mc,
+    const sparc64_ctx_t *ctx, uint64_t dst, uint64_t *pc_out,
+    uint64_t *npc_out)
+{
+    sparc64_dec_t d;
+    bool taken = true;
+    uint64_t target = UINT64_C(0);
+    if (pc_out == NULL || npc_out == NULL || ctx == NULL) {
+        return false;
+    }
+    if (!dbt_fetch_classify(mem, mc, dst, &d)) {
+        return false;
+    }
+    switch (d.cls) {
+    case SPARC64_ICLS_CALL:
+        target = dst + (uint64_t)d.disp;
+        break;
+    case SPARC64_ICLS_JMPL:
+    case SPARC64_ICLS_RETURN:
+        target = ctx->r[d.rs1] +
+            ((d.is_imm != 0U) ? (uint64_t)d.imm : ctx->r[d.rs2]);
+        if ((target & UINT64_C(3)) != UINT64_C(0)) {
+            return false;
+        }
+        break;
+    case SPARC64_ICLS_BICC:
+        taken = sparc64_eval_cond(d.cond, sparc64_cc_icc(ctx));
+        target = taken ? dst + (uint64_t)d.disp : dst + UINT64_C(8);
+        break;
+    case SPARC64_ICLS_BPCC:
+        taken = sparc64_eval_cond(d.cond,
+            d.cc == 2U ? sparc64_cc_xcc(ctx) : sparc64_cc_icc(ctx));
+        target = taken ? dst + (uint64_t)d.disp : dst + UINT64_C(8);
+        break;
+    case SPARC64_ICLS_BPR:
+        taken = sparc64_eval_rcond(d.cond, ctx->r[d.rs1]);
+        target = taken ? dst + (uint64_t)d.disp : dst + UINT64_C(8);
+        break;
+    default:
+        /* TCC, FBR, and plain instructions replay sequentially. */
+        return false;
+    }
+    /* An annulled-away delay never ran: replay the CTI itself, whose
+     * annul handling matches the interpreter by construction. */
+    if (d.annul != 0U) {
+        bool skip = taken ?
+            (d.cond == 8U && d.cls != (uint8_t)SPARC64_ICLS_BPR) : true;
+        if (skip) {
+            return false;
+        }
+    }
+    *pc_out = dst + UINT64_C(4);
+    *npc_out = target;
+    return true;
+}
+
 /* Commit one fragment exit into ctx; returns the step-shaped outcome.
  * BRANCH chains (CONTINUE with advanced pc/npc), SYSCALL stops without
  * advancing (the caller runs the handler), anything else replays one
@@ -385,8 +454,18 @@ static sparc64_step_result_t dbt_commit_exit(sparc64_ctx_t *ctx,
         r.memory_reason = SPARC64_MEM_FAULT_NONE;
         return r;
     }
-    ctx->pc = dst;
-    ctx->npc = dst + 4U;
+    {
+        uint64_t cont_pc = UINT64_C(0);
+        uint64_t cont_npc = UINT64_C(0);
+        if (dbt_delay_continuation(mem, mc, ctx, dst, &cont_pc,
+                &cont_npc)) {
+            ctx->pc = cont_pc;
+            ctx->npc = cont_npc;
+        } else {
+            ctx->pc = dst;
+            ctx->npc = dst + 4U;
+        }
+    }
     return sparc64_step(ctx, mem, mc);
 }
 

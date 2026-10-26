@@ -104,7 +104,8 @@ void sparc64_mem_block_free(sparc64_mem_block_t *blk)
 }
 
 uint32_t sparc64_mem_slow_step(sparc64_ctx_t *ctx,
-    const sparc64_mem_ops_t *mem, void *mc, uint64_t fault_pc)
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t exec_pc,
+    uint64_t fault_pc)
 {
     sparc64_step_result_t r;
     uint64_t saved_pc;
@@ -115,10 +116,12 @@ uint32_t sparc64_mem_slow_step(sparc64_ctx_t *ctx,
     saved_pc = ctx->pc;
     saved_npc = ctx->npc;
     /* The block never advances pc/npc per instruction; replay exactly
-     * one instruction at the fault PC and restore the pair so the
-     * resumed block and its exits observe undisturbed state. */
-    ctx->pc = fault_pc;
-    ctx->npc = fault_pc + UINT64_C(4);
+     * one instruction at the exec PC and restore the pair so the
+     * resumed block and its exits observe undisturbed state. exec_pc
+     * and fault_pc differ only for delay-slot sites (exec at the
+     * delay-slot instruction, fault attributed to the CTI). */
+    ctx->pc = exec_pc;
+    ctx->npc = exec_pc + UINT64_C(4);
     r = sparc64_step(ctx, mem, mc);
     if (r.kind == SPARC64_STEP_CONTINUE) {
         ctx->pc = saved_pc;
@@ -212,6 +215,7 @@ void *sparc64_mem_miss(sparc64_ctx_t *ctx, uint64_t gva, uint64_t val,
 {
     const sparc64_mem_site_t *site;
     uint64_t fault_pc;
+    uint64_t exec_pc;
     uint32_t rc;
     (void)val;
     if (ctx == NULL || blk == NULL || blk->mem == NULL ||
@@ -228,14 +232,17 @@ void *sparc64_mem_miss(sparc64_ctx_t *ctx, uint64_t gva, uint64_t val,
      * but the memory instruction itself lives at guest_pc + 4. Replaying
      * the CTI here would re-execute generated-code effects — for RETURN
      * the register window restore would run twice. Execute the delay-slot
-     * instruction itself on a valid fill instead. The delay slot is
-     * always a plain (non-CTI) insn, so executing it with a sequential
-     * npc is architecturally exact for loads/stores/atomics; the site's
+     * instruction itself (exec_pc) on a valid fill instead; the fault
+     * path below still reports fault_pc (the CTI) so the dispatcher
+     * attributes the fault precisely. The delay slot is always a plain
+     * (non-CTI) insn, so executing it with a sequential npc is
+     * architecturally exact for loads/stores/atomics; the site's
      * guest_pc/next_pc deltas stay untouched for real guest fault
      * delivery (SIGSEGV/SIGBUS replay from the CTI). */
+    exec_pc = fault_pc;
     if (((unsigned)site->flags &
             (unsigned)SPARC64_MEM_F_IN_DELAY_SLOT) != 0U) {
-        fault_pc += 4U;
+        exec_pc += 4U;
     }
     if (site->sp_rollback_delta != 0 &&
         site->addr_base_reg < 32u) {
@@ -243,7 +250,8 @@ void *sparc64_mem_miss(sparc64_ctx_t *ctx, uint64_t gva, uint64_t val,
             ctx->r[site->addr_base_reg] +
             (uint64_t)(int64_t)site->sp_rollback_delta;
     }
-    rc = sparc64_mem_slow_step(ctx, blk->mem, blk->mc, fault_pc);
+    rc = sparc64_mem_slow_step(ctx, blk->mem, blk->mc, exec_pc,
+        fault_pc);
     if (rc == (uint32_t)SPARC64_EXIT_NONE) {
         /* The replay proved the page valid and permitted: publish the
          * entry so later accesses hit the inline fast path. The

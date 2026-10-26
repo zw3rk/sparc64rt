@@ -84,9 +84,12 @@ int64_t rt_host_msync(void *host_addr, size_t len, int linux_flags)
     return 0L;
 }
 
+static unsigned preempt_calls = 0u;
+
 int rt_host_preempt_worker(uint64_t host_tid)
 {
     (void)host_tid;
+    preempt_calls++;
     return 0;
 }
 
@@ -581,6 +584,40 @@ int main(void)
         check("v1-with-sites-rejected",
             sparc64_aot_encode(&image, record, sizeof(record),
                 &written) != 0 && errno == EINVAL);
+    }
+
+    /* H. Active worker registry (RC-U4 #3): register is visible in
+     * the table and idempotent, solo prepare/commit takes the fast
+     * path with no peer preemption, unregister drops the slot, and a
+     * bare prepare self-heals by registering on demand. The stub host
+     * id is constant, so two registers must still show one worker. */
+    {
+        unsigned before;
+        check("workers-start-empty", vm64_worker_live_count() == 0u);
+        vm64_worker_register();
+        check("workers-register-visible",
+            vm64_worker_live_count() == 1u);
+        vm64_worker_register();
+        check("workers-register-idempotent",
+            vm64_worker_live_count() == 1u);
+        before = preempt_calls;
+        check("workers-solo-prepare", vm64_stxn_prepare() == 0);
+        check("workers-solo-no-preempt", preempt_calls == before);
+        check("workers-solo-commit", vm64_stxn_commit(0u, 0u) == 0);
+        vm64_worker_unregister();
+        check("workers-unregister", vm64_worker_live_count() == 0u);
+        vm64_worker_unregister();
+        check("workers-unregister-idempotent",
+            vm64_worker_live_count() == 0u);
+        before = preempt_calls;
+        check("workers-prepare-heals",
+            vm64_stxn_prepare() == 0 &&
+            vm64_worker_live_count() == 1u);
+        check("workers-healed-no-preempt", preempt_calls == before);
+        check("workers-healed-commit",
+            vm64_stxn_commit(0u, 0u) == 0);
+        vm64_worker_unregister();
+        check("workers-end-empty", vm64_worker_live_count() == 0u);
     }
 
     if (fails == 0) {

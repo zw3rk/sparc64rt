@@ -90,7 +90,11 @@ typedef enum {
 typedef struct {
     _Atomic unsigned state;
     _Atomic uint64_t dbt_epoch;
-    uint64_t host_tid;
+    /* Platform worker id (tgkill target on Linux, worker-table key on
+     * Darwin); zero marks a free slot the prepare loop skips. Atomic
+     * so register/unregister (table lock) and the lock-free prepare
+     * scan never race on plain storage. */
+    _Atomic uint64_t host_tid;
 } vm64_worker_t;
 
 /* Host-operation callback executed in Step 3 (Quiesce held). Returns
@@ -548,7 +552,17 @@ int vm64_txn_prepare(vm64_txn_t *txn)
     atomic_store_explicit(&txn->mutating, 1u, memory_order_seq_cst);
     for (i = 0; i < txn->nworkers; ++i) {
         unsigned st;
+        uint64_t peer;
         if (i == txn->self_index) {
+            continue;
+        }
+        /* Free table slots carry host_tid 0 (never a live thread:
+         * the platform ids are nonzero); they hold no DBT state to
+         * preempt, so the scan skips them. Fully populated external
+         * tables behave exactly as before. */
+        peer = atomic_load_explicit(&txn->workers[i].host_tid,
+            memory_order_seq_cst);
+        if (peer == UINT64_C(0)) {
             continue;
         }
         (void)atomic_fetch_add_explicit(&txn->workers[i].dbt_epoch,
@@ -557,8 +571,7 @@ int vm64_txn_prepare(vm64_txn_t *txn)
             memory_order_seq_cst);
         if (st == (unsigned)VM64_WORKER_RUNNING_DBT &&
             txn->preempt != NULL) {
-            (void)txn->preempt(txn->workers[i].host_tid,
-                txn->preempt_ctx);
+            (void)txn->preempt(peer, txn->preempt_ctx);
         }
     }
     return 0;
@@ -580,20 +593,27 @@ long vm64_txn_host_op(vm64_txn_t *txn, vm64_host_op_fn op, void *op_ctx)
     return rc;
 }
 
-/* ---- Lane A2: single-participant txn legs for sysmem_* --------------------
- * The big-lock engine has no live peer table (all guest threads serialize
- * on thr_big_lock), so quiescence takes the epoch-bump leg: prepare parks
- * self and announces the mutation, host_op runs the fallible step first
- * (failure releases with zero mutation and resumes self), commit clears
- * the announcement and resumes. Paired-TLB invalidation stays at the
- * sysmem_* call sites (they own the live sparc64_dbt_tlb via
- * src/dbt/mem_sites.h); the commit leg below therefore takes a NULL
- * table, which is a no-op by contract. No redesign: thin wrappers over
- * the section 4.5 core; one shared slot, big-lock serialized. */
+/* ---- Lane A2: active-worker txn legs for sysmem_* (RC-U4 #3) -------------
+ * The big-lock engine serializes guest execution, but quiescence must
+ * address every live thread: the main thread registers at startup and
+ * each CLONE_VM worker registers on thread entry (unregistering on
+ * exit). The legs below run the section 4.5 core over that table;
+ * with zero or one live worker the loop parks self and finds no peers,
+ * which is exactly the old nworkers=1/self-0 fast path. Paired-TLB
+ * invalidation stays at the sysmem_* call sites (they own the live
+ * sparc64_dbt_tlb via src/dbt/mem_sites.h); the commit leg below
+ * therefore takes a NULL table, which is a no-op by contract.
+ * Fork children inherit the table: stale parent tids never park (the
+ * child registers itself on first prepare) and failed preemptions are
+ * ignored by contract, so no fork hook is needed. */
 
-static vm64_worker_t a2_self;
+/* Main slot plus one per host-thread-backed guest thread. */
+#define VM64_MAX_WORKERS 65u
+
+static vm64_worker_t vm64_workers[VM64_MAX_WORKERS];
 static vm64_txn_t a2_txn;
 static int a2_bound;
+static atomic_flag vm64_table_lock = ATOMIC_FLAG_INIT;
 
 /* Forward declarations of the section 4.5 core (defined below). */
 int vm64_txn_prepare(vm64_txn_t *txn);
@@ -604,8 +624,8 @@ int vm64_txn_commit(vm64_txn_t *txn, vm64_tlb_entry_t *tlb,
 static void a2_bind(void)
 {
     if (a2_bound == 0) {
-        a2_txn.workers = &a2_self;
-        a2_txn.nworkers = 1u;
+        a2_txn.workers = vm64_workers;
+        a2_txn.nworkers = (size_t)VM64_MAX_WORKERS;
         a2_txn.self_index = 0u;
         a2_txn.preempt = vm64_preempt_via_rt_host;
         a2_txn.preempt_ctx = NULL;
@@ -613,22 +633,133 @@ static void a2_bind(void)
     }
 }
 
-/* Register the calling thread in the quiescence worker table with its
- * platform worker id (tgkill target on Linux, worker-table key on
- * Darwin). Called once at engine startup for the thread that runs
- * guest code; without it Step-2 preemption has no live addressee. */
-void vm64_stxn_register_self(void)
+static void vm64_table_lock_acq(void)
 {
-    a2_bind();
-    a2_self.host_tid = rt_host_register_self();
+    while (atomic_flag_test_and_set_explicit(&vm64_table_lock,
+            memory_order_acquire)) {
+    }
 }
 
-/* Steps 1-2: park self, announce the mutation (no peers to preempt on
- * the single-participant slot). Returns 0, or -VM64_EFAULT when the
- * slot is unusable. */
+static void vm64_table_lock_rel(void)
+{
+    atomic_flag_clear_explicit(&vm64_table_lock, memory_order_release);
+}
+
+/* Find the calling thread's slot, claiming a free one when absent.
+ * Returns VM64_MAX_WORKERS when the table is full (unreachable in
+ * practice: main plus one slot per guest thread). */
+static size_t vm64_find_or_claim_self(uint64_t tid)
+{
+    size_t i;
+    size_t free_slot = (size_t)VM64_MAX_WORKERS;
+    for (i = 0; i < (size_t)VM64_MAX_WORKERS; i++) {
+        uint64_t have = atomic_load_explicit(&vm64_workers[i].host_tid,
+            memory_order_seq_cst);
+        if (have == tid) {
+            atomic_store_explicit(&vm64_workers[i].state,
+                (unsigned)VM64_WORKER_RUNNING_DBT,
+                memory_order_seq_cst);
+            return i;
+        }
+        if (free_slot == (size_t)VM64_MAX_WORKERS &&
+            have == UINT64_C(0)) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < (size_t)VM64_MAX_WORKERS) {
+        atomic_store_explicit(&vm64_workers[free_slot].host_tid, tid,
+            memory_order_seq_cst);
+        atomic_store_explicit(&vm64_workers[free_slot].state,
+            (unsigned)VM64_WORKER_RUNNING_DBT, memory_order_seq_cst);
+    }
+    return free_slot;
+}
+
+/* Register the calling thread in the quiescence worker table with its
+ * platform worker id (tgkill target on Linux, worker-table key on
+ * Darwin). Idempotent: re-registering a live thread only marks it
+ * running. Called once at engine startup for the thread that runs
+ * guest code, and on every CLONE_VM worker-thread entry; without it
+ * Step-2 preemption has no live addressee. */
+void vm64_worker_register(void)
+{
+    uint64_t tid = rt_host_register_self();
+    if (tid == UINT64_C(0)) {
+        return;
+    }
+    vm64_table_lock_acq();
+    (void)vm64_find_or_claim_self(tid);
+    vm64_table_lock_rel();
+}
+
+/* Drop the calling thread's quiescence slot (worker-thread exit). The
+ * cleared slot resumes as free: commit's PARKED->RUNNING CAS no-ops on
+ * it and prepare skips it by its zero tid. Idempotent. */
+void vm64_worker_unregister(void)
+{
+    uint64_t tid = rt_host_register_self();
+    size_t i;
+    if (tid == UINT64_C(0)) {
+        return;
+    }
+    vm64_table_lock_acq();
+    for (i = 0; i < (size_t)VM64_MAX_WORKERS; i++) {
+        uint64_t have = atomic_load_explicit(&vm64_workers[i].host_tid,
+            memory_order_seq_cst);
+        if (have == tid) {
+            atomic_store_explicit(&vm64_workers[i].host_tid,
+                UINT64_C(0), memory_order_seq_cst);
+            atomic_store_explicit(&vm64_workers[i].state,
+                (unsigned)VM64_WORKER_RUNNING_DBT,
+                memory_order_seq_cst);
+            break;
+        }
+    }
+    vm64_table_lock_rel();
+}
+
+/* Live-slot count for tests and diagnostics. */
+unsigned vm64_worker_live_count(void)
+{
+    size_t i;
+    unsigned n = 0u;
+    vm64_table_lock_acq();
+    for (i = 0; i < (size_t)VM64_MAX_WORKERS; i++) {
+        if (atomic_load_explicit(&vm64_workers[i].host_tid,
+                memory_order_relaxed) != UINT64_C(0)) {
+            n++;
+        }
+    }
+    vm64_table_lock_rel();
+    return n;
+}
+
+/* Historical startup entry: registers the calling (main) thread. */
+void vm64_stxn_register_self(void)
+{
+    vm64_worker_register();
+}
+
+/* Steps 1-2: park self, announce the mutation, preempt live peers.
+ * The caller registers on demand, so zero or one live worker takes
+ * the same fast path as the old single-participant slot. Returns 0,
+ * or -VM64_EFAULT when the table is unusable. */
 int vm64_stxn_prepare(void)
 {
+    uint64_t tid;
+    size_t idx;
     a2_bind();
+    tid = rt_host_register_self();
+    if (tid == UINT64_C(0)) {
+        return -VM64_EFAULT;
+    }
+    vm64_table_lock_acq();
+    idx = vm64_find_or_claim_self(tid);
+    vm64_table_lock_rel();
+    if (idx >= (size_t)VM64_MAX_WORKERS) {
+        return -VM64_EFAULT;
+    }
+    a2_txn.self_index = idx;
     return vm64_txn_prepare(&a2_txn);
 }
 

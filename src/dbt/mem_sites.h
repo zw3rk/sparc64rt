@@ -124,13 +124,16 @@ sparc64_mem_block_t *sparc64_mem_block_alloc(
     uint64_t rx_base, uint32_t n_sites);
 void sparc64_mem_block_free(sparc64_mem_block_t *blk);
 
-/* Run one guest instruction at fault_pc through the reference
+/* Run one guest instruction at exec_pc through the reference
  * interpreter with pc/npc restored afterwards. Returns
  * SPARC64_EXIT_NONE when the instruction completed (caller resumes at
  * the cont address); any other SPARC64_EXIT_* reason is committed into
- * ctx->exit_reason/exit_dest for the dispatcher. */
+ * ctx->exit_reason/exit_dest for the dispatcher, with exit_dest at
+ * fault_pc (the architectural fault PC: for a delay-slot site the CTI,
+ * while exec_pc is the delay-slot instruction itself). */
 uint32_t sparc64_mem_slow_step(sparc64_ctx_t *ctx,
-    const sparc64_mem_ops_t *mem, void *mc, uint64_t fault_pc);
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t exec_pc,
+    uint64_t fault_pc);
 
 /* Miss-trampoline slow path: (ctx, x1 = gva, x0 = val, blk, site_idx).
  * Applies the SP rollback, runs the interpreter step, and returns the

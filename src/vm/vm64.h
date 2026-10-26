@@ -47,6 +47,14 @@ int vm64_stxn_commit(uint64_t changed_base, uint64_t changed_len);
 void vm64_stxn_abort(void);
 void vm64_stxn_register_self(void);
 
+/* Active worker table (RC-U4 #3): register on worker-thread start
+ * (the main thread registers at engine startup), unregister on thread
+ * exit; prepare iterates the live slots instead of a hardcoded
+ * single-participant slot. All three are idempotent. */
+void vm64_worker_register(void);
+void vm64_worker_unregister(void);
+unsigned vm64_worker_live_count(void);
+
 /* Live Soft-TLB window (section 4.5.2). */
 uint64_t vm64_seq_rewind(uint64_t pc, uint64_t seq_start,
     uint64_t host_insn);

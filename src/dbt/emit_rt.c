@@ -37,8 +37,10 @@ uint64_t s64_rt_mem(sparc64_ctx_t *ctx, const sparc64_mem_ops_t *mem,
     }
     /* The interpreter re-fetches and re-decodes the word at pc, so the
      * packed op fields are informational only; parity holds because the
-     * same step function backs the miss trampoline in mem_sites.c. */
-    rc = sparc64_mem_slow_step(ctx, mem, mc, pc);
+     * same step function backs the miss trampoline in mem_sites.c.
+     * Backend memory ops are never delay-slot sites, so exec and fault
+     * PCs coincide here. */
+    rc = sparc64_mem_slow_step(ctx, mem, mc, pc, pc);
     return rc == (uint32_t)SPARC64_EXIT_NONE ? UINT64_C(0) :
         (uint64_t)SPARC64_EXIT_UNDEF;
 }

@@ -193,190 +193,23 @@ static ssize_t sysmem_pread_all(int fd, uint64_t offset, uint8_t *dst,
     return (ssize_t)done;
 }
 
-/* Copy len bytes from fd@offset into guest space at base. Short reads
- * (EOF) leave the tail as mapped (fresh pages are zero-filled),
- * reporting LOAD_IO so the caller keeps the mapping; LOAD_NOMEM rolls
- * the span back. Mirrors the loader copy in guest_run.c. */
-/* ---- File-backed range registry (RC-U4 follow-up) -----------------------
- * Tracks live file-backed sysmem mappings so truncate/ftruncate can
- * convert stripped 8 KiB pages to BUS spans (and regrow them back to
- * zero pages) instead of leaving stale readable mappings behind.
- * Keyed by (dev, ino); dropped on any overlapping munmap/mremap. Ring
- * of 64: overflow evicts oldest, degrading to pre-registry behavior
- * (stale readable bytes) for the evicted range only. */
-#define SYSMEM_FILERANGE_SLOTS 64u
-typedef struct {
-    bool live;
-    uint64_t dev;
-    uint64_t ino;
-    uint64_t file_offset;
-    uint64_t base;
-    uint64_t len;
-    unsigned prot;
-} sysmem_file_range_t;
-static sysmem_file_range_t sysmem_files[SYSMEM_FILERANGE_SLOTS];
-static unsigned sysmem_file_next;
-
-static uint64_t sysmem_align_up_8k(uint64_t v)
-{
-    if (v > UINT64_C(0xffffffffffffffff) - UINT64_C(8191)) {
-        return UINT64_C(0xffffffffffffffff);
-    }
-    return (v + UINT64_C(8191)) & ~UINT64_C(8191);
-}
-
-/* Beyond-EOF BUS span of a file mapping, in file coordinates: full 8 KiB
- * pages of [file_offset, file_offset + len) lying entirely at/after
- * file_size. Partial tail pages read zero and stay mapped. */
-static bool sysmem_file_bus_span(uint64_t file_offset, uint64_t len,
-    uint64_t file_size, uint64_t *bus_out, uint64_t *bus_len_out)
-{
-    uint64_t bus;
-    uint64_t end = file_offset + len;
-    if (len == 0u || end < file_offset) {
-        return false;
-    }
-    bus = sysmem_align_up_8k(file_size);
-    if (bus < file_offset) {
-        bus = file_offset;
-    }
-    if (bus >= end) {
-        return false;
-    }
-    if (bus_out != NULL) {
-        *bus_out = bus;
-    }
-    if (bus_len_out != NULL) {
-        *bus_len_out = end - bus;
-    }
-    return true;
-}
-
-void sysmem_file_note_map(void *context, uint64_t dev, uint64_t ino,
-    uint64_t file_offset, uint64_t base, uint64_t len, unsigned prot)
-{
-    sysmem_file_range_t *slot;
-    (void)context;
-    if (len == 0u || file_offset > UINT64_C(0xffffffffffffffff) - len) {
-        return;
-    }
-    slot = &sysmem_files[sysmem_file_next % SYSMEM_FILERANGE_SLOTS];
-    sysmem_file_next++;
-    slot->live = true;
-    slot->dev = dev;
-    slot->ino = ino;
-    slot->file_offset = file_offset;
-    slot->base = base;
-    slot->len = len;
-    slot->prot = prot & 7u;
-}
-
-void sysmem_file_drop_map(void *context, uint64_t base, uint64_t len)
-{
-    unsigned i;
-    uint64_t end;
-    (void)context;
-    if (len == 0u) {
-        return;
-    }
-    end = base + len;
-    if (end < base) {
-        end = UINT64_C(0xffffffffffffffff);
-    }
-    for (i = 0; i < SYSMEM_FILERANGE_SLOTS; i++) {
-        sysmem_file_range_t *slot = &sysmem_files[i];
-        if (!slot->live) {
-            continue;
-        }
-        if (slot->base < end && base < slot->base + slot->len) {
-            slot->live = false;
-        }
-    }
-}
-
-/* Resize a file all live mappings observe: shrink converts stripped
- * full 8 KiB pages to BUS spans; growth restores previously-bused
- * pages as zero heap pages. Both invalidate paired TLB coverage. */
-void sysmem_file_resize(void *context, uint64_t dev, uint64_t ino,
-    uint64_t old_size, uint64_t new_size)
-{
-    guest_state_t *g = (guest_state_t *)context;
-    unsigned i;
-    if (g == NULL || old_size == new_size) {
-        return;
-    }
-    for (i = 0; i < SYSMEM_FILERANGE_SLOTS; i++) {
-        sysmem_file_range_t *slot = &sysmem_files[i];
-        uint64_t ob = 0u;
-        uint64_t ob_len = 0u;
-        uint64_t nb = 0u;
-        uint64_t nb_len = 0u;
-        uint64_t lo;
-        uint64_t hi;
-        bool had_bus;
-        bool has_bus;
-        if (!slot->live || slot->dev != dev || slot->ino != ino) {
-            continue;
-        }
-        /* BUS spans always run to the mapping end, so the delta is a
-         * single interval: shrink newly strips [nb, ob), growth
-         * re-admits [ob, nb). (Shrink: nb <= ob; growth: nb >= ob.) */
-        had_bus = sysmem_file_bus_span(slot->file_offset, slot->len,
-            old_size, &ob, &ob_len);
-        has_bus = sysmem_file_bus_span(slot->file_offset, slot->len,
-            new_size, &nb, &nb_len);
-        (void)ob_len;
-        (void)nb_len;
-        if (has_bus && (!had_bus || nb < ob)) {
-            /* Newly stripped pages: BUS + invalidate paired TLB. */
-            lo = slot->base + (nb - slot->file_offset);
-            hi = lo + (had_bus ? ob - nb :
-                slot->file_offset + slot->len - nb);
-            (void)sparc64_space_map_bus(&g->space, lo, hi - lo,
-                slot->prot, true);
-            sparc64_tlb_invalidate_gva(lo, hi - lo);
-        } else if (had_bus && (!has_bus || ob < nb)) {
-            /* Re-admitted pages (growth): zero heap pages + invalidate. */
-            lo = slot->base + (ob - slot->file_offset);
-            hi = lo + (has_bus ? nb - ob :
-                slot->file_offset + slot->len - ob);
-            (void)sparc64_space_map(&g->space, lo, hi - lo,
-                slot->prot, true);
-            sparc64_tlb_invalidate_gva(lo, hi - lo);
-        }
-    }
-}
-
-/* Copy len bytes from fd@offset into guest space at base. Short reads
- * (EOF) leave the tail as mapped (fresh pages are zero-filled),
- * reporting LOAD_IO so the caller keeps the mapping; LOAD_NOMEM rolls
- * the span back. Mirrors the loader copy in guest_run.c. */
-static int sysmem_fill(guest_state_t *g, int fd, uint64_t offset,
-    uint64_t base, uint64_t len)
-{
-    uint64_t done = 0;
-    uint8_t chunk[4096];
-    while (done < len) {
-        uint64_t want = len - done;
-        ssize_t got;
-        if (want > (uint64_t)sizeof(chunk)) {
-            want = (uint64_t)sizeof(chunk);
-        }
-        got = sysmem_pread_all(fd, offset + done, chunk, want);
-        if (got < 0 || got == 0) {
-            return -LOAD_IO;
-        }
-        if (!sparc64_space_write_initial(&g->space, base + done, chunk,
-                (size_t)got)) {
-            return -LOAD_NOMEM;
-        }
-        done += (uint64_t)got;
-        if ((uint64_t)got < want) {
-            return -LOAD_IO;
-        }
-    }
-    return LOAD_OK;
-}
+/* File-backed range registry, truncate/resize handling, mremap
+ * coverage updates, and the Provider-A populate fill live in
+ * src/os/guest_run_sysmem_file.c (RC-U4 split); the shells below call
+ * in through these local externs. */
+extern void sysmem_file_note_map(void *context, uint64_t dev,
+    uint64_t ino, uint64_t file_offset, uint64_t base, uint64_t len,
+    unsigned prot, int is_private, const uint8_t *cstate,
+    size_t nchunk);
+extern void sysmem_file_drop_map(void *context, uint64_t base,
+    uint64_t len);
+extern void sysmem_file_remap_update(void *context, uint64_t old_base,
+    uint64_t old_len, uint64_t dest, uint64_t new_len);
+extern int sysmem_file_fill(void *context, int fd, uint64_t file_offset,
+    uint64_t base, uint64_t len, uint64_t file_size, int is_private,
+    uint8_t *cstate_out, size_t cstate_cap, size_t *nchunk_out);
+extern bool sysmem_file_bus_span(uint64_t file_offset, uint64_t len,
+    uint64_t file_size, uint64_t *bus_out, uint64_t *bus_len_out);
 
 long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
     unsigned prot, unsigned flags, int fd, uint64_t offset)
@@ -456,46 +289,70 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
         (void)vm64_stxn_commit(base, size);
         return (long)base;
     }
-    /* Short files leave a zero tail (fresh pages are zero-filled). */
-    if (len != 0U &&
-        sysmem_fill(g, fd, offset, base, len) == -LOAD_NOMEM) {
-        /* Host-op-first abort: roll the span back (zero net mutation)
-         * and drop any paired Soft-TLB coverage it may carry. */
-        (void)sparc64_space_unmap(&g->space, base, size);
-        sparc64_tlb_invalidate_gva(base, size);
-        vm64_stxn_abort();
-        return -ENOMEM;
-    }
-    /* Label the span for /proc/self/maps (L5a, best-effort):
-     * guest fds are host fds, so readlink the translator's own fd. */
-    {
-        char link[32];
-        char target[SPARC64RT_INTERP_PATH_MAX];
-        ssize_t got;
-        int wn = snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
-        if (wn > 0 && (size_t)wn < sizeof(link)) {
-            got = readlink(link, target, sizeof(target) - 1U);
-            if (got > 0) {
-                target[got] = '\0';
-                sparc64_guest_proc_note_map(g, base, base + size, target);
-            }
-        }
-    }
-    sparc64_tlb_invalidate_gva(base, size);
-    if (g->dbt != NULL) {
-        sparc64_dbt_invalidate(g->dbt, base, size);
-    }
-    /* RC-U4: beyond-EOF full 8 KiB pages fault (SIGBUS) instead of
-     * serving stale zeros: map them BUS and drop paired TLB coverage.
-     * Partial tail pages stay mapped (zero-filled by the fill above). */
+    /* RC-U4 #5: populate through vm_file_populate_segment (fresh-size
+     * aware) into a bounded 8 KiB staging buffer, then into the guest
+     * pages. Short files leave a zero tail and report LOAD_IO (the
+     * caller keeps the mapping); LOAD_NOMEM rolls the span back. */
     {
         struct stat st;
-        uint64_t fsize;
+        uint64_t fsize = UINT64_C(0xffffffffffffffff);
+        uint64_t fdev = UINT64_C(0);
+        uint64_t fino = UINT64_C(0);
+        bool have_reg = false;
         uint64_t bus;
         uint64_t bus_len;
+        /* Bounded per-8KiB-chunk state for the range entry; matches
+         * SYSMEM_FILERANGE_CHUNKS in the registry TU. */
+        uint8_t cstate[64];
+        size_t nchunk = 0u;
+        int is_private;
+        int frc;
         if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+            st.st_size >= 0 &&
             (uint64_t)st.st_size <= (uint64_t)INT64_MAX) {
             fsize = (uint64_t)st.st_size;
+            fdev = (uint64_t)st.st_dev;
+            fino = (uint64_t)st.st_ino;
+            have_reg = true;
+        }
+        is_private = ((flags & SYSMEM_MAP_PRIVATE) != 0U) ? 1 : 0;
+        frc = sysmem_file_fill(g, fd, offset, base, len, fsize,
+            is_private, cstate, sizeof(cstate), &nchunk);
+        if (frc == -LOAD_NOMEM) {
+            /* Host-op-first abort: roll the span back (zero net
+             * mutation) and drop any paired Soft-TLB coverage. */
+            (void)sparc64_space_unmap(&g->space, base, size);
+            sparc64_tlb_invalidate_gva(base, size);
+            vm64_stxn_abort();
+            return -ENOMEM;
+        }
+        /* Label the span for /proc/self/maps (L5a, best-effort):
+         * guest fds are host fds, so readlink the translator's own
+         * fd. */
+        {
+            char link[32];
+            char target[SPARC64RT_INTERP_PATH_MAX];
+            ssize_t got;
+            int wn = snprintf(link, sizeof(link), "/proc/self/fd/%d",
+                fd);
+            if (wn > 0 && (size_t)wn < sizeof(link)) {
+                got = readlink(link, target, sizeof(target) - 1U);
+                if (got > 0) {
+                    target[got] = '\0';
+                    sparc64_guest_proc_note_map(g, base, base + size,
+                        target);
+                }
+            }
+        }
+        sparc64_tlb_invalidate_gva(base, size);
+        if (g->dbt != NULL) {
+            sparc64_dbt_invalidate(g->dbt, base, size);
+        }
+        /* RC-U4: beyond-EOF full 8 KiB pages fault (SIGBUS) instead of
+         * serving stale zeros: map them BUS and drop paired TLB
+         * coverage. Partial tail pages stay mapped (zero-filled by the
+         * fill above). */
+        if (have_reg) {
             if (sysmem_file_bus_span(offset, size, fsize, &bus,
                     &bus_len)) {
                 uint64_t gbus = base + (bus - offset);
@@ -503,8 +360,8 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
                     prot & 7u, true);
                 sparc64_tlb_invalidate_gva(gbus, bus_len);
             }
-            sysmem_file_note_map(g, (uint64_t)st.st_dev,
-                (uint64_t)st.st_ino, offset, base, size, prot & 7u);
+            sysmem_file_note_map(g, fdev, fino, offset, base, size,
+                prot & 7u, is_private, cstate, nchunk);
         }
     }
     (void)vm64_stxn_commit(base, size);
@@ -756,6 +613,10 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
             old_addr + old_len >= g->brk_cur) {
             g->brk_cur = old_addr + new_len;
         }
+        /* RC-U4 #4: trim the tracked coverage to the shrunken length
+         * (the dropped tail must not receive truncate updates). */
+        sysmem_file_remap_update(g, old_addr, old_len, old_addr,
+            new_len);
         (void)vm64_stxn_commit(old_addr, old_len);
         return (long)old_addr;
     } else if (new_len > SPARC64_TASK_SIZE - (old_addr + old_len) ||
@@ -812,14 +673,11 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
         sparc64_dbt_invalidate(g->dbt, old_addr, old_len);
         sparc64_dbt_invalidate(g->dbt, dest, new_len);
     }
-    /* RC-U4: a moved file mapping keeps its (possibly BUS) pages, but
-     * the registry tracks guest VAs — drop overlapping records so a
-     * later truncate cannot BUS or restore the wrong addresses
-     * (moved mappings stop receiving truncate-driven updates). */
-    sysmem_file_drop_map(g, old_addr, old_len);
-    if (dest != old_addr) {
-        sysmem_file_drop_map(g, dest, new_len);
-    }
+    /* RC-U4 #4: a moved file mapping keeps its (possibly BUS) pages;
+     * rebase the tracked coverage to the destination (trimming past a
+     * shrunken length) so a later truncate still BUSes or restores the
+     * right addresses. Partial overlaps and replaced spans drop. */
+    sysmem_file_remap_update(g, old_addr, old_len, dest, new_len);
     if (old_addr != dest && old_addr >= g->brk_base &&
         old_addr < g->brk_cur && old_addr + old_len >= g->brk_cur) {
         g->brk_cur = dest + (g->brk_cur - old_addr);
