@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 
+#include "dbt/emit_mem.h"
 #include "dbt/emit_priv.h"
 
 
@@ -714,18 +715,18 @@ static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Loads/stores/atomics via the checked backend; faults replay. */
+/* Mem via the inline Soft-TLB fast path; refusals use the backend. */
 static bool e_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     size_t p_fault;
-    if (ec->mem == NULL) {
-        return false;
+    if (ec->mem == NULL || !sparc64_mem_emit_site(ec->buf, d,
+        ec->fault_pc, ec->delay == d)) {
+        p_fault = (ec->mem == NULL) ? SPARC64_DBT_NOPOS : e_call_mem(ec, d);
+        if (p_fault == SPARC64_DBT_NOPOS) {
+            return false;
+        }
+        e_resolve_fault(ec, p_fault);
     }
-    p_fault = e_call_mem(ec, d);
-    if (p_fault == SPARC64_DBT_NOPOS) {
-        return false;
-    }
-    e_resolve_fault(ec, p_fault);
     return !ec->buf->overflow;
 }
 

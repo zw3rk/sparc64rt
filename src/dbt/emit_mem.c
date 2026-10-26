@@ -12,8 +12,11 @@
 
 #include "dbt/emit_mem.h"
 
+#include <string.h>
+
 #include "dbt/emit_priv.h"
 #include "dbt/mem_sites.h"
+#include "interp/interp.h"
 
 /* No-edge sentinel: matches SPARC64_DBT_NOPOS ((size_t)-1). */
 #define MEM_NO_EDGE ((size_t)-1)
@@ -307,18 +310,59 @@ size_t sparc64_mem_emit_atomic_edge(struct sparc64_dbt_buf *b)
     return miss;
 }
 
+/* Fixed 4-word movz/movk materialization (unlike the variable-length
+ * sb_mov_imm64) so the block-record address baked by the tail can be
+ * patched after the record slot is carved. Never touches x18. */
+static size_t mem_mov_imm64_fixed(sparc64_dbt_buf_t *b, unsigned rd,
+    uint64_t v)
+{
+    size_t at = b->count;
+    unsigned hw;
+    sb_word(b, UINT32_C(0xd2800000) | ((0U & 3U) << 21) |
+        ((((uint32_t)(v & UINT64_C(0xffff))) << 5) | (rd & 31U)));
+    for (hw = 1U; hw < 4U; hw++) {
+        uint32_t half = (uint32_t)((v >> (hw * 16U)) & UINT64_C(0xffff));
+        sb_word(b, UINT32_C(0xf2800000) | ((hw & 3U) << 21) |
+            (half << 5) | (rd & 31U));
+    }
+    return at;
+}
+
+/* Rewrite the 4 words at a mem_mov_imm64_fixed site in place. */
+static void mem_patch_imm64(sparc64_dbt_buf_t *b, size_t at, unsigned rd,
+    uint64_t v)
+{
+    unsigned hw;
+    if (b == NULL || at == SPARC64_DBT_NOPOS || at + 4U > b->count) {
+        if (b != NULL) {
+            b->overflow = true;
+        }
+        return;
+    }
+    b->words[at] = UINT32_C(0xd2800000) | ((0U & 3U) << 21) |
+        ((((uint32_t)(v & UINT64_C(0xffff))) << 5) | (rd & 31U));
+    for (hw = 1U; hw < 4U; hw++) {
+        uint32_t half = (uint32_t)((v >> (hw * 16U)) & UINT64_C(0xffff));
+        b->words[at + (size_t)hw] = UINT32_C(0xf2800000) |
+            ((hw & 3U) << 21) | (half << 5) | (rd & 31U);
+    }
+}
+
 /* Shared per-block miss trampoline. Entry: x1 = gva, x0 = value
  * (stores), w4 = site index. Preserves the CCR cached in NZCV across
  * the C slow path, then resumes at the helper's address or exits for
  * dispatcher replay. x30 (the trampoline return) is spilled across
- * the BLR; x29 is untouched. */
+ * the BLR; x29 is untouched. The x3 record address is a fixed-width
+ * placeholder until the tail carves the record and patches it. */
 static bool mem_emit_common(struct sparc64_dbt_buf *b,
-    const sparc64_mem_block_t *blk, size_t *b_patches, uint32_t n)
+    const sparc64_mem_block_t *blk, size_t *b_patches, uint32_t n,
+    size_t *blk_patch_out)
 {
     size_t common;
     size_t miss_cbz;
+    size_t blk_patch;
     uint32_t i;
-    if (blk == NULL) {
+    if (blk == NULL || blk_patch_out == NULL) {
         return false;
     }
     common = b->count;
@@ -327,7 +371,11 @@ static bool mem_emit_common(struct sparc64_dbt_buf *b,
     sb_push64(b, 30U);
     sb_mov_reg(b, true, 2U, 0U); /* val */
     sb_mov_reg(b, true, 0U, 19U); /* ctx */
-    sb_mov_imm64(b, 3U, (uint64_t)(uintptr_t)blk);
+    blk_patch = mem_mov_imm64_fixed(b, 3U, UINT64_C(0));
+    if (blk_patch == SPARC64_DBT_NOPOS) {
+        return false;
+    }
+    *blk_patch_out = blk_patch;
     sb_mov_imm64(b, 6U, (uint64_t)(uintptr_t)&sparc64_mem_miss);
     sb_blr(b, 6U); /* x0 = resume address or NULL */
     sb_pop64(b, 30U);
@@ -359,13 +407,20 @@ bool sparc64_mem_emit_tail(struct sparc64_dbt_buf *b,
     const sparc64_mem_block_t *blk, const size_t *edges, uint32_t n)
 {
     size_t *b_patches;
+    size_t blk_patch = SPARC64_DBT_NOPOS;
     uint32_t i;
+    uint32_t j;
+    uint64_t base;
+    uint64_t slot_addr;
+    size_t slot_off;
+    size_t need;
+    sparc64_mem_block_t *slot;
     /* VLA-free scratch: blocks hold at most 64 sites (one per insn);
      * refuse larger tables instead of growing the stack frame. */
     size_t patches[SPARC64_DBT_MAX_SITES_PER_BLOCK];
     if (b == NULL || blk == NULL || edges == NULL || n == 0U ||
         n > SPARC64_DBT_MAX_SITES_PER_BLOCK ||
-        blk->n_sites != n) {
+        blk->n_sites != n || b->words == NULL) {
         return false;
     }
     b_patches = patches;
@@ -383,5 +438,214 @@ bool sparc64_mem_emit_tail(struct sparc64_dbt_buf *b,
         }
         (void)stub;
     }
-    return mem_emit_common(b, blk, b_patches, n);
+    if (!mem_emit_common(b, blk, b_patches, n, &blk_patch)) {
+        return false;
+    }
+    /* Carve the record from the same buffer at the next 8-byte boundary
+     * past the emitted code: the slot address is absolute (the arena
+     * base may sit 4-misaligned after a code-only commit), and the
+     * tail size rounds up to 8 so the next block keeps 4-byte code
+     * alignment. Lifetime follows the block: recycle and retranslate
+     * drop the code and the record together. */
+    base = (uint64_t)(uintptr_t)b->words;
+    slot_addr = (base + (uint64_t)b->count * 4U + UINT64_C(7)) &
+        ~(uint64_t)UINT64_C(7);
+    need = ((uint64_t)sizeof(*slot) +
+        (uint64_t)n * (uint64_t)sizeof(slot->sites[0]) +
+        UINT64_C(7)) & ~(uint64_t)UINT64_C(7);
+    if (slot_addr + need > base + (uint64_t)b->capacity * 4U) {
+        b->overflow = true;
+        return false;
+    }
+    slot_off = (size_t)((slot_addr - base) / 4U);
+    slot = (sparc64_mem_block_t *)(void *)&b->words[slot_off];
+    slot->mem = blk->mem;
+    slot->mc = blk->mc;
+    slot->guest_pc_base = blk->guest_pc_base;
+    slot->rx_base = base;
+    slot->n_sites = n;
+    for (j = 0U; j < n; j++) {
+        slot->sites[j] = blk->sites[j];
+    }
+    mem_patch_imm64(b, blk_patch, 3U, slot_addr);
+    b->count = (size_t)((slot_addr + need - base) / 4U);
+    return !b->overflow;
+}
+
+/* ---- integer-emitter fast-path sites (Lane A1) ----------------------
+ * Per-block accumulator plus the single-access plain-ASI wiring used
+ * by e_emit_mem. Register plan: x1 = gva in, x0 = store value in,
+ * x9 (ES0) = load destination out; the fast path owns x2-x4. Only
+ * adds/movs/ldrs/strs run before the check, so host NZCV (which
+ * caches guest CCR) is never disturbed. */
+
+/* Map a decoded integer access onto the fast path. Twin-word (LDD/STD),
+ * alternate-ASI (*A), FSR, and atomic forms decline: the caller falls
+ * back to the checked helper, which replays them bit-identically. */
+static bool mem_classify_site(const sparc64_dec_t *d, bool *is_store,
+    unsigned *width, bool *is_signed)
+{
+    if (d == NULL || is_store == NULL || width == NULL ||
+        is_signed == NULL) {
+        return false;
+    }
+    if (d->asi != 0U || d->regasi != 0U) {
+        return false;
+    }
+    switch (d->op3) {
+    case SPARC64_OP3_LDUW:
+        *is_store = false;
+        *width = 4U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_LDUB:
+        *is_store = false;
+        *width = 1U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_LDUH:
+        *is_store = false;
+        *width = 2U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_LDSW:
+        *is_store = false;
+        *width = 4U;
+        *is_signed = true;
+        return true;
+    case SPARC64_OP3_LDSB:
+        *is_store = false;
+        *width = 1U;
+        *is_signed = true;
+        return true;
+    case SPARC64_OP3_LDSH:
+        *is_store = false;
+        *width = 2U;
+        *is_signed = true;
+        return true;
+    case SPARC64_OP3_LDX:
+        *is_store = false;
+        *width = 8U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_STW:
+        *is_store = true;
+        *width = 4U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_STB:
+        *is_store = true;
+        *width = 1U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_STH:
+        *is_store = true;
+        *width = 2U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_STX:
+        *is_store = true;
+        *width = 8U;
+        *is_signed = false;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Per-block accumulator: reset by block_begin, appended by emit_site,
+ * consumed by block_end. Bounds match the tail's 64-site static
+ * scratch, so no heap lives across sites. */
+static sparc64_mem_site_t
+    acc_sites[SPARC64_DBT_MAX_SITES_PER_BLOCK];
+static size_t acc_edges[SPARC64_DBT_MAX_SITES_PER_BLOCK];
+static uint64_t acc_base;
+static uint32_t acc_n;
+
+bool sparc64_mem_emit_site(struct sparc64_dbt_buf *b,
+    const sparc64_dec_t *d, uint64_t fault_pc, bool in_delay)
+{
+    bool is_store = false;
+    unsigned width = 0U;
+    bool is_signed = false;
+    size_t miss;
+    uint32_t idx;
+    if (b == NULL || d == NULL) {
+        return false;
+    }
+    if (!mem_classify_site(d, &is_store, &width, &is_signed)) {
+        return false;
+    }
+    if (acc_n >= SPARC64_DBT_MAX_SITES_PER_BLOCK) {
+        return false;
+    }
+    if (is_store) {
+        e_ld64(b, 0U, d->rd);
+    }
+    e_ld64(b, 1U, d->rs1);
+    e_src2(b, ES1, d);
+    sb_add_reg(b, true, false, 1U, 1U, ES1);
+    idx = acc_n;
+    miss = sparc64_mem_emit_fast(b, is_store, width, is_signed, ES0,
+        &acc_sites[idx]);
+    if (miss == MEM_NO_EDGE) {
+        return false;
+    }
+    acc_edges[idx] = miss;
+    acc_sites[idx].guest_pc_delta = (uint16_t)(fault_pc - acc_base);
+    acc_sites[idx].npc_delta = 0;
+    acc_sites[idx].insn_word = d->raw;
+    acc_sites[idx].sp_rollback_delta = 0;
+    acc_sites[idx].npc_mode = (uint8_t)SPARC64_NPC_SEQUENTIAL;
+    acc_sites[idx].width = (uint8_t)width;
+    acc_sites[idx].flags = (uint8_t)((is_store ?
+        (unsigned)SPARC64_MEM_F_STORE : 0U) |
+        (in_delay ? (unsigned)SPARC64_MEM_F_IN_DELAY_SLOT : 0U) |
+        (unsigned)SPARC64_MEM_F_BE);
+    acc_sites[idx].val_or_dst_reg = (uint8_t)(d->rd & 31U);
+    acc_sites[idx].addr_base_reg = (uint8_t)(d->rs1 & 31U);
+    acc_sites[idx].reserved = 0U;
+    acc_n = idx + 1U;
+    if (!is_store) {
+        e_st64(b, d->rd, ES0);
+        /* Resume past the writeback: the miss path lands here with
+         * ctx->r[rd] already updated by the interpreter replay. */
+        acc_sites[idx].cont_insn_offset =
+            (uint16_t)((size_t)b->count * 4U);
+    }
+    return !b->overflow;
+}
+
+void sparc64_mem_block_begin(uint64_t guest_base)
+{
+    acc_base = guest_base;
+    acc_n = 0U;
+}
+
+bool sparc64_mem_block_end(struct sparc64_dbt_buf *b,
+    const sparc64_mem_ops_t *mem, void *mc)
+{
+    sparc64_mem_block_t *tmp;
+    bool ok;
+    if (b == NULL) {
+        return false;
+    }
+    if (acc_n == 0U) {
+        return true;
+    }
+    if (mem == NULL || acc_n > SPARC64_DBT_MAX_SITES_PER_BLOCK ||
+        b->words == NULL) {
+        return false;
+    }
+    tmp = sparc64_mem_block_alloc(mem, mc, acc_base,
+        (uint64_t)(uintptr_t)b->words, acc_n);
+    if (tmp == NULL) {
+        return false;
+    }
+    (void)memcpy(tmp->sites, acc_sites,
+        (size_t)acc_n * sizeof(acc_sites[0]));
+    ok = sparc64_mem_emit_tail(b, tmp, acc_edges, acc_n);
+    sparc64_mem_block_free(tmp);
+    acc_n = 0U;
+    return ok;
 }

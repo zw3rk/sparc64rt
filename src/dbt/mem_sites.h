@@ -56,6 +56,15 @@ extern sparc64_tlb_entry_t sparc64_dbt_tlb[SPARC64_TLB_SIZE];
 /* Mark every entry invalid. Must run once before translated code runs. */
 void sparc64_tlb_init(void);
 
+/* Publish one 4 KiB entry: tag is (gva & ~0xFFF), addend is
+ * host_page_base - (gva & ~0xFFF). Readable/writable select which tags
+ * go live (the other stays ~0ULL); addend is stored whenever either
+ * is set. A no-permission call (both false) leaves the entry invalid.
+ * The miss helper calls this after a successful interpreter replay so
+ * later accesses to the page hit the inline fast path. */
+void sparc64_tlb_fill(uint64_t gva, uintptr_t addend, bool readable,
+    bool writable);
+
 /* Drop coverage of [gva, gva + len): under 512 pages invalidate exactly
  * those indices, otherwise clear the whole table (Rev 4 section 4.5). */
 void sparc64_tlb_invalidate_gva(uint64_t gva, uint64_t len);
