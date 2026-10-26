@@ -71,6 +71,10 @@ static uint64_t sysmem_align_up(uint64_t v, uint64_t a)
 }
 
 /* ---- sparc64_syscall_mem_t read/write helpers over the same space ------ */
+/* File-range COW promotion (guest_run_sysmem_file.c). */
+extern void sysmem_file_note_write(void *context, uint64_t base,
+    uint64_t len);
+
 bool sparc64_sysmem_read(void *context, uint64_t va, void *host,
     uint64_t len)
 {
@@ -89,7 +93,13 @@ bool sparc64_sysmem_write(void *context, uint64_t va, const void *host,
     if (g == NULL || (len != 0U && host == NULL) || len == 0U) {
         return g != NULL;
     }
-    return sparc64_space_write(&g->space, va, host, (size_t)len);
+    if (!sparc64_space_write(&g->space, va, host, (size_t)len)) {
+        return false;
+    }
+    /* RC-U4 #5: syscall copyout (read/recv into guest buffers) dirties
+     * file pages exactly like guest stores do. */
+    sysmem_file_note_write(g, va, len);
+    return true;
 }
 
 bool sparc64_sysmem_prepare_write(void *context, uint64_t va, uint64_t len)
@@ -675,8 +685,10 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     }
     /* RC-U4 #4: a moved file mapping keeps its (possibly BUS) pages;
      * rebase the tracked coverage to the destination (trimming past a
-     * shrunken length) so a later truncate still BUSes or restores the
-     * right addresses. Partial overlaps and replaced spans drop. */
+     * shrunken length, covering an extension tail) so a later truncate
+     * still BUSes or restores the right addresses. Straddlers split
+     * (unmoved head/tail stay, the middle moves); replaced destination
+     * spans excise the same split-aware way. */
     sysmem_file_remap_update(g, old_addr, old_len, dest, new_len);
     if (old_addr != dest && old_addr >= g->brk_base &&
         old_addr < g->brk_cur && old_addr + old_len >= g->brk_cur) {

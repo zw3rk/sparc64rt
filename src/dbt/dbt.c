@@ -359,16 +359,21 @@ fail:
     return NULL;
 }
 
+/* RC-U4 A1 continuation snapshot (see mem_sites.h): the pre-effect
+ * JMPL/RETURN target stashed by the emitted fragment. Zero until the
+ * first stashing fragment runs; only read for JMPL/RETURN dst below. */
+uint64_t sparc64_dbt_cti_target = UINT64_C(0);
+
 /* Delay-slot fault continuation (RC-U4 A1): a Soft-TLB miss inside a
  * CTI delay slot reports exit_dest at the CTI (the precise fault PC)
  * while the replayed instruction lives at dst + 4. Replaying the CTI
  * itself would re-execute already-committed transfer effects (for
  * RETURN the register window restore would run twice), so replay the
  * delay slot instead, with the npc the branch continuation needs: the
- * static target for CALL and direct branches, the register-derived
- * target for JMPL/RETURN, the fall-through for a not-taken conditional.
- * A taken branch therefore resumes at its target instead of
- * sequentially past the delay slot. Returns false for non-CTI
+ * static target for CALL and direct branches, the stashed pre-effect
+ * target for JMPL/RETURN, the fall-through for a not-taken
+ * conditional. A taken branch therefore resumes at its target instead
+ * of sequentially past the delay slot. Returns false for non-CTI
  * destinations (sequential replay), undecodable words, annulled-away
  * delays, and misaligned dynamic targets; the caller then replays from
  * dst with npc = dst + 4 exactly like before. */
@@ -391,8 +396,12 @@ static bool dbt_delay_continuation(const sparc64_mem_ops_t *mem, void *mc,
         break;
     case SPARC64_ICLS_JMPL:
     case SPARC64_ICLS_RETURN:
-        target = ctx->r[d.rs1] +
-            ((d.is_imm != 0U) ? (uint64_t)d.imm : ctx->r[d.rs2]);
+        /* RC-U4 A1: the fragment stashed the pre-effect target before
+         * the delay slot ran. Recomputing from current registers would
+         * read post-CTI state: the JMPL rd write has committed (wrong
+         * when rd aliases rs1/rs2) and RETURN has restored the window
+         * (windowed operands now address the wrong set). */
+        target = sparc64_dbt_cti_target;
         if ((target & UINT64_C(3)) != UINT64_C(0)) {
             return false;
         }

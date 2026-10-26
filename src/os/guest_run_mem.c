@@ -18,6 +18,11 @@
 #include "os/guest_run_priv.h"
 #include "os/mem_space.h"
 
+/* File-range COW promotion (guest_run_sysmem_file.c): mirrors the
+ * substrate's private_cow promotion in the per-chunk registry states. */
+extern void sysmem_file_note_write(void *context, uint64_t base,
+    uint64_t len);
+
 /* ---- sparc64_mem_ops_t bridge over the rt64 substrate ------------------- */
 static void record_fault(const guest_state_t *g, sparc64_mem_fault_t *fault)
 {
@@ -66,6 +71,10 @@ static bool guest_mem_write(void *context, uint64_t address,
         }
         return false;
     }
+    /* RC-U4 #5: a successful guest write promotes overlapping tracked
+     * COW_CLEAN chunks (covers interp, DBT slow-path, and difftest;
+     * the DBT fast path never reaches file pages). */
+    sysmem_file_note_write(g, address, (uint64_t)size);
     return true;
 }
 
@@ -81,6 +90,13 @@ static bool guest_mem_atomic(void *context,
             record_fault(g, fault);
         }
         return false;
+    }
+    /* RC-U4 #5: mutating atomics promote like writes (LR only reads;
+     * a failed SC writes nothing, mirroring the substrate). */
+    if (request->op != SPARC64_ATOMIC_LR &&
+        (request->op != SPARC64_ATOMIC_SC || result->sc_success)) {
+        sysmem_file_note_write(g, request->address,
+            (uint64_t)request->width);
     }
     return true;
 }

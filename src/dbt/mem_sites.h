@@ -53,6 +53,19 @@ _Static_assert(sizeof(sparc64_tlb_entry_t) == 32,
  * sparc64_tlb_init, since BSS zeroes would read as tag 0). */
 extern sparc64_tlb_entry_t sparc64_dbt_tlb[SPARC64_TLB_SIZE];
 
+/* RC-U4 A1: original JMPL/RETURN continuation snapshot. Generated code
+ * (e_emit_jmpl_ret) stores the pre-effect branch target here before the
+ * delay slot runs, and the dispatcher (dbt_delay_continuation) reads it
+ * back instead of recomputing the target from post-CTI registers (the
+ * rd write and, for RETURN, the window restore have already committed
+ * when a delay-slot miss exits). Written and read by the same worker
+ * thread under the big guest lock, so no slot array is needed; the
+ * value is only meaningful on a delay-slot miss exit whose exit_dest
+ * decodes as JMPL/RETURN (every such exit executes the storing
+ * fragment first). Baked as an absolute mov64 like the helper
+ * addresses (see emit_mem.h): the AOT writer lane must relocate it. */
+extern uint64_t sparc64_dbt_cti_target;
+
 /* Mark every entry invalid. Must run once before translated code runs. */
 void sparc64_tlb_init(void);
 
@@ -72,7 +85,7 @@ void sparc64_tlb_invalidate_gva(uint64_t gva, uint64_t len);
 /* How guest npc is recovered for a faulting site. SEQUENTIAL covers
  * plain loads/stores; STATIC_TARGET covers CTI delay slots with a fixed
  * target; DYNAMIC_CTX covers JMPL/RETURN delay slots whose target the
- * block re-derives from registers (emit_int.c delay handling). */
+ * dispatcher reads from the sparc64_dbt_cti_target snapshot above. */
 typedef enum {
     SPARC64_NPC_SEQUENTIAL = 0,
     SPARC64_NPC_STATIC_TARGET = 1,

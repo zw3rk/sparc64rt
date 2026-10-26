@@ -620,14 +620,10 @@ static bool e_emit_jmpl_ret(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_misaligned;
     size_t p_fault;
-    if (is_ret) {
-        if (ec->delay != NULL && (ec->delay->cls == SPARC64_ICLS_SAVE
-            || ec->delay->cls == SPARC64_ICLS_RESTORE)) {
-            return false;
-        }
-        if (ec->mem == NULL) {
-            return false;
-        }
+    if (is_ret && (ec->mem == NULL || (ec->delay != NULL &&
+            (ec->delay->cls == SPARC64_ICLS_SAVE ||
+            ec->delay->cls == SPARC64_ICLS_RESTORE)))) {
+        return false;
     }
     if (!e_delay_plain(ec)) {
         return false;
@@ -635,6 +631,9 @@ static bool e_emit_jmpl_ret(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     e_ld64(b, ES0, d->rs1);
     e_src2(b, ES1, d);
     sb_add_reg(b, true, false, ES0, ES0, ES1);
+    /* A1: stash the pre-effect target (dispatcher delay replay). */
+    sb_mov_imm64(b, ES2, (uint64_t)(uintptr_t)&sparc64_dbt_cti_target);
+    sb_ldst_imm(b, false, true, ES0, ES2, 0U);
     sb_ubfm(b, false, ES1, ES0, 0U, 1U);
     p_misaligned = sb_cbz_placeholder(b, false, true, ES1);
     if (!is_ret) {
