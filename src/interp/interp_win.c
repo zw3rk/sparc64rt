@@ -402,17 +402,17 @@ static unsigned cc_sub(unsigned width, uint64_t a, uint64_t b, unsigned bin,
     return nz;
 }
 
-/* MULcc shared tail (H3 oracle probes vs qemu-sparc64): rd keeps the
- * full product; Y the high 32 bits; icc N/Z from the low 32 bits,
- * xcc N/Z from the full 64 bits; C is 0. V keeps the pre-existing
- * rule (oracle reports V=0 on overflow; left for the coordinator,
- * see docs/h3-coremark.md). */
+/* MULcc shared tail (oracle probes vs qemu-sparc64, coordinator
+ * ruling on the H3 V-on-overflow open item): 32-bit operands, so the
+ * 64-bit product always fits — V (64-bit overflow) never sets, and
+ * the oracle reports V=0 on every probe including 41-bit products.
+ * rd keeps the full product; Y the high 32 bits (product<63:32>);
+ * icc N/Z from the low 32 bits, xcc N/Z from the full 64 bits; C 0. */
 static void mulcc_tail(sparc64_ctx_t *ctx, unsigned rd, uint32_t lo,
-    uint64_t prod, bool is_signed)
+    uint64_t prod)
 {
     unsigned icc = 0U;
     unsigned xcc = 0U;
-    bool v;
     if ((lo & UINT32_C(0x80000000)) != UINT32_C(0)) {
         icc |= 8U;
     }
@@ -424,14 +424,6 @@ static void mulcc_tail(sparc64_ctx_t *ctx, unsigned rd, uint32_t lo,
     }
     if (prod == UINT64_C(0)) {
         xcc |= 4U;
-    }
-    if (is_signed) {
-        v = (int64_t)prod != (int64_t)(int32_t)lo;
-    } else {
-        v = prod > (uint64_t)UINT32_C(0xFFFFFFFF);
-    }
-    if (v) {
-        icc |= 2U;
     }
     ctx->y = (uint32_t)(prod >> 32);
     sparc64_cc_set(ctx, icc, xcc);
@@ -615,13 +607,13 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         return sparc64_step_ok(pc);
     case SPARC64_OP3_UMULCC: {
         uint64_t p = (uint64_t)(uint32_t)a * (uint64_t)(uint32_t)b;
-        mulcc_tail(cpu, d->rd, (uint32_t)p, p, false);
+        mulcc_tail(cpu, d->rd, (uint32_t)p, p);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_SMULCC: {
         int64_t p = (int64_t)(int32_t)(uint32_t)a *
             (int64_t)(int32_t)(uint32_t)b;
-        mulcc_tail(cpu, d->rd, (uint32_t)(uint64_t)p, (uint64_t)p, true);
+        mulcc_tail(cpu, d->rd, (uint32_t)(uint64_t)p, (uint64_t)p);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_UDIVCC: {

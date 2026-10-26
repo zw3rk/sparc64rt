@@ -237,6 +237,12 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
     if ((prot & ~7U) != 0U) {
         return -EINVAL;
     }
+    /* W^X (H1, coordinator ruling): WX is deliberately NOT refused.
+     * The platform toolchain emits RWE DSO LOADs (even libc.so.6 has
+     * one, with BSS zero-fill), so refusing WX breaks all dynamic
+     * loading; Linux and qemu-user both allow it. Host W^X still
+     * holds: guest pages are heap-backed data the host never
+     * executes. The H1 guest records WX as SKIP on allow. */
     if (((flags & (GUEST_MAP_PRIVATE | GUEST_MAP_SHARED)) == 0U) ||
         ((flags & (GUEST_MAP_PRIVATE | GUEST_MAP_SHARED)) ==
          (GUEST_MAP_PRIVATE | GUEST_MAP_SHARED))) {

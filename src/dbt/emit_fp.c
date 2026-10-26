@@ -123,7 +123,8 @@ static inline void fp_st_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned field)
 
 /* Rounding guard prologue: FSR.RD (bits 31:30) must be 0
  * (round-to-nearest, the host FPCR default); nonzero exits UNDEF so the
- * dispatcher replays the instruction with the reference interpreter. */
+ * dispatcher replays the instruction with the reference interpreter.
+ * Also clears host FPSR so fp_sync_fsr observes only this op's flags. */
 static bool fp_guard_rd0(sparc64_emit_ctx_t *ec)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -136,6 +137,34 @@ static bool fp_guard_rd0(sparc64_emit_ctx_t *ec)
     }
     e_fault_here(b, ec->fault_pc);
     sb_patch_cb(b, p_ok, b->count);
+    sb_word(b, UINT32_C(0xd51b443f)); /* msr FPSR, xzr */
+    return !b->overflow;
+}
+
+static void fp_clear_cexc(sparc64_dbt_buf_t *b)
+{
+    sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
+    sb_word(b, UINT32_C(0x927be800) | ((ES3 & 31U) << 5) | (ES3 & 31U));
+    sb_ldst_imm(b, true, false, ES3, ECTX, FP_FSR_OFF);
+}
+
+/* If the host FP op raised any IEEE exception (IOC|DZC|OFC|UFC|IXC in
+ * FPSR[4:0]), exit UNDEF before writing the destination register so the
+ * interpreter replays the instruction and sets FSR.cexc/aexc/TEM traps
+ * identically to the oracle; otherwise clear FSR.cexc (bits 4:0). */
+static bool fp_sync_fsr(sparc64_emit_ctx_t *ec)
+{
+    sparc64_dbt_buf_t *b = ec->buf;
+    size_t p_ok;
+    sb_word(b, UINT32_C(0xd53b4420) | (ES3 & 31U)); /* mrs ES3, FPSR */
+    sb_ubfm(b, true, ES3, ES3, 0U, 4U);
+    p_ok = sb_cbz_placeholder(b, true, false, ES3);
+    if (p_ok == SPARC64_DBT_NOPOS) {
+        return false;
+    }
+    e_fault_here(b, ec->fault_pc);
+    sb_patch_cb(b, p_ok, b->count);
+    fp_clear_cexc(b);
     return !b->overflow;
 }
 
@@ -179,7 +208,7 @@ static bool fp_emit_arith(sparc64_emit_ctx_t *ec, uint32_t base,
         fp_ld_d(b, 0U, rs1);
         fp_ld_d(b, 1U, rs2);
         fp_alu(b, base, 2U, 0U, 1U);
-        if (!fp_nan_check(ec, true, 2U)) {
+        if (!fp_nan_check(ec, true, 2U) || !fp_sync_fsr(ec)) {
             return false;
         }
         fp_st_d(b, 2U, rd);
@@ -187,7 +216,7 @@ static bool fp_emit_arith(sparc64_emit_ctx_t *ec, uint32_t base,
         fp_ld_s(b, 0U, rs1);
         fp_ld_s(b, 1U, rs2);
         fp_alu(b, base, 2U, 0U, 1U);
-        if (!fp_nan_check(ec, false, 2U)) {
+        if (!fp_nan_check(ec, false, 2U) || !fp_sync_fsr(ec)) {
             return false;
         }
         fp_st_s(b, 2U, rd);
@@ -209,14 +238,14 @@ static bool fp_emit_sqrt(sparc64_emit_ctx_t *ec, uint32_t base,
     if (is_double) {
         fp_ld_d(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
-        if (!fp_nan_check(ec, true, 1U)) {
+        if (!fp_nan_check(ec, true, 1U) || !fp_sync_fsr(ec)) {
             return false;
         }
         fp_st_d(b, 1U, rd);
     } else {
         fp_ld_s(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
-        if (!fp_nan_check(ec, false, 1U)) {
+        if (!fp_nan_check(ec, false, 1U) || !fp_sync_fsr(ec)) {
             return false;
         }
         fp_st_s(b, 1U, rd);
@@ -238,6 +267,7 @@ static bool fp_emit_mov(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         fp_ld_s(b, 0U, rs2);
         fp_st_s(b, 0U, rd);
     }
+    fp_clear_cexc(b);
     return !b->overflow;
 }
 
@@ -257,6 +287,7 @@ static bool fp_emit_unary(sparc64_emit_ctx_t *ec, uint32_t base,
         fp_alu(b, base, 1U, 0U, 0U);
         fp_st_s(b, 1U, rd);
     }
+    fp_clear_cexc(b);
     return !b->overflow;
 }
 
@@ -282,6 +313,9 @@ static bool fp_emit_f2i(sparc64_emit_ctx_t *ec, uint32_t base,
         return false;
     }
     fp_alu(b, base, ES1, 0U, 0U);
+    if (!fp_sync_fsr(ec)) {
+        return false;
+    }
     if (to_64) {
         fp_alu(b, FP_FMOV_D_X, ES1, ES1, 0U);
         fp_st_d(b, ES1, rd);
@@ -308,6 +342,9 @@ static bool fp_emit_i2f(sparc64_emit_ctx_t *ec, uint32_t base,
     fp_ld_s(b, 0U, rs2);
     fp_alu(b, FP_FMOV_W_S, ES0, 0U, 0U);
     fp_alu(b, base, 0U, ES0, 0U);
+    if (!fp_sync_fsr(ec)) {
+        return false;
+    }
     if (to_double) {
         fp_st_d(b, 0U, rd);
     } else {
@@ -330,6 +367,9 @@ static bool fp_emit_x2f(sparc64_emit_ctx_t *ec, uint32_t base,
     fp_ld_d(b, 0U, rs2);
     fp_alu(b, FP_FMOV_X_D, ES0, 0U, 0U);
     fp_alu(b, base, 0U, ES0, 0U);
+    if (!fp_sync_fsr(ec)) {
+        return false;
+    }
     if (to_double) {
         fp_st_d(b, 0U, rd);
     } else {
@@ -354,6 +394,9 @@ static bool fp_emit_f2f(sparc64_emit_ctx_t *ec, uint32_t base,
             return false;
         }
         fp_alu(b, base, 1U, 0U, 0U);
+        if (!fp_sync_fsr(ec)) {
+            return false;
+        }
         fp_st_s(b, 1U, rd);
     } else {
         fp_ld_s(b, 0U, rs2);
@@ -361,6 +404,9 @@ static bool fp_emit_f2f(sparc64_emit_ctx_t *ec, uint32_t base,
             return false;
         }
         fp_alu(b, base, 1U, 0U, 0U);
+        if (!fp_sync_fsr(ec)) {
+            return false;
+        }
         fp_st_d(b, 1U, rd);
     }
     return !b->overflow;
