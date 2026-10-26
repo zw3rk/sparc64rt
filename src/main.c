@@ -14,7 +14,7 @@
 #include <string.h>
 
 #include "os/guest_run.h"
-#include "runtime/host_contract.h"
+#include "os/host_contract.h"
 
 int main(int argc, char **argv)
 {
