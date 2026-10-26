@@ -278,6 +278,9 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
                 if (!mem->read(mem->context, base + done, chunk, want)) {
                     return (total != 0U) ? (long)total : -EFAULT;
                 }
+                /* S2 hook point: host op runs first (Step 3); the
+                 * coordinator lands vm_file_commit_resize here (Step 4)
+                 * once the family table + truncate dispatch exist. */
                 got = write((int)fd, chunk, (size_t)want);
                 if (got <= 0) {
                     if (got == 0) {

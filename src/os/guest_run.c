@@ -37,6 +37,7 @@
 #include "os/guest_run_priv.h"
 #include "dbt/dbt.h"
 #include "dbt/difftest.h"
+#include "dbt/mem_sites.h"
 #include "os/sync_sig.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
@@ -221,6 +222,10 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
                         unsigned prot, unsigned flags, int fd,
                         uint64_t offset)
 {
+    /* Provider-A 6-step (lane S2): no live peer table on the big-lock
+     * engine, so the epoch-bump leg applies (space generation + DBT
+     * page versions advance below; no rt_host_preempt_worker peer).
+     * Space ops are transactional: failure leaves zero mutation. */
     guest_state_t *g = (guest_state_t *)context;
     uint64_t size;
     uint64_t base;
@@ -274,8 +279,11 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
             return -ENOMEM;
         }
         if ((flags & GUEST_MAP_ANONYMOUS) != 0U) {
+            /* Commit edge: publish done above; drop paired 4 KiB
+             * Soft-TLB entries (vpn, vpn^1) and the block range. */
+            sparc64_tlb_invalidate_gva(base, size);
             if (g->dbt != NULL) {
-                sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+                sparc64_dbt_invalidate(g->dbt, base, size);
             }
             return (long)base;
         }
@@ -283,7 +291,10 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
     /* Short files leave a zero tail (fresh pages are zero-filled). */
     if (len != 0U &&
         copy_from_fd(g, fd, offset, base, len) == -LOAD_NOMEM) {
+        /* Host-op-first abort: roll the span back (zero net mutation)
+         * and drop any paired Soft-TLB coverage it may carry. */
         (void)sparc64_space_unmap(&g->space, base, size);
+        sparc64_tlb_invalidate_gva(base, size);
         return -ENOMEM;
     }
     /* Label the span for /proc/self/maps (L5a, best-effort):
@@ -301,14 +312,17 @@ static long sysmem_mmap(void *context, uint64_t addr, uint64_t len,
             }
         }
     }
+    sparc64_tlb_invalidate_gva(base, size);
     if (g->dbt != NULL) {
-        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+        sparc64_dbt_invalidate(g->dbt, base, size);
     }
     return (long)base;
 }
 
 static long sysmem_munmap(void *context, uint64_t addr, uint64_t len)
 {
+    /* S2 6-step: unmap tolerates holes (no failure leg); commit then
+     * drops paired Soft-TLB entries and the block-cache range. */
     guest_state_t *g = (guest_state_t *)context;
     uint64_t base;
     uint64_t size;
@@ -330,8 +344,9 @@ static long sysmem_munmap(void *context, uint64_t addr, uint64_t len)
     }
     /* Tolerates holes like Linux; shrink the break when its tail goes. */
     (void)sparc64_space_unmap(&g->space, base, size);
+    sparc64_tlb_invalidate_gva(base, size);
     if (g->dbt != NULL) {
-        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+        sparc64_dbt_invalidate(g->dbt, base, size);
     }
     if (base >= g->brk_base && base < g->brk_cur &&
         base + size >= g->brk_cur) {
@@ -343,6 +358,8 @@ static long sysmem_munmap(void *context, uint64_t addr, uint64_t len)
 static long sysmem_mprotect(void *context, uint64_t addr, uint64_t len,
                             unsigned prot)
 {
+    /* S2 6-step: protect mutates nothing unless every page is mapped
+     * (zero-mutation abort otherwise); commit invalidates the span. */
     guest_state_t *g = (guest_state_t *)context;
     uint64_t size;
     if (g == NULL) {
@@ -362,8 +379,11 @@ static long sysmem_mprotect(void *context, uint64_t addr, uint64_t len,
     if (!sparc64_space_protect(&g->space, addr, size, prot & 7U)) {
         return -ENOMEM;
     }
+    /* Commit edge: permission change drops paired Soft-TLB entries
+     * (write-tag gating) and the block-cache range. */
+    sparc64_tlb_invalidate_gva(addr, size);
     if (g->dbt != NULL) {
-        sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+        sparc64_dbt_invalidate(g->dbt, addr, size);
     }
     return 0;
 }

@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "os/backend.h"
+
 /* ---- Linux errno values returned as negative codes ----------------------
  * Fixed Linux numbers (not host <errno.h>: identical on Linux and
  * Darwin for these codes, but the translator targets Linux ABI). */
@@ -102,6 +104,16 @@ typedef long (*vm64_host_op_fn)(void *op_ctx);
 /* Worker-preemption callback (tgkill(SIGRTMIN+1) on Linux,
  * pthread_kill(SIGUSR2) on Darwin). Returns 0 on success. */
 typedef int (*vm64_preempt_fn)(uint64_t host_tid, void *ctx);
+
+/* Lane S2 wire-up: default Step-2 preempt hook over the existing
+ * rt_host_* backend. The coordinator installs this as
+ * vm64_txn_t.preempt where a live peer table exists; single-threaded
+ * engines take the epoch-bump leg instead. No guest mapping, no x18. */
+int vm64_preempt_via_rt_host(uint64_t host_tid, void *ctx)
+{
+    (void)ctx;
+    return rt_host_preempt_worker(host_tid);
+}
 
 /* ---- 8 KiB alignment primitives ------------------------------------------ */
 
