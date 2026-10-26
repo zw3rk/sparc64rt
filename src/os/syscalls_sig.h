@@ -21,6 +21,18 @@
 #include <stdint.h>
 
 #include "core/cpu.h"
+
+/* macOS <sys/signal.h> (reached via <stdlib.h>) #defines sa_handler
+ * and sa_sigaction over the host union; the frozen guest
+ * sparc64_sigaction_t below needs those spellings as plain field
+ * names, so drop the macros here (no TU including this header uses
+ * the host struct sigaction). */
+#ifdef sa_handler
+#undef sa_handler
+#endif
+#ifdef sa_sigaction
+#undef sa_sigaction
+#endif
 #include "os/sigframe_sparc64rt.h"
 #include "os/syscalls_min.h"
 

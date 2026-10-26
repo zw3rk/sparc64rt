@@ -93,3 +93,50 @@ help: ## Show available targets
 	@echo "Targets:"
 	@grep -E '^[a-zA-Z0-9_-]+: .*## ' Makefile | \
 		sed 's/: .*## / — /'
+
+# ---- Darwin standalone (Lane S1) -------------------------------------------
+# Native macOS arm64 Mach-O link (clang -target arm64-apple-macos13):
+# every src/*.c except the Linux-only backend, plus the DBT trampoline.
+# safe_syscall_a64.S stays Linux-only and is excluded. -D_DARWIN_C_SOURCE
+# exposes the full <sys/resource.h> rusage and <unistd.h> mkdtemp that
+# the (frozen) host-contract TUs use.
+.PHONY: build-darwin
+
+DARWIN_CC ?= clang
+DARWIN_TARGET ?= arm64-apple-macos13
+# Frozen host-contract TUs carry Linux-only static helpers that are dead
+# code on Darwin; keep them warnings (not errors) without touching the
+# files or weakening -Werror elsewhere.
+DARWIN_CFLAGS := -O2 -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra \
+	-D_DARWIN_C_SOURCE -Wno-error=unused-function
+DARWIN_CPPFLAGS := -Isrc -Iinclude
+DARWIN_OBJ_DIR := $(BUILD_DIR)/darwin-obj
+DARWIN_BIN := $(BUILD_DIR)/sparc64rt-darwin-arm64
+DARWIN_C_SRCS := $(filter-out src/os/backend_linux.c,$(shell find src -name '*.c'))
+DARWIN_S_SRCS := src/dbt/trampoline_a64.S
+DARWIN_OBJS := $(patsubst src/%.c,$(DARWIN_OBJ_DIR)/%.o,$(DARWIN_C_SRCS)) \
+	$(patsubst src/%.S,$(DARWIN_OBJ_DIR)/%.o,$(DARWIN_S_SRCS))
+
+build-darwin: $(DARWIN_BIN) ## Link _build/sparc64rt-darwin-arm64 (native macOS arm64)
+
+# The DBT trampoline (src/dbt, coordinator-owned) defines its ELF entry
+# names without the Mach-O leading underscore; alias them at link time
+# so the C references resolve. Proper fix belongs in the trampoline
+# itself (underscore-prefixed globals under __APPLE__).
+DARWIN_LD_ALIASES := -Wl,-alias,sparc64_dbt_enter,_sparc64_dbt_enter \
+	-Wl,-alias,sparc64_dbt_enter_step,_sparc64_dbt_enter_step
+
+$(DARWIN_BIN): $(DARWIN_OBJS)
+	@mkdir -p $(dir $@)
+	$(DARWIN_CC) -target $(DARWIN_TARGET) $(DARWIN_OBJS) \
+		$(DARWIN_LD_ALIASES) -o $@
+
+$(DARWIN_OBJ_DIR)/%.o: src/%.c Makefile $(shell find src include -name '*.h')
+	@mkdir -p $(dir $@)
+	$(DARWIN_CC) -target $(DARWIN_TARGET) $(DARWIN_CFLAGS) \
+		$(DARWIN_CPPFLAGS) -c $< -o $@
+
+$(DARWIN_OBJ_DIR)/%.o: src/%.S Makefile $(shell find src include -name '*.h')
+	@mkdir -p $(dir $@)
+	$(DARWIN_CC) -target $(DARWIN_TARGET) $(DARWIN_CFLAGS) \
+		$(DARWIN_CPPFLAGS) -c $< -o $@
