@@ -227,12 +227,28 @@ static bool dbt_is_cti(const sparc64_dec_t *d)
 
 /* A delay slot is emittable only as a plain data/control op: a CTI,
  * Tcc, privileged, FPU, or illegal delay ends the block before the CTI
- * (the emitter refuses it and the interpreter replays both). */
+ * (the emitter refuses it and the interpreter replays both). SETHI
+ * (which covers nop) plus the no-op MEMBAR/FLUSH are accepted on top
+ * of the ALU/memory baseline: without SETHI, ordinary sethi/nop
+ * delay fillers silently force whole blocks into the interpreter
+ * fallback (H3: 78% of CoreMark block entries fell back for this
+ * reason alone). This list mirrors e_delay_is_plain in emit_int.c:
+ * SETHI covers nop fillers; SAVE/RESTORE are safe because JMPL now
+ * snapshots a register-indirect target before the delay slot instead
+ * of re-reading it after a window rotation (interp exec_cti order;
+ * the old recompute jumped into the wrong window on ret-with-
+ * restore). Keep the two lists in sync: any skew reintroduces
+ * silent fallback-or-divergence risk. */
 static bool dbt_delay_emittable(const sparc64_dec_t *d)
 {
     switch (d->cls) {
+    case SPARC64_ICLS_SETHI:
+    case SPARC64_ICLS_MEMBAR:
+    case SPARC64_ICLS_FLUSH:
     case SPARC64_ICLS_LOAD:
     case SPARC64_ICLS_STORE:
+    case SPARC64_ICLS_LDSTUB:
+    case SPARC64_ICLS_SWAP:
     case SPARC64_ICLS_ATOMIC:
     case SPARC64_ICLS_ALU:
     case SPARC64_ICLS_SHIFT:
@@ -241,6 +257,8 @@ static bool dbt_delay_emittable(const sparc64_dec_t *d)
     case SPARC64_ICLS_MOVCC:
     case SPARC64_ICLS_MOVR:
     case SPARC64_ICLS_ALIGN:
+    case SPARC64_ICLS_SAVE:
+    case SPARC64_ICLS_RESTORE:
         return true;
     default:
         return false;
@@ -314,6 +332,11 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
     if (buf.overflow) {
         goto fail;
     }
+    /* Commit only the emitted bytes: the 12KB stage is scratch, and
+     * keeping all of it per block fills the 4MB arena after ~341
+     * translations, after which every recycle drops all native code
+     * into interpreter replay (H3: ~79% of CoreMark entries). */
+    dbt->arena_used = used_before + (size_t)buf.count * 4U;
     return (const void *)stage;
 fail:
     dbt->arena_used = used_before;

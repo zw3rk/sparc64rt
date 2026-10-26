@@ -498,6 +498,20 @@ static inline void sb_ldr_x30_post(sparc64_dbt_buf_t *b)
     sb_word(b, UINT32_C(0xf84107fe));
 }
 
+/* Parameterized 16-byte host-stack spill across helper calls and delay
+ * slots (same encodings as the x30 pair above; sp stays 16B-aligned).
+ * H3: lets JMPL snapshot a register-indirect target before a delay
+ * slot that may rotate windows or reuse the scratch set. */
+static inline void sb_push64(sparc64_dbt_buf_t *b, unsigned rt)
+{
+    sb_word(b, UINT32_C(0xf81f0fe0) | (rt & 31U));
+}
+
+static inline void sb_pop64(sparc64_dbt_buf_t *b, unsigned rt)
+{
+    sb_word(b, UINT32_C(0xf84107e0) | (rt & 31U));
+}
+
 /* ---- translator-local runtime helpers ------------------------------------
  * Static so only the including emitter (emit_int.c) emits references;
  * JIT code resolves their addresses at emit time via BLR. All helpers

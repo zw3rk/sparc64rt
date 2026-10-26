@@ -402,19 +402,28 @@ static unsigned cc_sub(unsigned width, uint64_t a, uint64_t b, unsigned bin,
     return nz;
 }
 
-/* MULcc shared tail: N/Z from the 32-bit low product, V = signed overflow
- * beyond 32 bits, C = 0. Both nibbles carry the 32-bit result (the op is
- * 32-bit; xcc mirrors icc). Y holds the high 32 product bits. */
+/* MULcc shared tail (H3 oracle probes vs qemu-sparc64): rd keeps the
+ * full product; Y the high 32 bits; icc N/Z from the low 32 bits,
+ * xcc N/Z from the full 64 bits; C is 0. V keeps the pre-existing
+ * rule (oracle reports V=0 on overflow; left for the coordinator,
+ * see docs/h3-coremark.md). */
 static void mulcc_tail(sparc64_ctx_t *ctx, unsigned rd, uint32_t lo,
     uint64_t prod, bool is_signed)
 {
     unsigned icc = 0U;
+    unsigned xcc = 0U;
     bool v;
     if ((lo & UINT32_C(0x80000000)) != UINT32_C(0)) {
         icc |= 8U;
     }
     if (lo == 0U) {
         icc |= 4U;
+    }
+    if ((prod & UINT64_C(0x8000000000000000)) != UINT64_C(0)) {
+        xcc |= 8U;
+    }
+    if (prod == UINT64_C(0)) {
+        xcc |= 4U;
     }
     if (is_signed) {
         v = (int64_t)prod != (int64_t)(int32_t)lo;
@@ -425,8 +434,8 @@ static void mulcc_tail(sparc64_ctx_t *ctx, unsigned rd, uint32_t lo,
         icc |= 2U;
     }
     ctx->y = (uint32_t)(prod >> 32);
-    sparc64_cc_set(ctx, icc, icc);
-    sparc64_wreg(ctx, rd, (uint64_t)lo);
+    sparc64_cc_set(ctx, icc, xcc);
+    sparc64_wreg(ctx, rd, prod);
 }
 
 /* 64-bit population count. */
@@ -492,16 +501,19 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         sparc64_wreg(cpu, d->rd, a * b);
         return sparc64_step_ok(pc);
     case SPARC64_OP3_UMUL: {
+        /* Oracle parity (H3): rd keeps the full 64-bit product; GCC's
+         * strength-reduced division reads the high half out of rd. */
         uint64_t p = (uint64_t)(uint32_t)a * (uint64_t)(uint32_t)b;
         cpu->y = (uint32_t)(p >> 32);
-        sparc64_wreg(cpu, d->rd, (uint64_t)(uint32_t)p);
+        sparc64_wreg(cpu, d->rd, p);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_SMUL: {
+        /* Oracle parity (H3): rd keeps the full 64-bit product. */
         int64_t p = (int64_t)(int32_t)(uint32_t)a *
             (int64_t)(int32_t)(uint32_t)b;
         cpu->y = (uint32_t)((uint64_t)p >> 32);
-        sparc64_wreg(cpu, d->rd, (uint64_t)(uint32_t)(uint64_t)p);
+        sparc64_wreg(cpu, d->rd, (uint64_t)p);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_SDIVX: {

@@ -6,17 +6,15 @@
  *
  * Integer emitter with interpreter-identical semantics (--difftest).
  * Inline: SETHI, ALU + dual icc/xcc, ADDX/SUBX + cc (carry from icc.C),
- * MULX/UMUL/SMUL, UDIVX/SDIVX/UDIV/SDIV (+cc, divide-by-zero trap,
- * SDIV saturation), POPC (helper), TADD/TSUB (+TV trap), MULSCC, shifts
- * (SLL/SRL full-64, SRA sign-31/63), MOVcc (csel-free branch),
- * MOVr, RDASR/WRASR user state, ALIGNADDR, CALL/Bicc/BPcc/BPr/JMPL/
- * RETURN with delay slots + annul, Tcc (syscall gate). Helpers
- * (emit_priv.h): loads/stores/LDSTUB/SWAP/CASA/CASXA (alignment +
- * ASI + big-endian + mem callbacks via the interp backend),
- * SAVE/RESTORE (shared interp window file). Misaligned multi-byte
- * access faults, never emulates; PRIV/FPU/FBR/odd encodings return
- * false for dispatcher fallback. Contract: x19 = ctx, scratch
- * x9-x14, exits carry PC in x15 and reason in w16; never x18.
+ * MULX/UMUL/SMUL, UDIVX/SDIVX/UDIV/SDIV (+cc, div-by-zero trap, SDIV
+ * saturation), POPC (helper), TADD/TSUB (+TV trap), MULSCC, shifts
+ * (full-64 SLL/SRL, sign-31/63 SRA), MOVcc/MOVr, RDASR/WRASR user
+ * state, ALIGNADDR, CALL/Bicc/BPcc/BPr/JMPL/RETURN + delays/annul,
+ * Tcc (syscall gate). Helpers (emit_priv.h): mem (alignment + ASI +
+ * BE via interp backend), SAVE/RESTORE (shared window file).
+ * Misaligned access faults, never emulates; PRIV/FPU/FBR/odd
+ * encodings fall back. Contract: x19 = ctx, scratch x9-x14, exits
+ * carry PC in x15 and reason in w16; never x18.
  */
 
 #include "dbt/emit_int.h"
@@ -53,11 +51,9 @@ static const uint32_t e_a64_cond[16] = {
     7u /* BVC  -> VC */
 };
 
-/* ---- delay slots ---------------------------------------------------------
- * The delay instruction executes unless annulled away; faults replay via
- * the interpreter at the CTI address in ec->fault_pc. A CTI, Tcc, priv,
- * FPU, FBR, or illegal delay cannot inline: return false for fallback.
- */
+/* ---- delay slots --------------------------------------------------
+ * Executes unless annulled; faults replay via interp at ec->fault_pc.
+ * CTI/Tcc/priv/FPU/FBR/illegal delays refuse (fallback). */
 
 static bool e_delay_is_plain(const sparc64_dec_t *d)
 {
@@ -119,9 +115,8 @@ static bool e_emit_sethi(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Complex ALU via the translator helper: x0=ctx x1=op3 x2=rs1
- * x3=rs2-or-imm32 x4=is_imm x5=rd x6=pc, then BLR s64_rt_alu with the
- * UNDEF fault path. The reference backend sets Y/cc/traps. */
+/* Complex ALU via helper: x0=ctx x1=op3 x2=rs1 x3=rs2-or-imm32
+ * x4=is_imm x5=rd x6=pc, BLR s64_rt_alu; backend sets Y/cc/traps. */
 static size_t e_call_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -209,8 +204,7 @@ static bool e_emit_alu_simple(sparc64_emit_ctx_t *ec,
 
 
 
-/* ADDCC/SUBCC/ADDXCC/SUBXCC: icc from the low 32 bits, xcc from the
- * full 64 bits; the stored result is always the full 64-bit value. */
+/* ADDCC/SUBCC/ADDXCC/SUBXCC: icc from low 32, xcc from full 64. */
 static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
     const sparc64_dec_t *d)
 {
@@ -224,9 +218,8 @@ static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
     }
     e_ld64(b, ES0, d->rs1);
     e_src2(b, ES1, d);
-    /* The 32-bit (icc) pass runs first into xzr so the 64-bit result
-     * survives in ES0 for the store below; each pass reseeds the
-     * carry it consumes. */
+    /* 32-bit (icc) pass first into xzr; the 64-bit result survives
+     * in ES0; each pass reseeds its carry. */
     if (with_carry) {
         e_load_carry(b, ES2);
         if (is_sub) {
@@ -276,8 +269,7 @@ static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
     return !b->overflow;
 }
 
-/* Logic cc ops: N/Z from bit 31 / low32-zero (icc) and bit 63 /
- * full-zero (xcc); V and C are clear. */
+/* Logic cc: N/Z from bit31/low32-zero (icc), bit63/full-zero (xcc). */
 static bool e_emit_logiccc(sparc64_emit_ctx_t *ec,
     const sparc64_dec_t *d)
 {
@@ -307,8 +299,7 @@ static bool e_emit_logiccc(sparc64_emit_ctx_t *ec,
     default:
         return false;
     }
-    /* ANDS preserves C/V: clear NZCV first so the nibble sees V=C=0
-     * as the architecture requires for logic ops. */
+    /* ANDS preserves C/V: clear NZCV first for logic-op V=C=0. */
     sb_add_reg(b, false, true, ES2, 31U, 31U);
     sb_ands_reg(b, true, 31U, ES0, ES0);
     e_host_to_nibble(b, ES3, ES2, false);
@@ -413,8 +404,7 @@ static bool e_emit_movr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* User state registers: %y/%ccr/%asi/%fprs/%gsr. Other numbers are
- * privileged or illegal and fall back. */
+/* User state: %y/%ccr/%asi/%fprs/%gsr; other numbers fall back. */
 static bool e_emit_rdasr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -494,16 +484,14 @@ static bool e_emit_align(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* True when the delay slot can be inlined (validated without
- * emitting, so the caller stays pristine on fallback). */
+/* True when the delay slot inlines; validated without emitting. */
 static bool e_delay_plain(sparc64_emit_ctx_t *ec)
 {
     return ec->delay != NULL && e_delay_is_plain(ec->delay);
 }
 
-/* CALL: %o7 = pc, delay runs, pc += disp. Pristine fallback when the
- * delay cannot be inlined. The link write precedes the delay, matching
- * the reference model (a delay reading %o7 sees the new value). */
+/* CALL: %o7 = pc, then delay, then pc += disp. Link precedes delay;
+ * pristine fallback when the delay cannot inline. */
 static bool e_emit_call(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -522,8 +510,7 @@ static bool e_emit_call(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* AArch64 condition taken by a BPr rcond (cbz/cbnz/b.cond forms report
- * through the same patch kind the emitter used). */
+/* BPr rcond to AArch64 condition (same patch kind as emitted). */
 static unsigned e_bpr_cond(unsigned rcond, bool *is_cb)
 {
     *is_cb = (rcond == 1U || rcond == 5U);
@@ -542,8 +529,7 @@ static unsigned e_bpr_cond(unsigned rcond, bool *is_cb)
     return 10U;
 }
 
-/* Bicc/BPcc/BPr: condition, annul, delay, pc/npc update per the
- * reference model. Pristine fallback when the delay is not plain. */
+/* Bicc/BPcc/BPr: condition, annul, delay, pc/npc per reference. */
 static bool e_emit_branch(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -624,13 +610,24 @@ static bool e_emit_branch(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* JMPL: misaligned targets trap, rd = pc precedes the delay, then the
- * transfer. Pristine fallback when the delay is not plain. RETURN is
- * handled by the interpreter (V9 A.45 window restore). */
-static bool e_emit_jmpl(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
+/* JMPL/RETURN: trap misaligned targets, run delay, then transfer.
+ * JMPL writes rd = pc; RETURN restores first (sum to %g0), no write.
+ * Target snapshotted (H3); SAVE/RESTORE delays under RETURN replay. */
+static bool e_emit_jmpl_ret(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
+    bool is_ret)
 {
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_misaligned;
+    size_t p_fault;
+    if (is_ret) {
+        if (ec->delay != NULL && (ec->delay->cls == SPARC64_ICLS_SAVE
+            || ec->delay->cls == SPARC64_ICLS_RESTORE)) {
+            return false;
+        }
+        if (ec->mem == NULL) {
+            return false;
+        }
+    }
     if (!e_delay_plain(ec)) {
         return false;
     }
@@ -639,18 +636,26 @@ static bool e_emit_jmpl(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     sb_add_reg(b, true, false, ES0, ES0, ES1);
     sb_ubfm(b, false, ES1, ES0, 0U, 1U);
     p_misaligned = sb_cbz_placeholder(b, false, true, ES1);
-    sb_mov_imm64(b, ES1, ec->pc);
-    e_st64(b, d->rd, ES1);
+    if (!is_ret) {
+        sb_mov_imm64(b, ES1, ec->pc);
+        e_st64(b, d->rd, ES1);
+    }
+    sb_push64(b, ES0);
+    if (is_ret) {
+        /* V9 A.45: the implicit restore precedes the delay slot. */
+        p_fault = e_call_win(ec, SPARC64_G0, false);
+        if (p_fault == SPARC64_DBT_NOPOS) {
+            return false;
+        }
+        e_resolve_fault(ec, p_fault);
+    }
     if (!e_emit_delay(ec)) {
         return false;
     }
-    if (d->rd == SPARC64_O7) {
+    if (!is_ret && d->rd == SPARC64_O7) {
         b->is_call = true;
     }
-    /* Recompute the target: the delay slot may use the scratch set. */
-    e_ld64(b, ES0, d->rs1);
-    e_src2(b, ES1, d);
-    sb_add_reg(b, true, false, ES0, ES0, ES1);
+    sb_pop64(b, ES0);
     sb_mov_reg(b, true, EPC, ES0);
     sb_mov_imm32(b, ERSN, SPARC64_EXIT_BRANCH);
     sb_ret(b);
@@ -659,9 +664,8 @@ static bool e_emit_jmpl(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Tcc: false conditions fall through; a true 0x6d..0x6f trap number
- * is the syscall/setjmp/longjmp gate (engine re-reads the ta word),
- * any other true trap number faults out to the interpreter. */
+/* Tcc: false falls through; true 0x6d..0x6f is the syscall gate,
+ * other true numbers fault out to the interpreter. */
 static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -710,8 +714,7 @@ static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Loads, stores, and atomics funnel through the checked backend:
- * alignment and ASI faults replay through the interpreter. */
+/* Loads/stores/atomics via the checked backend; faults replay. */
 static bool e_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     size_t p_fault;
@@ -775,12 +778,9 @@ static bool e_emit_one(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     case SPARC64_ICLS_BPR:
         return e_emit_branch(ec, d);
     case SPARC64_ICLS_JMPL:
-        return e_emit_jmpl(ec, d);
+        return e_emit_jmpl_ret(ec, d, false);
     case SPARC64_ICLS_RETURN:
-        /* V9 A.45 restores the window before the delay slot executes;
-         * replay pristinely through the interpreter until a native
-         * restore-then-transfer sequence lands. */
-        return false;
+        return e_emit_jmpl_ret(ec, d, true);
     case SPARC64_ICLS_TCC:
         return e_emit_tcc(ec, d);
     case SPARC64_ICLS_SAVE:
@@ -864,9 +864,8 @@ static bool e_emit_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     }
 }
 
-/* Shifts: SLL/SRL with x==0 shift only low32 and zero-extend
- * (V9 A.48, E02/E04 + P1 oracle); SRA sign-extends bit 31 (plain)
- * or bit 63 (X forms). Counts mask to 5/6 bits. */
+/* Shifts: SLL/SRL with x==0 touch low32 only (V9 A.48); SRA
+ * extends bit 31 (plain) or 63 (X forms). Counts mask to 5/6. */
 static bool e_emit_shift(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
