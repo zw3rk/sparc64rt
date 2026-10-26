@@ -9,7 +9,7 @@
 # or: nix build .#sparc64rt (uses the configured aarch64-linux builder).
 
 .DEFAULT_GOAL := help
-.PHONY: help all build check check-line-limits check-abi-invariants check-thr-granule clean
+.PHONY: help all build check check-line-limits check-abi-invariants check-thr-granule check-rc-u2 clean
 MAKEFLAGS += -j8
 
 BUILD_DIR := _build
@@ -58,7 +58,7 @@ $(OBJ_DIR)/%.o: src/%.S Makefile $(shell find src include -name '*.h')
 $(BUILD_DIR):
 	mkdir -p $@
 
-check: build check-line-limits check-abi-invariants check-thr-granule ## Build plus all Phase 0 gates
+check: build check-line-limits check-abi-invariants check-thr-granule check-rc-u2 ## Build plus all Phase 0 gates
 
 check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
 	@dirs="src"; test -d include && dirs="src include"; \
@@ -132,3 +132,11 @@ $(DARWIN_OBJ_DIR)/%.o: src/%.S Makefile $(shell find src include -name '*.h')
 	@mkdir -p $(dir $@)
 	$(DARWIN_CC) -target $(DARWIN_TARGET) $(DARWIN_CFLAGS) \
 		$(DARWIN_CPPFLAGS) -c $< -o $@
+
+# ---- RC-U2 gate (Lane A3) ----------------------------------------------------
+check-rc-u2: ## Build and run the RC-U2 8 KiB COW/EOF gate test (Lane A3)
+	$(HOST_CC) $(CFLAGS) -Isrc tests/test_rc_u2_8k_cow_eof.c \
+		src/vm/vm64.c src/vm/vm_file.c src/os/mem_space.c \
+		src/os/mem_space_write.c src/dbt/aot/sites.c \
+		-o $(BUILD_DIR)/test_rc_u2_8k_cow_eof && \
+	./$(BUILD_DIR)/test_rc_u2_8k_cow_eof

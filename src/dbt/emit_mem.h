@@ -8,6 +8,8 @@
  * (big-endian) guests. Entry convention, established by the caller:
  * x1 holds the guest effective address; for stores x0 holds the value
  * (for 16-byte stores x5 holds the high half); x5-x8 are dead scratch.
+ * 16-byte stores byte-swap x5 in place (rev x5, x5), so x5 is clobbered
+ * by the fast path and callers must treat it as dead afterwards.
  * The sequence never touches PSTATE.NZCV and never reads or writes
  * host register x18.
  *
