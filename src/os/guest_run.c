@@ -126,8 +126,9 @@ static int read_at(int fd, uint64_t offset, uint8_t *dst, uint64_t len,
     return 0;
 }
 
-/* Copy len bytes from fd@offset into guest space at base. Short reads
- * (EOF) leave the tail as mapped (fresh pages are zero-filled). */
+/* Copy len bytes from fd@offset into guest space at base. A short read
+ * (truncated file, lane A3 EOF clamp) stops with the available prefix
+ * loaded; fresh pages and the caller's zero tail cover the rest. */
 static int copy_from_fd(guest_state_t *g, int fd, uint64_t offset,
                         uint64_t base, uint64_t len)
 {
@@ -139,9 +140,11 @@ static int copy_from_fd(guest_state_t *g, int fd, uint64_t offset,
         if (want > (uint64_t)sizeof(chunk)) {
             want = (uint64_t)sizeof(chunk);
         }
-        if (read_at(fd, offset + done, chunk, want, &moved) != 0 ||
-            moved == 0U) {
+        if (read_at(fd, offset + done, chunk, want, &moved) != 0) {
             return -LOAD_IO;
+        }
+        if (moved == 0U) {
+            break;
         }
         if (!sparc64_space_write_initial(&g->space, base + done, chunk,
                                          (size_t)moved)) {
@@ -149,7 +152,7 @@ static int copy_from_fd(guest_state_t *g, int fd, uint64_t offset,
         }
         done += moved;
         if (moved < want) {
-            return -LOAD_IO;
+            break;
         }
     }
     return LOAD_OK;

@@ -15,12 +15,12 @@
 #define SPARC64_RESERVATION_GRANULE ((size_t)16)
 #define SPARC64_PAGE_GRANULES ((size_t)256)
 
-/* Guest user address space: 1ULL << 47 (128 TiB, va_bits = 47,
- * AT_PAGESZ = 4096). Guest VAs are full 64-bit values and are never
- * truncated into a 4 GiB window. */
+/* Guest user address space: 1ULL << 47 (128 TiB, va_bits = 47).
+ * Guest VAs are full 64-bit values and are never truncated into a
+ * 4 GiB window. The guest page size is 8 KiB (GUEST_ABI_PAGE_SIZE in
+ * src/os/guest_run_priv.h); this header keeps no AT_PAGESZ copy. */
 #define SPARC64_VA_BITS 47
 #define SPARC64_TASK_SIZE (UINT64_C(1) << SPARC64_VA_BITS)
-#define SPARC64_AT_PAGESZ UINT64_C(4096)
 
 enum { SPARC64_MEM_READ = 1, SPARC64_MEM_WRITE = 2, SPARC64_MEM_EXEC = 4 };
 typedef enum {

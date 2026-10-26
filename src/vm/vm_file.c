@@ -33,6 +33,7 @@
 #define VMF_ENOMEM 12
 #define VMF_EFAULT 14
 #define VMF_ENOENT 2
+#define VMF_EIO 5
 
 #define VMF_ABI_PAGE UINT64_C(8192)
 #define VMF_ABI_MASK (VMF_ABI_PAGE - UINT64_C(1))
@@ -322,6 +323,18 @@ bool vm_file_shared_direct_ok(uint64_t gva, uint64_t file_offset,
     return ((gva ^ file_offset) & mask) == UINT64_C(0);
 }
 
+/* Cross-TU 8 KiB legs owned by src/vm/vm64.c (same binary, lane A3).
+ * vm64_eof_upper_half / vm64_zero_span take plain integer and pointer
+ * types. vm64_cow_promote_8k takes vm64.c-local vm64_page_state_t
+ * (UNMAPPED = 0, ANON = 1, SHARED = 2, COW_CLEAN = 3, COW_DIRTY = 4,
+ * declared in that order); both TUs compile the states as int-sized
+ * enums, so the int-punned prototype below is representation-identical
+ * and the RC-U2 gate test pins the 3 -> 4 transition at runtime. */
+extern bool vm64_cow_promote_8k(int *lower_half, int *upper_half);
+extern bool vm64_eof_upper_half(uint64_t file_size, uint64_t map_end,
+    uint64_t *zero_start_out, uint64_t *zero_len_out);
+extern void vm64_zero_span(void *host_addr, size_t len);
+
 /* Populate a mapping from the file at mmap time (H > 4096 hosts keep
  * MAP_PRIVATE | MAP_ANONYMOUS arena backing at HVA and pread the
  * bytes; H == 4096 hosts map the file directly and never call this).
@@ -347,6 +360,112 @@ long vm_file_populate(int host_fd, uint64_t file_offset, void *host_addr,
     }
     if (moved_out != NULL) {
         *moved_out = done;
+    }
+    return (long)done;
+}
+
+/* ---- Provider-A segment data path (lane A3, RC-U2) ----------------------
+ * Populate one 8 KiB-quantized file-backed segment in place at its fixed
+ * canonical host address (UNIFICATION-PLAN Rev 4, section 5.1): pread the
+ * file bytes, zero the [st_size, 8 KiB) EOF tail (including the upper-half
+ * materialization span reported by vm64_eof_upper_half), promote the
+ * enclosing 8 KiB page COW_CLEAN -> COW_DIRTY as one unit through
+ * vm64_cow_promote_8k, and report full 4 KiB pages completely beyond EOF
+ * as a SIGBUS span for the caller to convert (Linux file-mmap fault
+ * behavior; the loader uses sparc64_space_map_bus for this).
+ *
+ * file_size is a fresh fstat st_size taken by the caller. The segment
+ * covers file bytes [file_offset, file_offset + seg_len). Returns the
+ * number of file bytes populated, or a negative -errno: -VMF_EINVAL on
+ * bad arguments, a negative host errno from rt_host_pread64, or -VMF_EIO
+ * when the file shrank under the caller (pread hit EOF before file_size
+ * bytes were served).
+ *
+ * lower_state / upper_state track the enclosing 8 KiB page halves as
+ * ints (3 = COW_CLEAN, 4 = COW_DIRTY, see above); both may be NULL to
+ * skip promotion (fresh anonymous pages, e.g. the ELF loader path).
+ * bus_base_out / bus_len_out receive the beyond-EOF span in FILE
+ * coordinates (both 0 when no full page lies beyond EOF); either may be
+ * NULL. The tail zeroing runs even when the upper-half leg reports
+ * nothing, so [file_size, file_offset + seg_len) always reads zero. */
+long vm_file_populate_segment(int host_fd, uint64_t file_offset,
+    uint64_t file_size, void *host_addr, size_t seg_len,
+    int *lower_state, int *upper_state,
+    uint64_t *bus_base_out, uint64_t *bus_len_out)
+{
+    uint64_t avail;
+    uint64_t want;
+    uint64_t eof_off;
+    uint64_t bus;
+    uint64_t seg_end;
+    size_t done = 0;
+    if (bus_base_out != NULL) {
+        *bus_base_out = UINT64_C(0);
+    }
+    if (bus_len_out != NULL) {
+        *bus_len_out = UINT64_C(0);
+    }
+    if (host_fd < 0 || host_addr == NULL || seg_len == 0u) {
+        return -VMF_EINVAL;
+    }
+    if (file_offset > UINT64_MAX - (uint64_t)seg_len) {
+        return -VMF_EINVAL;
+    }
+    seg_end = file_offset + (uint64_t)seg_len;
+    avail = file_offset < file_size ? file_size - file_offset : UINT64_C(0);
+    want = avail < (uint64_t)seg_len ? avail : (uint64_t)seg_len;
+    while (done < (size_t)want) {
+        int64_t got = rt_host_pread64(host_fd,
+            (char *)host_addr + done, (size_t)want - done,
+            (int64_t)(file_offset + (uint64_t)done));
+        if (got < 0L) {
+            return got;
+        }
+        if (got == 0L) {
+            return -VMF_EIO;
+        }
+        done += (size_t)got;
+    }
+    /* [st_size, 8 KiB) EOF zeroing: everything past the last file byte
+     * in this segment reads zero (partial-page tail and BSS alike). */
+    if (done < seg_len) {
+        vm64_zero_span((char *)host_addr + done, seg_len - done);
+    }
+    /* Upper-half materialization: when the file ends in the lower 4 KiB
+     * half of an 8 KiB page and the mapping runs into the upper half,
+     * guarantee that span reads zero (idempotent on this substrate,
+     * load-bearing where the upper 4 KiB host page maps separately). */
+    {
+        uint64_t zs = UINT64_C(0);
+        uint64_t zl = UINT64_C(0);
+        if (vm64_eof_upper_half(file_size, seg_end, &zs, &zl) &&
+            zl != UINT64_C(0) && zs >= file_offset &&
+            zl <= seg_end - zs) {
+            vm64_zero_span((char *)host_addr + (zs - file_offset),
+                (size_t)zl);
+        }
+    }
+    /* Whole-8KiB COW promotion: populating file bytes materializes the
+     * private copy, so the enclosing page promotes as one indivisible
+     * unit (HVA and TLB addend never change). */
+    if (lower_state != NULL && upper_state != NULL && done != 0u) {
+        (void)vm64_cow_promote_8k(lower_state, upper_state);
+    }
+    /* Beyond-EOF SIGBUS span: full 4 KiB pages past the last populated
+     * byte, in file coordinates for the caller to convert to BUS. */
+    eof_off = file_offset + (uint64_t)done;
+    bus = eof_off + (VMF_SUB_PAGE - UINT64_C(1));
+    if (bus < eof_off) {
+        bus = UINT64_MAX;
+    }
+    bus &= ~(VMF_SUB_PAGE - UINT64_C(1));
+    if (bus < seg_end) {
+        if (bus_base_out != NULL) {
+            *bus_base_out = bus;
+        }
+        if (bus_len_out != NULL) {
+            *bus_len_out = seg_end - bus;
+        }
     }
     return (long)done;
 }
