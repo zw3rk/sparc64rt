@@ -37,6 +37,8 @@
 #include "dbt/dbt.h"
 #include "dbt/emit_fp.h"
 #include "dbt/emit_int.h"
+#include "dbt/emit_mem.h"
+#include "dbt/mem_sites.h"
 #include "interp/interp.h"
 
 /* Trampoline entries (trampoline_a64.S): ctx in x0, fragment entry in
@@ -290,6 +292,7 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
     ec.mem = mem;
     ec.mc = mc;
     ec.delay = NULL;
+    sparc64_mem_block_begin(pc);
     a = pc;
     while (a < end) {
         sparc64_dec_t d;
@@ -328,6 +331,11 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
         if (a == end && !term_here) {
             e_exit_imm(&buf, end, (uint32_t)SPARC64_EXIT_BRANCH);
         }
+    }
+    /* Append the Soft-TLB miss tail when sites were recorded; without
+     * sites this is a no-op. Failure rewinds to the interpreter. */
+    if (!sparc64_mem_block_end(&buf, mem, mc)) {
+        goto fail;
     }
     if (buf.overflow) {
         goto fail;
@@ -629,6 +637,10 @@ int sparc64_dbt_init(sparc64_dbt_t *dbt)
         return -1;
     }
     (void)memset(dbt, 0, sizeof(*dbt));
+    /* The Soft-TLB table is BSS-zeroed (tag 0 would false-hit VPN 0 and
+     * dereference the raw guest VA on the host); poison every tag to
+     * ~0ULL before any translated code can run. */
+    sparc64_tlb_init();
     dbt->epoch = 1U;
     dbt->arena_base = NULL;
     dbt->arena_used = 0U;
