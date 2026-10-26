@@ -27,7 +27,7 @@
 
 #include "core/cpu.h"
 #include "os/syscalls_ext.h"
-#include "rt64/loader/interp_map.h"
+#include "os/guest_interp_map.h"
 
 /* Single-call staging cap (short reads are legal; the shared directory
  * cursor continues on the next call). */

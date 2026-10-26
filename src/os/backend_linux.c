@@ -6,7 +6,7 @@
  *
  * Backend 1 (UNIFICATION-PLAN Rev 4 section 6): static-PIE aarch64-linux
  * (musl), native or inside hyper-linux. Blocking calls go through the
- * race-free src/rt64/runtime/safe_syscall_a64.S window ([.L_check..svc]
+ * race-free src/os/safe_syscall_a64.S window ([.L_check..svc]
  * rewound to -LINUX_EINTR on preemption); the rest use libc. On
  * aarch64-musl the O_, PROT_, CLOCK_, EPOLL_ and FUTEX_ constants equal
  * the Linux UAPI values, so linux_ flags pass through unwidened.

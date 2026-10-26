@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * SPARC V9 (sparc64) user-mode translator entry: host-contract CLI/env
- * parsing lives in src/rt64/runtime/host_contract.c; this TU wires the
+ * parsing lives in src/os/host_contract.c; this TU wires the
  * resolved options to the runner, reports --stats, and owns exit codes.
  * Unknown --options fail hard (exit 2).
  */

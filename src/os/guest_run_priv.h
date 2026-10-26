@@ -18,7 +18,7 @@
 #include "core/cpu.h"
 #include "dbt/dbt.h"
 #include "os/syscalls_min.h"
-#include "rt64/memory/space.h"
+#include "os/mem_space.h"
 
 typedef struct {
     sparc64_space_t space;

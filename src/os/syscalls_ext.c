@@ -46,7 +46,7 @@
 
 #include "core/cpu.h"
 #include "os/guest_proc.h"
-#include "rt64/loader/interp_map.h"
+#include "os/guest_interp_map.h"
 #include "os/sigframe_sparc64rt.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"

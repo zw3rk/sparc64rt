@@ -40,8 +40,8 @@
 #include "os/sync_sig.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
-#include "rt64/loader/interp_map.h"
-#include "rt64/memory/space.h"
+#include "os/guest_interp_map.h"
+#include "os/mem_space.h"
 
 /* ---- Guest ABI constants (SPARC Linux, arch/sparc) --------------------- */
 #define GUEST_PAGE_MASK (GUEST_PAGE_SIZE - UINT64_C(1))
@@ -318,8 +318,13 @@ static long sysmem_munmap(void *context, uint64_t addr, uint64_t len)
     if (len == 0U) {
         return -EINVAL;
     }
-    base = align_down(addr, GUEST_PAGE_SIZE);
-    size = align_up(addr + len, GUEST_PAGE_SIZE) - base;
+    /* Wave U2: 8 KiB architectural granule — a non-8K-aligned address
+     * fails with -EINVAL like Linux (mprotect below matches). */
+    if ((addr & GUEST_PAGE_MASK) != 0U) {
+        return -EINVAL;
+    }
+    base = addr;
+    size = align_up(len, GUEST_PAGE_SIZE);
     if (base < GUEST_PAGE_SIZE || size > SPARC64_TASK_SIZE - base) {
         return -EINVAL;
     }

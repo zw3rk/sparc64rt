@@ -26,13 +26,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- Local externs: section 6 backend names (coordinator rewires) -------- */
-extern int64_t rt_host_pread64(int host_fd, void *buf, size_t count,
-    int64_t offset);
-extern int64_t rt_host_ftruncate(int host_fd, int64_t length);
-extern int64_t rt_host_msync(void *host_addr, size_t len, int linux_flags);
-extern int rt_host_create_shared_mem(const char *name, size_t size,
-    int *out_host_fd);
+#include "os/backend.h"
 
 /* ---- Linux errno values as negative codes -------------------------------- */
 #define VMF_EINVAL 22

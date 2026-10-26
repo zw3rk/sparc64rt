@@ -33,7 +33,7 @@
 #include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
 #include "os/proc.h"
-#include "rt64/loader/interp_map.h"
+#include "os/guest_interp_map.h"
 
 #include <unistd.h>
 #include "os/sync_sig.h"

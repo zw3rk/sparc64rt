@@ -27,7 +27,7 @@
 #include "core/cpu.h"
 #include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
-#include "rt64/memory/space.h"
+#include "os/mem_space.h"
 
 /* ---- Stack ABI constants (SPARC Linux, arch/sparc) ---------------------- */
 #define GUEST_STACK_TOP UINT64_C(0x7ffffffff000)

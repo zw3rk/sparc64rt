@@ -16,8 +16,8 @@
  * SAVE/RESTORE spill/fill 16 x 64-bit big-endian registers at
  * [%sp + 2047 .. %sp + 2047 + 120] (STACK_BIAS 2047).
  *
- * The ported rt64 substrate (src/rt64/memory, src/rt64/runtime,
- * src/rt64/linux, src/rt64/aot, vendored from ../rvrt/src with
+ * The ported substrate (src/os/mem_space*, src/os/guest_interp_map,
+ * src/os/safe_syscall_a64.S, vendored from ../rvrt/src with
  * rv_ -> sparc64_ renames) addresses this context as sparc64_cpu_t and
  * drives it through sparc64_decode / sparc64_step (src/interp/,
  * Phase 1) and the AArch64 DBT (src/dbt/, Phase 2).
@@ -25,7 +25,7 @@
 #ifndef SPARC64RT_CORE_CPU_H
 #define SPARC64RT_CORE_CPU_H
 
-#include "rt64/core/atomic.h"
+#include "core/atomic.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -101,7 +101,7 @@
 #define SPARC64_EXIT_SINGLE_STEP 6U
 
 /* Architectural limits and cache capacities. Guest page size is defined
- * by the ported substrate (src/rt64/memory/space.h, SPARC64_PAGE_SIZE). */
+ * by the ported substrate (src/os/mem_space.h, SPARC64_PAGE_SIZE). */
 #define SPARC64_RAS_SIZE 64U
 #define SPARC64_IBTC_SIZE 4096U
 

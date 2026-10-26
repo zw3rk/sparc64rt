@@ -46,7 +46,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
 #include "os/threads.h"
-#include "rt64/memory/space_split.h"
+#include "os/mem_space_split.h"
 
 /* Clone subset (linux/sched.h numbers, documented in threads.h). */
 #define THR_CLONE_MASK \
@@ -247,9 +247,14 @@ static void *thr_resolve(void *mc, uint64_t va, size_t size,
         va > SPARC64_TASK_SIZE - (uint64_t)size) {
         return NULL;
     }
-    base = va & ~(GUEST_PAGE_SIZE - UINT64_C(1));
+    /* Wave U2: resolve at the 4 KiB translation granule
+     * (RT_TRANSLATION_GRANULE), never at the 8 KiB guest ABI page size:
+     * the space substrate pages are 4 KiB, so an 8 KiB base would land
+     * on the neighboring lower page and off would overread past the
+     * 4 KiB backing (heap overread + wrong atomic/futex address). */
+    base = va & ~(SPARC64_PAGE_SIZE - UINT64_C(1));
     off = (size_t)(va - base);
-    if (off + size > (size_t)GUEST_PAGE_SIZE) {
+    if (off + size > (size_t)SPARC64_PAGE_SIZE) {
         return NULL;
     }
     if (!validate_access(&g->space, va, size, perm)) {
@@ -345,6 +350,10 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
 {
     uint64_t cmd = op & (uint64_t)THR_FUTEX_CMD_MASK;
     uint64_t flags = op & THR_FUTEX_FLAG_MASK;
+    /* Consumed only by the Linux futex path below; keep -Werror clean
+     * on hosts where that path is compiled out. */
+    (void)cmd;
+    (void)flags;
     uint32_t host_val = __builtin_bswap32(val);
     uint32_t cur = 0U;
     int rc;
@@ -813,25 +822,25 @@ bool sparc64_threads_try_host_atomic(sparc64_cpu_t *cpu, void *mc,
     }
     if (is_swap != 0) {
         if (size == 1U) {
-            uint8_t prev = __atomic_exchange_1((uint8_t *)hp,
+            uint8_t prev = __atomic_exchange_n((uint8_t *)hp,
                 (uint8_t)swap, __ATOMIC_SEQ_CST);
             old = (uint64_t)prev;
         } else {
             uint32_t s = thr_swap32((uint32_t)swap, little);
-            uint32_t p = __atomic_exchange_4((uint32_t *)hp, s,
+            uint32_t p = __atomic_exchange_n((uint32_t *)hp, s,
                 __ATOMIC_SEQ_CST);
             old = (uint64_t)thr_swap32(p, little);
         }
     } else if (size == 4U) {
         uint32_t e = thr_swap32((uint32_t)expect, little);
         uint32_t s = thr_swap32((uint32_t)swap, little);
-        (void)__atomic_compare_exchange_4((uint32_t *)hp, &e, s, false,
+        (void)__atomic_compare_exchange_n((uint32_t *)hp, &e, s, false,
             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
         old = (uint64_t)thr_swap32(e, little);
     } else {
         uint64_t e = thr_swap64(expect, little);
         uint64_t s = thr_swap64(swap, little);
-        (void)__atomic_compare_exchange_8((uint64_t *)hp, &e, s, false,
+        (void)__atomic_compare_exchange_n((uint64_t *)hp, &e, s, false,
             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
         old = thr_swap64(e, little);
     }

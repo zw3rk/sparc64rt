@@ -9,7 +9,7 @@
 # or: nix build .#sparc64rt (uses the configured aarch64-linux builder).
 
 .DEFAULT_GOAL := help
-.PHONY: help all build check check-line-limits check-abi-invariants clean
+.PHONY: help all build check check-line-limits check-abi-invariants check-thr-granule clean
 MAKEFLAGS += -j8
 
 BUILD_DIR := _build
@@ -19,37 +19,19 @@ HOST_CC ?= cc
 # Curated C11, no VLAs, no Annex K, no <threads.h>, no _Generic.
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra
-CPPFLAGS += -Isrc -Isrc/rt64 -Iinclude
+CPPFLAGS += -Isrc -Iinclude
 LDFLAGS_STATIC_PIE := -static-pie
 
-# Four carried files stay out of the Phase 0 link until their later lanes
-# provide the missing definitions; everything else under src/ builds. The
-# frozen CPU/step contract in src/core/cpu.h already resolves the context
-# types, and loader/ plus the jit/a64.h metadata surface are wired in.
-# Engine-retry (Phase 1 interp) is omitted, not excluded: the file does
-# not exist in the Phase 0 tree.
-#   runtime/aot_discover.c (Phase 6): root discovery through call sequences
-#     is ISA-specific and still follows the donor's RISC-V AUIPC/JALR walk.
-#   runtime/aot_cache.c + runtime/pretranslate.c (Phase 2/6): the cache
-#     needs the DBT emitter backend
-#     (sparc64_jit_emit_relocatable/source_validate/publish_relocated) and
-#     the Phase 6 discovery above; pretranslate drives the cache.
-#   linux/signal.c (Phase 4): handler-entry register setup still follows
-#     the donor convention (integer register file x0-style spill); V9
-#     enters with the signal in %o0, siginfo in %o1, ucontext in %o2.
-#   runtime/file_runtime_binding.c (Phase 4): needs signal.c's
-#     sparc64_linux_signal_enqueue_fsize.
+# Wave U1/U2: the src/rt64 donor tree is gone; everything under src/
+# builds for the Linux static-PIE target except the Darwin backend TU
+# (src/os/backend_darwin.c, built by build-darwin instead).
 EXCLUDED_SRCS := \
-	src/rt64/runtime/aot_discover.c \
-	src/rt64/runtime/aot_cache.c \
-	src/rt64/runtime/pretranslate.c \
-	src/rt64/runtime/file_runtime_binding.c \
-	src/rt64/linux/signal.c
+	src/os/backend_darwin.c
 
 ALL_C_SRCS := $(shell find src -name '*.c')
-RT64_SRCS := $(filter-out $(EXCLUDED_SRCS),$(ALL_C_SRCS))
+LINUX_C_SRCS := $(filter-out $(EXCLUDED_SRCS),$(ALL_C_SRCS))
 ASM_SRCS := $(shell find src -name '*.S')
-SRCS := $(RT64_SRCS) $(ASM_SRCS)
+SRCS := $(LINUX_C_SRCS) $(ASM_SRCS)
 
 all: build ## Build the translator (default cross target)
 
@@ -76,7 +58,7 @@ $(OBJ_DIR)/%.o: src/%.S Makefile $(shell find src include -name '*.h')
 $(BUILD_DIR):
 	mkdir -p $@
 
-check: build check-line-limits check-abi-invariants ## Build plus all Phase 0 gates
+check: build check-line-limits check-abi-invariants check-thr-granule ## Build plus all Phase 0 gates
 
 check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
 	@dirs="src"; test -d include && dirs="src include"; \
@@ -97,6 +79,12 @@ check-abi-invariants: ## Build and run tests/check_abi_invariants.c when present
 	else \
 		echo "check-abi-invariants: no tests/check_abi_invariants.c yet (Lane L0b), pass"; \
 	fi
+
+check-thr-granule: ## Build and run the host-atomic 4K-granule regression test (Wave U2)
+	$(HOST_CC) $(CFLAGS) -Isrc tests/test_thr_resolve_granule.c \
+		src/os/threads.c src/os/mem_space.c src/os/mem_space_write.c \
+		-o $(BUILD_DIR)/test_thr_resolve_granule -pthread && \
+	./$(BUILD_DIR)/test_thr_resolve_granule
 
 clean: ## Remove build outputs
 	rm -rf $(BUILD_DIR)

@@ -12,7 +12,7 @@
  * cleanup verification) while exercising only a minimal Provider-A
  * style control: a per-family directory
  * (/tmp/.sparc64rt-family-<pid>-<seq>-<suffix>) keyed by its live
- * (st_dev, st_ino) identity in a small vm_inode_shared_t record.
+ * (st_dev, st_ino) identity in a small sparc64_family_control_t record.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -39,7 +39,7 @@ typedef struct {
     uint64_t inode; /* st_ino of the control directory */
     unsigned long seq; /* family sequence number embedded in the name */
     char dir[128]; /* NUL-terminated control directory path */
-} vm_inode_shared_t;
+} sparc64_family_control_t;
 
 /* Parse "/tmp/.sparc64rt-family-<pid>-<seq>-<suffix>": pid and seq out,
  * 0 on success. */
@@ -118,7 +118,7 @@ static unsigned long next_family_seq(void)
     return have ? best : 0;
 }
 
-static int family_control_create(vm_inode_shared_t *out, unsigned long seq)
+static int family_control_create(sparc64_family_control_t *out, unsigned long seq)
 {
     char tmpl[128];
     struct stat status;
@@ -143,7 +143,7 @@ static int family_control_create(vm_inode_shared_t *out, unsigned long seq)
     return 0;
 }
 
-static int family_control_retire(vm_inode_shared_t *control)
+static int family_control_retire(sparc64_family_control_t *control)
 {
     char dir[128];
     int gone;
@@ -163,8 +163,8 @@ static int family_control_retire(vm_inode_shared_t *control)
 
 int sparc64_host_family_verify(void)
 {
-    vm_inode_shared_t first;
-    vm_inode_shared_t second;
+    sparc64_family_control_t first;
+    sparc64_family_control_t second;
     int first_live = 0;
     int second_live = 0;
     unsigned long base;

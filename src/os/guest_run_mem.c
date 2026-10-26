@@ -16,7 +16,7 @@
 
 #include "core/cpu.h"
 #include "os/guest_run_priv.h"
-#include "rt64/memory/space.h"
+#include "os/mem_space.h"
 
 /* ---- sparc64_mem_ops_t bridge over the rt64 substrate ------------------- */
 static void record_fault(const guest_state_t *g, sparc64_mem_fault_t *fault)

@@ -27,7 +27,7 @@
 #include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
 #include "os/syscalls_ext.h"
-#include "rt64/memory/space.h"
+#include "os/mem_space.h"
 
 #define PROC_PATH_MAX 4096U
 #define PROC_AT_FDCWD ((int64_t)-100)
