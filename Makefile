@@ -119,17 +119,9 @@ DARWIN_OBJS := $(patsubst src/%.c,$(DARWIN_OBJ_DIR)/%.o,$(DARWIN_C_SRCS)) \
 
 build-darwin: $(DARWIN_BIN) ## Link _build/sparc64rt-darwin-arm64 (native macOS arm64)
 
-# The DBT trampoline (src/dbt, coordinator-owned) defines its ELF entry
-# names without the Mach-O leading underscore; alias them at link time
-# so the C references resolve. Proper fix belongs in the trampoline
-# itself (underscore-prefixed globals under __APPLE__).
-DARWIN_LD_ALIASES := -Wl,-alias,sparc64_dbt_enter,_sparc64_dbt_enter \
-	-Wl,-alias,sparc64_dbt_enter_step,_sparc64_dbt_enter_step
-
 $(DARWIN_BIN): $(DARWIN_OBJS)
 	@mkdir -p $(dir $@)
-	$(DARWIN_CC) -target $(DARWIN_TARGET) $(DARWIN_OBJS) \
-		$(DARWIN_LD_ALIASES) -o $@
+	$(DARWIN_CC) -target $(DARWIN_TARGET) $(DARWIN_OBJS) -o $@
 
 $(DARWIN_OBJ_DIR)/%.o: src/%.c Makefile $(shell find src include -name '*.h')
 	@mkdir -p $(dir $@)

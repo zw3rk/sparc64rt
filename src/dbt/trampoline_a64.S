@@ -89,6 +89,12 @@
     .type sparc64_dbt_enter, %function
 #endif
 sparc64_dbt_enter:
+#ifdef __APPLE__
+    /* Mach-O references carry a leading underscore: publish the
+     * underscored aliases natively instead of -Wl,-alias at link. */
+    .globl _sparc64_dbt_enter
+_sparc64_dbt_enter:
+#endif
     DBT_ENTER_PROLOGUE
     /* x27 = chaining entry, x28 = live epoch word (chaining allowed). */
     mov x27, x2
@@ -103,6 +109,10 @@ sparc64_dbt_enter:
     .type sparc64_dbt_enter_step, %function
 #endif
 sparc64_dbt_enter_step:
+#ifdef __APPLE__
+    .globl _sparc64_dbt_enter_step
+_sparc64_dbt_enter_step:
+#endif
     DBT_ENTER_PROLOGUE
     /* x27 = chaining entry; x28 = zero epoch word so every
      * epoch-gated chain probe bails: single execution. */
