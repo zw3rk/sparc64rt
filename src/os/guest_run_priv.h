@@ -35,12 +35,22 @@ typedef struct {
 } guest_state_t;
 
 /* Guest ABI constants shared by the loader (guest_run.c) and the
- * _start stack synthesis (guest_stack.c). */
-#define GUEST_PAGE_SIZE UINT64_C(4096)
-/* AT_PAGESZ value (Phase 5, L5a): the SPARC64 Linux page size is 8K
- * (oracle and hardware truth). The translator's mapping granule
- * stays 4K (a harmless superset: 8K-aligned guests map fine). */
-#define GUEST_AT_PAGESZ_VALUE UINT64_C(8192)
+ * _start stack synthesis (guest_stack.c).
+ *
+ * Wave U2 (lane M2): unified 8 KiB SPARC V9 architectural page granule
+ * (UNIFICATION-PLAN Rev 4, section 4.2). GUEST_ABI_PAGE_SIZE = 8192
+ * governs every guest-visible VM operation: AT_PAGESZ, mmap / mprotect /
+ * munmap / mremap alignment (-EINVAL on 4KiB-only offsets/addresses),
+ * ELF segment rounding, whole-page COW promotion, and EOF tail zeroing.
+ * RT_TRANSLATION_GRANULE = 4096 stays the Soft-TLB indexing granule:
+ * every 8 KiB guest page transition updates the paired 4 KiB Soft-TLB
+ * entries (vpn and vpn ^ 1) together (see src/vm/vm64.c). */
+#define GUEST_ABI_PAGE_SIZE UINT64_C(8192)
+#define GUEST_PAGE_SIZE GUEST_ABI_PAGE_SIZE
+#define RT_TRANSLATION_GRANULE UINT64_C(4096)
+/* AT_PAGESZ value: the SPARC64 Linux page size is 8K (oracle and
+ * hardware truth), now also the enforced mapping granule. */
+#define GUEST_AT_PAGESZ_VALUE GUEST_ABI_PAGE_SIZE
 #define GUEST_MAX_ARGC 256U
 
 /* Loader outcomes: positive errno-style values without depending on

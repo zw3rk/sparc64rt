@@ -33,6 +33,7 @@
  * Oracle:
  *   qemu-sparc64 _build/guest_p6pperm
  */
+#include <errno.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -183,6 +184,25 @@ int main(void)
         check("TAIL-OK", "TAIL-FAIL", v);
     } else {
         check("TAIL-OK", "TAIL-FAIL", 0);
+    }
+
+    /* 8K-granule legs (Wave U2, lane M2): the guest ABI page is
+     * 8192 bytes, so 4KiB-only (non-8K) addresses fail with EINVAL
+     * and leave the mapping untouched. The qemu-sparc64 oracle (8K
+     * target pages) agrees. */
+    errno = 0;
+    if (mprotect(rwpage + 4096, 4096, PROT_READ) == 0) {
+        check("ALIGN-OK", "ALIGN-FAIL", 0);
+    } else {
+        check("ALIGN-OK", "ALIGN-FAIL", errno == EINVAL);
+    }
+    errno = 0;
+    if (mmap(rwpage + 4096, 4096, PROT_READ | PROT_WRITE,
+             MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1,
+             0) == MAP_FAILED) {
+        check("FIXED-OK", "FIXED-FAIL", errno == EINVAL);
+    } else {
+        check("FIXED-OK", "FIXED-FAIL", 0);
     }
 
     if (fails == 0) {

@@ -93,3 +93,41 @@
 | **Phase 5 (`RC5`)** | `L5a` (`PT_INTERP` dynamic linker loading + auxv + `/proc/self/*`), `L5b` (Dynamic `glibc`/`musl` + `BusyBox` suite) | Dynamic `test_p5_dyn` and `BusyBox` (`sh -c 'ls / && echo ok | wc -c'`) match `qemu-sparc64` on both `interp` and `dbt`. |
 | **Phase 6 (`RC6`)** | `L6a` (`hyper-linux` host contract & packaging), `L6b` (Both-host parity test suite) | `test_p1_isa`, `test_p3_fp_simd`, `test_p4_threads_signals`, `test_p5_dyn`, and `BusyBox` pass on both AArch64 Linux container and `hl` (`hyper-linux`). |
 | **Phase 7 (`RC-H`)** | `H1` (`test_h1_smc`), `H2` (`libc-test` + LTP syscall subset -> `docs/h2-report.md`), `H3` (6-step instrumented CoreMark -> `docs/h3-coremark.md`), `H4` (C++17 exceptions/RTTI/TLS smoke) | All 4 hardening gates committed with machine-verified pass counts (`0` unexpected failures) and measured `dbt > interp` speedup in `docs/h3-coremark.md`. |
+
+---
+
+## D11. Guest ABI Page Size: `AT_PAGESZ = 8192` (Wave U2, Lane M2)
+
+SPARC V9 Linux uses an 8 KiB architectural page. `sparc64rt` unifies
+`GUEST_ABI_PAGE_SIZE = 8192` (`src/os/guest_run_priv.h`) across every
+guest-visible VM operation, while the Soft-TLB translation granule
+stays `RT_TRANSLATION_GRANULE = 4096`:
+
+- `AT_PAGESZ` reports `8192` in the initial auxv (`guest_stack.c`).
+- `mmap` / `mprotect` / `munmap` / `mremap` require 8 KiB alignment
+  and return `-EINVAL` on 4KiB-only addresses, offsets, and sizes
+  (`src/vm/vm64.c`: `vm64_check_mmap_args`, `vm64_check_mprotect_args`,
+  `vm64_check_munmap_args`, `vm64_check_mremap_args`).
+- ELF `PT_LOAD` spans round to
+  `[align_down_8k(p_vaddr), align_up_8k(p_vaddr + p_memsz))`
+  (`vm64_round_elf_span`), so the 8K-rounded RELRO `mprotect` the
+  dynamic linker issues stays inside the mapping.
+- `MAP_PRIVATE` COW promotes the whole 8 KiB page
+  (`PAGE_COW_CLEAN -> PAGE_COW_DIRTY`) in place at the fixed canonical
+  `HVA = arena_base + gva`; one 4 KiB half is never left `COW_DIRTY`
+  while the other stays `COW_CLEAN` (`vm64_cow_promote_8k`).
+- Partial-page EOF tails round to `align_up(file_size, 8192)`: when a
+  file ends in the lower 4 KiB half of an 8 KiB page on a 4 KiB host,
+  the upper 4 KiB half materializes as an anonymous zeroed page
+  (`vm64_eof_upper_half`), so valid accesses there never raise a
+  kernel `SIGBUS`.
+- Every 8 KiB guest page transition updates the PAIRED 4 KiB Soft-TLB
+  entries (`vpn` and `vpn ^ 1`) together (`vm64_tlb_publish_pair`,
+  `vm64_tlb_invalidate_pair`, `vm64_tlb_invalidate_range`).
+- File backing follows Provider A (`src/vm/vm_file.c`): fixed canonical
+  `HVA`, lightweight `MAP_SHARED` `vm_inode_shared_t` family table,
+  shrink-then-regrow dirty-page discard (`vm_file_commit_resize`),
+  pinned futex admission with big-endian byte-swap
+  (`vm_futex_prepare_and_pin`), and the 6-step
+  Prepare -> Quiesce -> Host-Op -> Commit protocol
+  (`vm64_txn_prepare` / `vm64_txn_host_op` / `vm64_txn_commit`).
