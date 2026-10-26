@@ -1,0 +1,6 @@
+EXC-OK depth=42 sum=42
+SIGNAL-OK code=42
+RTTI-OK derived=42 null=1 kind=1
+DSO-EXC-OK code=7
+THREAD-OK workers=2 dtors=2 order=ok
+H4-PASS

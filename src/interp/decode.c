@@ -155,6 +155,16 @@ static int is_fp_mem_op3(uint32_t op3)
     return op3 >= SPARC64_OP3_LDF && op3 <= SPARC64_OP3_STDF;
 }
 
+/* FP alternate-space group (V9 0x30-0x37, imm ASI or %asi form). Only
+ * the architecturally assigned LDFA/LDDFA/STFA/STDFA members classify;
+ * 0x31/0x32/0x35/0x36 stay illegal. Matches the DBT classifier in
+ * src/interp/interp.c (sparc64_decode_op3) and the Phase 3 executor. */
+static int is_fp_alt_op3(uint32_t op3)
+{
+    return op3 == SPARC64_OP3_LDFA || op3 == SPARC64_OP3_LDDFA ||
+        op3 == SPARC64_OP3_STFA || op3 == SPARC64_OP3_STDFA;
+}
+
 /* Alternate-space memory ops (imm ASI in bits 12:5). */
 static int is_alternate_op3(uint32_t op3)
 {
@@ -500,7 +510,14 @@ static void decode_op3(uint32_t word, sparc64_decoded_t *out)
         out->cls = SPARC64_OP_STORE;
         return;
     }
-    if (is_fp_mem_op3(op3)) {
+    if (is_fp_mem_op3(op3) || is_fp_alt_op3(op3)) {
+        if (is_fp_alt_op3(op3) && i != 0U) {
+            /* %asi-register form (glibc VIS block memcpy): the simm13
+             * still forms [rs1 + imm]; the ASI is read from %asi at
+             * execution. Odd rd is legal here (the executor banks the
+             * pair, oracle-verified); no even-rd check. */
+            out->regasi = 1U;
+        }
         out->cls = SPARC64_OP_FPMEM;
         return;
     }
