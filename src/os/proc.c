@@ -625,8 +625,15 @@ static long proc_store_waitid(const sparc64_syscall_mem_t *mem,
     l2a_put_be32(b + 16U, (uint32_t)si->si_pid);
     l2a_put_be32(b + 20U, (uint32_t)si->si_uid);
     l2a_put_be32(b + 24U, (uint32_t)si->si_status);
+#if defined(__linux__)
     l2a_put_be64(b + 32U, (uint64_t)si->si_utime);
     l2a_put_be64(b + 40U, (uint64_t)si->si_stime);
+#else
+    /* macOS siginfo_t carries no SIGCHLD times: the BE slots stay zero,
+     * matching the already-zeroed tail above. Layout unchanged. */
+    l2a_put_be64(b + 32U, UINT64_C(0));
+    l2a_put_be64(b + 40U, UINT64_C(0));
+#endif
     if (!mem->prepare_write(mem->context, va, (uint64_t)sizeof(b))) {
         return -EFAULT;
     }
@@ -662,10 +669,12 @@ long sparc64_proc_waitid(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         rup = &ru;
     }
     memset(&si, 0, sizeof(si));
-#if defined(SYS_waitid)
+#if defined(__linux__) && defined(SYS_waitid)
     /* musl exposes only the 4-arg POSIX waitid; the kernel takes a
      * fifth rusage argument (as glibc passes on the oracle), so issue
-     * it directly for exact per-child usage. */
+     * it directly for exact per-child usage. (Linux only: the
+     * syscall(2) function is unavailable on macOS, which takes the
+     * libc waitid path below instead.) */
     r = (int)syscall((long)SYS_waitid, (idtype_t)idtype,
         (id_t)(int64_t)id, &si, opts, rup);
     if (r != 0) {

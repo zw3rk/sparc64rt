@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "core/cpu.h"
+#include "os/darwin_compat.h"
 #include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
 #include "os/syscalls_ext.h"
@@ -435,22 +436,24 @@ static char *gen_auxv(const sparc64_guest_proc_t *proc, size_t *len_out)
 static long pipe_content(const void *data, size_t len, int host_flags)
 {
     int fds[2] = { -1, -1 };
-#ifdef O_CLOEXEC
+#if defined(__linux__) && defined(O_CLOEXEC)
     if (pipe2(fds, ((host_flags & O_CLOEXEC) != 0) ? O_CLOEXEC : 0) != 0) {
         return -(long)errno;
     }
-#else
-    if (pipe(fds) != 0) {
-        return -(long)errno;
-    }
-    if ((host_flags & O_CLOEXEC) != 0) {
-        (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-        (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    }
-#endif
     if ((host_flags & O_NONBLOCK) != 0) {
         (void)fcntl(fds[0], F_SETFL, O_NONBLOCK);
     }
+#else
+    /* macOS has no pipe2(2): the compat shim applies CLOEXEC and
+     * NONBLOCK itself, so nothing more to set here. */
+    {
+        int rc = rt_darwin_pipe2(fds,
+            host_flags & (O_CLOEXEC | O_NONBLOCK));
+        if (rc != 0) {
+            return (long)rc;
+        }
+    }
+#endif
     if (len != 0U) {
         size_t done = 0;
         while (done < len) {

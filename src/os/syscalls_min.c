@@ -59,8 +59,10 @@
 /* Process-wide dispatch tally for --stats (Phase 6, L6a). Guest
  * execution is serialized under the big lock, but blocking syscalls
  * may run on worker threads, so the tally is atomic. */
-static _Atomic unsigned long long dispatched_total =
-    (_Atomic unsigned long long)0;
+/* Static storage is zero-initialized, so no explicit initializer is
+ * needed (a file-scope compound literal is not a constant expression
+ * under strict C11 and breaks the Darwin build). */
+static _Atomic unsigned long long dispatched_total;
 
 unsigned long long sparc64_syscalls_dispatched(void)
 {
