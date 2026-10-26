@@ -474,10 +474,10 @@ static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
         op3 == SPARC64_OP3_CASA || op3 == SPARC64_OP3_CASXA ||
         (op3 >= SPARC64_OP3_LDFA && op3 <= SPARC64_OP3_STDFA);
     if ((op3 == SPARC64_OP3_LDD || op3 == SPARC64_OP3_STD ||
-            op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA ||
-            op3 == SPARC64_OP3_LDDFA || op3 == SPARC64_OP3_STDFA) &&
+            op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA) &&
         (d->rd & 1U) != 0U) {
-        /* Twin-word destinations must be even. */
+        /* Twin-word integer destinations must be even (0x30-group LDDFA/
+         * STDFA encode %f32..%f62 via odd rd and stay legal). */
         d->cls = SPARC64_ICLS_ILLEGAL;
         return;
     }

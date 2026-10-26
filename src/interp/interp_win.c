@@ -229,6 +229,7 @@ bool sparc64_win_flush_all(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
                 interp_winsp[w] + SPARC64_STACK_BIAS, res, pc)) {
             return false;
         }
+        win_valid[w] = false;
     }
     return true;
 }
@@ -871,8 +872,10 @@ sparc64_step_result_t sparc64_exec_align(sparc64_cpu_t *cpu, uint64_t pc,
 }
 
 /* Privileged-class execution. FLUSHW is the V9 exception: it is
- * unprivileged and only spills outstanding windows to their homes
- * (glibc issues it around clone); occupancy is unchanged. */
+ * unprivileged and spills all non-current windows to their stack homes,
+ * leaving CANRESTORE == 0 so subsequent RESTOREs refill from memory
+ * (required by libgcc uw_install_context, which rewrites the caller save
+ * area on the stack before executing RETURN). */
 sparc64_step_result_t sparc64_exec_priv(sparc64_cpu_t *cpu,
     const sparc64_mem_ops_t *mem, void *mc, uint64_t pc,
     const sparc64_dec_t *d)
@@ -882,6 +885,8 @@ sparc64_step_result_t sparc64_exec_priv(sparc64_cpu_t *cpu,
         if (!sparc64_win_flush_all(cpu, mem, mc, &res, pc)) {
             return res;
         }
+        cpu->canrestore = 0U;
+        cpu->cansave = SPARC64_NWINDOWS - 1U;
         return sparc64_step_ok(pc);
     }
     return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);

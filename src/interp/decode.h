@@ -91,8 +91,9 @@ typedef enum {
                          * decodes PRIV); i == 1 takes ASI from %asi
                          * (regasi set, E03). */
     SPARC64_OP_CASXA,   /* CASXA (op 3, op3 0x3e): 64-bit form of CASA. */
-    SPARC64_OP_FPMEM,   /* FP loads/stores (op 3, op3 0x20..0x27): LDF/
-                         * LDFSR/LDQF/LDDF/STF/STFSR/STQF/STDF. Purely
+    SPARC64_OP_FPMEM,   /* FP loads/stores (op 3, op3 0x20..0x27 plus the
+                         * 0x30-group LDFA/LDDFA/STFA/STDFA): LDF/LDFSR/
+                         * LDQF/LDDF/STF/STFSR/STQF/STDF. Purely
                          * syntactic; semantics and traps are Phase 3. */
     SPARC64_OP_PREFETCH, /* PREFETCH (op 3, op3 0x2d): cache hint; rd is
                          * the prefetch function. L1b checks ASI privilege
@@ -206,6 +207,14 @@ typedef enum {
 #define SPARC64_OP3_STFSR  0x25U
 #define SPARC64_OP3_STQF   0x26U
 #define SPARC64_OP3_STDF   0x27U
+/* FP alternate-space group (V9 0x30-0x37, imm ASI or %asi form);
+ * values match src/interp/interp.h. Only the LDFA/LDDFA/STFA/STDFA
+ * members are architecturally assigned (0x31/0x32/0x35/0x36 stay
+ * illegal); glibc's VIS block memcpy uses LDDFA/STDFA with %asi. */
+#define SPARC64_OP3_LDFA   0x30U
+#define SPARC64_OP3_LDDFA  0x33U
+#define SPARC64_OP3_STFA   0x34U
+#define SPARC64_OP3_STDFA  0x37U
 #define SPARC64_OP3_PREFETCH 0x2DU
 #define SPARC64_OP3_CASA   0x3CU
 #define SPARC64_OP3_CASXA  0x3EU
