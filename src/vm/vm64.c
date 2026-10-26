@@ -524,6 +524,92 @@ long vm64_txn_host_op(vm64_txn_t *txn, vm64_host_op_fn op, void *op_ctx)
     return rc;
 }
 
+/* ---- Lane A2: single-participant txn legs for sysmem_* --------------------
+ * The big-lock engine has no live peer table (all guest threads serialize
+ * on thr_big_lock), so quiescence takes the epoch-bump leg: prepare parks
+ * self and announces the mutation, host_op runs the fallible step first
+ * (failure releases with zero mutation and resumes self), commit clears
+ * the announcement and resumes. Paired-TLB invalidation stays at the
+ * sysmem_* call sites (they own the live sparc64_dbt_tlb via
+ * src/dbt/mem_sites.h); the commit leg below therefore takes a NULL
+ * table, which is a no-op by contract. No redesign: thin wrappers over
+ * the section 4.5 core; one shared slot, big-lock serialized. */
+
+static vm64_worker_t a2_self;
+static vm64_txn_t a2_txn;
+static int a2_bound;
+
+/* Forward declarations of the section 4.5 core (defined below). */
+int vm64_txn_prepare(vm64_txn_t *txn);
+long vm64_txn_host_op(vm64_txn_t *txn, vm64_host_op_fn op, void *op_ctx);
+int vm64_txn_commit(vm64_txn_t *txn, vm64_tlb_entry_t *tlb,
+    uint64_t changed_base, uint64_t changed_len);
+
+static void a2_bind(void)
+{
+    if (a2_bound == 0) {
+        a2_txn.workers = &a2_self;
+        a2_txn.nworkers = 1u;
+        a2_txn.self_index = 0u;
+        a2_txn.preempt = vm64_preempt_via_rt_host;
+        a2_txn.preempt_ctx = NULL;
+        a2_bound = 1;
+    }
+}
+
+/* Steps 1-2: park self, announce the mutation (no peers to preempt on
+ * the single-participant slot). Returns 0, or -VM64_EFAULT when the
+ * slot is unusable. */
+int vm64_stxn_prepare(void)
+{
+    a2_bind();
+    return vm64_txn_prepare(&a2_txn);
+}
+
+/* Step 3: run the fallible op; on failure the abort below already
+ * released the announcement AND resumed self, so the caller returns the
+ * negative errno with zero net mutation. */
+long vm64_stxn_host_op(long (*op)(void *), void *op_ctx)
+{
+    long rc;
+    unsigned expect;
+    a2_bind();
+    if (op == NULL) {
+        return -VM64_EFAULT;
+    }
+    rc = vm64_txn_host_op(&a2_txn, op, op_ctx);
+    if (rc < 0L) {
+        expect = (unsigned)VM64_WORKER_PARKED;
+        (void)atomic_compare_exchange_strong_explicit(
+            &a2_txn.workers[a2_txn.self_index].state, &expect,
+            (unsigned)VM64_WORKER_RUNNING_DBT,
+            memory_order_seq_cst, memory_order_seq_cst);
+    }
+    return rc;
+}
+
+/* Steps 4-6: the caller published state after Step 3 succeeded; clear
+ * the announcement and resume. */
+int vm64_stxn_commit(uint64_t changed_base, uint64_t changed_len)
+{
+    a2_bind();
+    return vm64_txn_commit(&a2_txn, NULL, changed_base, changed_len);
+}
+
+/* Abort leg for failures AFTER a successful host op (e.g. a file fill
+ * faulting past the mapping publish): drop the announcement and resume
+ * self so the engine keeps running with zero net mutation. */
+void vm64_stxn_abort(void)
+{
+    unsigned expect = (unsigned)VM64_WORKER_PARKED;
+    a2_bind();
+    atomic_store_explicit(&a2_txn.mutating, 0u, memory_order_release);
+    (void)atomic_compare_exchange_strong_explicit(
+        &a2_txn.workers[a2_txn.self_index].state, &expect,
+        (unsigned)VM64_WORKER_RUNNING_DBT,
+        memory_order_seq_cst, memory_order_seq_cst);
+}
+
 /* Steps 4-6: commit callback publishes VMA/inode state (only reached
  * after Step 3 succeeded), the paired TLB range is invalidated, and
  * all parked workers resume. */

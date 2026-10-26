@@ -56,6 +56,15 @@
 #define SPARC64_MAP_FIXED 0x10U
 #define SPARC64_MAP_ANONYMOUS 0x20U
 
+/* Lane A2: guest mremap(250) lives in src/os/guest_run_sysmem.c (it
+ * needs the space substrate); the truncate family below needs only the
+ * host filesystem. Declared locally: the mem-op struct keeps no
+ * mremap slot by design, so dispatch calls the runner directly with
+ * the same context the do_* handlers receive. */
+extern long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
+    uint64_t old_size, uint64_t new_size, unsigned flags,
+    uint64_t new_addr);
+
 /* Process-wide dispatch tally for --stats (Phase 6, L6a). Guest
  * execution is serialized under the big lock, but blocking syscalls
  * may run on worker threads, so the tally is atomic. */
@@ -253,6 +262,44 @@ static long sys_uname(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     if (!mem->write(mem->context, buf_va, buf,
                     (uint64_t)SPARC64_UTS_TOTAL)) {
         return -EFAULT;
+    }
+    return 0;
+}
+
+/* Lane A2: truncate(129)/truncate64(77) by path, ftruncate(130)/
+ * ftruncate64(84) by fd. The host call runs first (Step 3 of the 6-step
+ * protocol); only host success would commit Provider-A file_size +
+ * code_generation via vm_file_commit_resize (Step 4). No live family
+ * table exists on the big-lock engine (all mappings are private heap
+ * copies), so there is no (table, index) to commit; the hook point is
+ * the success return below, which already carries the real host result.
+ * Lengths are signed 64-bit (SPARC takes `long length`): negatives are
+ * -EINVAL like Linux, and both calls exist on Linux and Darwin hosts. */
+static long sys_truncate_path(const sparc64_syscall_mem_t *mem,
+    uint64_t path_va, uint64_t length)
+{
+    char path[L2A_PATH_MAX];
+    long rc;
+    if (length > (uint64_t)INT64_MAX) {
+        return -EINVAL;
+    }
+    rc = l2a_copy_cstring(mem, path_va, path, (uint64_t)L2A_PATH_MAX);
+    if (rc != 0) {
+        return rc;
+    }
+    if (truncate(path, (off_t)(int64_t)length) != 0) {
+        return -(long)errno;
+    }
+    return 0;
+}
+
+static long sys_ftruncate_fd(uint64_t fd, uint64_t length)
+{
+    if (length > (uint64_t)INT64_MAX) {
+        return -EINVAL;
+    }
+    if (ftruncate((int)fd, (off_t)(int64_t)length) != 0) {
+        return -(long)errno;
     }
     return 0;
 }
@@ -500,6 +547,19 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     case (long)SPARC64__NR_mprotect:
         ret = mem->do_mprotect(mem->context, o0, o1, (unsigned)o2);
+        break;
+    /* Lane A2: mremap(250), truncate(129/77), ftruncate(130/84). */
+    case (long)SPARC64__NR_mremap:
+        ret = sparc64_sysmem_mremap(mem->context, o0, o1, o2,
+            (unsigned)o3, o4);
+        break;
+    case (long)SPARC64__NR_truncate:
+    case (long)SPARC64__NR_truncate64:
+        ret = sys_truncate_path(mem, o0, o1);
+        break;
+    case (long)SPARC64__NR_ftruncate:
+    case (long)SPARC64__NR_ftruncate64:
+        ret = sys_ftruncate_fd(o0, o1);
         break;
     case (long)SPARC64__NR_uname:
         ret = sys_uname(ctx, mem, o0);

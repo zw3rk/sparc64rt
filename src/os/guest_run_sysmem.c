@@ -1,0 +1,642 @@
+/*
+ * src/os/guest_run_sysmem.c — SPARC64 guest memory syscalls (Lane A2 split)
+ *
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Split from src/os/guest_run.c (Lane A2) so neither TU exceeds the
+ * 900-line limit: this file owns the sparc64_syscall_mem_t cluster
+ * (read/write/prepare_write, mmap/munmap/mprotect/mremap, brk helpers
+ * stay in guest_run.c) over the rt64 memory substrate. Every mapping
+ * mutation runs the 6-step quiescence legs from src/vm/vm64.c
+ * (vm64_stxn_prepare / host_op / commit, host-op-first abort, commit
+ * publishes); paired Soft-TLB + DBT invalidation stays here with the
+ * live sparc64_dbt_tlb owner. Guest VA is 8 KiB-granular
+ * (GUEST_ABI_PAGE_SIZE); the file never maps guest data PROT_EXEC on
+ * the host and never touches host register x18.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+/* Needs _GNU_SOURCE: musl hides pread(2) under -std=c11. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#include "core/cpu.h"
+#include "os/guest_run_priv.h"
+#include "os/guest_proc.h"
+#include "os/guest_interp_map.h"
+#include "dbt/dbt.h"
+#include "dbt/mem_sites.h"
+#include "os/syscalls_min.h"
+#include "os/mem_space.h"
+
+/* ---- Guest ABI constants (SPARC Linux, arch/sparc) --------------------- */
+/* Canonical source is src/os/guest_run_priv.h (GUEST_ABI_PAGE_SIZE); the
+ * map-flag values mirror arch/sparc asm/mman.h. Repeated here so this TU
+ * compiles standalone until the coordinator rewires the headers. */
+#define SYSMEM_PAGE_MASK (GUEST_PAGE_SIZE - UINT64_C(1))
+#define SYSMEM_MMAP_BASE UINT64_C(0x6000000000)
+#define SYSMEM_MAP_SHARED 0x01U
+#define SYSMEM_MAP_PRIVATE 0x02U
+#define SYSMEM_MAP_FIXED 0x10U
+#define SYSMEM_MAP_ANONYMOUS 0x20U
+/* Linux mremap(2) flags (asm-generic, same on SPARC). */
+#define SYSMEM_MREMAP_MAYMOVE 1u
+#define SYSMEM_MREMAP_FIXED 2u
+/* Soft-TLB indexing granule for the permission-span scan. */
+#define SYSMEM_SUB_PAGE UINT64_C(4096)
+
+/* ---- Single-participant quiescence legs (src/vm/vm64.c) ---------------- */
+/* The big-lock engine has no live peer table, so these take the
+ * epoch-bump leg: prepare parks self + announces, host_op runs the
+ * fallible step first (failure releases with zero mutation), commit
+ * clears + resumes. Declared locally: the txn types stay private to
+ * src/vm/vm64.c by design. */
+extern int vm64_stxn_prepare(void);
+extern long vm64_stxn_host_op(long (*op)(void *), void *op_ctx);
+extern int vm64_stxn_commit(uint64_t changed_base, uint64_t changed_len);
+extern void vm64_stxn_abort(void);
+
+static uint64_t sysmem_align_up(uint64_t v, uint64_t a)
+{
+    return (v + (a - UINT64_C(1))) & ~(a - UINT64_C(1));
+}
+
+/* ---- sparc64_syscall_mem_t read/write helpers over the same space ------ */
+bool sparc64_sysmem_read(void *context, uint64_t va, void *host,
+    uint64_t len)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    if (g == NULL || (len != 0U && host == NULL) || len == 0U) {
+        return g != NULL;
+    }
+    return sparc64_space_read(&g->space, va, host, (size_t)len,
+        SPARC64_MEM_READ);
+}
+
+bool sparc64_sysmem_write(void *context, uint64_t va, const void *host,
+    uint64_t len)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    if (g == NULL || (len != 0U && host == NULL) || len == 0U) {
+        return g != NULL;
+    }
+    return sparc64_space_write(&g->space, va, host, (size_t)len);
+}
+
+bool sparc64_sysmem_prepare_write(void *context, uint64_t va, uint64_t len)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    if (g == NULL || len == 0U) {
+        return g != NULL;
+    }
+    return sparc64_space_prepare_write(&g->space, va, (size_t)len);
+}
+
+/* ---- Shared transactional space-op dispatcher (Step 3 host ops) --------- */
+#define SYSOP_MAP 1U
+#define SYSOP_REPLACE 2U
+#define SYSOP_UNMAP 3U
+#define SYSOP_PROTECT 4U
+#define SYSOP_REMAP 5U
+
+typedef struct {
+    guest_state_t *g;
+    uint64_t base;
+    uint64_t size;
+    unsigned prot;
+    unsigned kind;
+    uint64_t dest;
+    uint64_t new_size;
+} sysmem_span_op_t;
+
+static long sysmem_space_op(void *ctx)
+{
+    sysmem_span_op_t *p = (sysmem_span_op_t *)ctx;
+    switch (p->kind) {
+    case SYSOP_MAP:
+        return sparc64_space_map(&p->g->space, p->base, p->size,
+            p->prot, false) ? 0 : -ENOMEM;
+    case SYSOP_REPLACE:
+        return sparc64_space_replace(&p->g->space, p->base, p->size,
+            p->prot) ? 0 : -ENOMEM;
+    case SYSOP_UNMAP:
+        (void)sparc64_space_unmap(&p->g->space, p->base, p->size);
+        return 0;
+    case SYSOP_PROTECT:
+        return sparc64_space_protect(&p->g->space, p->base, p->size,
+            p->prot) ? 0 : -ENOMEM;
+    case SYSOP_REMAP:
+        return sparc64_space_remap(&p->g->space, p->base, p->size,
+            p->dest, p->new_size, p->prot) ? 0 : -ENOMEM;
+    default:
+        return -EINVAL;
+    }
+}
+
+/* Resolve the mapping base: MAP_FIXED uses addr verbatim, otherwise the
+ * first hole at/above addr (falling back to MMAP_BASE below the stack). */
+static long sysmem_resolve_base(guest_state_t *g, uint64_t addr,
+    uint64_t size, unsigned flags, uint64_t *base)
+{
+    if ((flags & SYSMEM_MAP_FIXED) != 0U) {
+        if ((addr & SYSMEM_PAGE_MASK) != 0U || addr == 0U ||
+            addr >= SPARC64_TASK_SIZE ||
+            size > SPARC64_TASK_SIZE - addr) {
+            return -EINVAL;
+        }
+        *base = addr;
+        return 0;
+    }
+    *base = (addr == 0U) ? SYSMEM_MMAP_BASE :
+        sysmem_align_up(addr, GUEST_PAGE_SIZE);
+    if (*base == 0U || *base >= SPARC64_TASK_SIZE ||
+        size > SPARC64_TASK_SIZE - *base) {
+        *base = SYSMEM_MMAP_BASE;
+    }
+    if (!sparc64_space_find_hole(&g->space, *base, size, base) &&
+        (*base == SYSMEM_MMAP_BASE ||
+         !sparc64_space_find_hole(&g->space, SYSMEM_MMAP_BASE, size,
+             base))) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+/* Robust pread loop for the file-backed fill below. */
+static ssize_t sysmem_pread_all(int fd, uint64_t offset, uint8_t *dst,
+    uint64_t want)
+{
+    uint64_t done = 0;
+    while (done < want) {
+        ssize_t got = pread(fd, dst + done, (size_t)(want - done),
+            (off_t)(offset + done));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (got == 0) {
+            break;
+        }
+        done += (uint64_t)got;
+    }
+    return (ssize_t)done;
+}
+
+/* Copy len bytes from fd@offset into guest space at base. Short reads
+ * (EOF) leave the tail as mapped (fresh pages are zero-filled),
+ * reporting LOAD_IO so the caller keeps the mapping; LOAD_NOMEM rolls
+ * the span back. Mirrors the loader copy in guest_run.c. */
+static int sysmem_fill(guest_state_t *g, int fd, uint64_t offset,
+    uint64_t base, uint64_t len)
+{
+    uint64_t done = 0;
+    uint8_t chunk[4096];
+    while (done < len) {
+        uint64_t want = len - done;
+        ssize_t got;
+        if (want > (uint64_t)sizeof(chunk)) {
+            want = (uint64_t)sizeof(chunk);
+        }
+        got = sysmem_pread_all(fd, offset + done, chunk, want);
+        if (got < 0 || got == 0) {
+            return -LOAD_IO;
+        }
+        if (!sparc64_space_write_initial(&g->space, base + done, chunk,
+                (size_t)got)) {
+            return -LOAD_NOMEM;
+        }
+        done += (uint64_t)got;
+        if ((uint64_t)got < want) {
+            return -LOAD_IO;
+        }
+    }
+    return LOAD_OK;
+}
+
+long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
+    unsigned prot, unsigned flags, int fd, uint64_t offset)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    uint64_t size;
+    uint64_t base;
+    sysmem_span_op_t pub;
+    long hop;
+    if (g == NULL) {
+        return -EFAULT;
+    }
+    if (len == 0U || len > SPARC64_TASK_SIZE) {
+        return -EINVAL;
+    }
+    size = sysmem_align_up(len, GUEST_PAGE_SIZE);
+    if (size == 0U || size > SPARC64_TASK_SIZE) {
+        return -ENOMEM;
+    }
+    if ((prot & ~7U) != 0U) {
+        return -EINVAL;
+    }
+    /* W^X (H1, coordinator ruling): WX is deliberately NOT refused.
+     * The platform toolchain emits RWE DSO LOADs (even libc.so.6 has
+     * one, with BSS zero-fill), so refusing WX breaks all dynamic
+     * loading; Linux and qemu-user both allow it. Host W^X still
+     * holds: guest pages are heap-backed data the host never
+     * executes. The H1 guest records WX as SKIP on allow. */
+    if (((flags & (SYSMEM_MAP_PRIVATE | SYSMEM_MAP_SHARED)) == 0U) ||
+        ((flags & (SYSMEM_MAP_PRIVATE | SYSMEM_MAP_SHARED)) ==
+         (SYSMEM_MAP_PRIVATE | SYSMEM_MAP_SHARED))) {
+        return -EINVAL;
+    }
+    if ((flags & SYSMEM_MAP_ANONYMOUS) == 0U) {
+        /* File-backed: pread probe validates fd readability. */
+        uint8_t probe;
+        ssize_t got;
+        if ((offset & SYSMEM_PAGE_MASK) != 0U) {
+            return -EINVAL;
+        }
+        got = sysmem_pread_all(fd, offset, &probe, sizeof(probe));
+        if (len != 0U && got < 0) {
+            return -(long)errno;
+        }
+    }
+    {
+        long rc = sysmem_resolve_base(g, addr, size, flags, &base);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    /* 6-step legs: the space publish is the host op (transactional:
+     * failure leaves zero mutation); the file fill follows under the
+     * same announcement with rollback on LOAD_NOMEM. */
+    if (vm64_stxn_prepare() != 0) {
+        return -EFAULT;
+    }
+    pub.g = g;
+    pub.base = base;
+    pub.size = size;
+    pub.prot = prot & 7U;
+    pub.kind = ((flags & SYSMEM_MAP_FIXED) != 0U) ? SYSOP_REPLACE :
+        SYSOP_MAP;
+    pub.dest = UINT64_C(0);
+    pub.new_size = UINT64_C(0);
+    hop = vm64_stxn_host_op(sysmem_space_op, &pub);
+    if (hop != 0) {
+        return hop;
+    }
+    if ((flags & SYSMEM_MAP_ANONYMOUS) != 0U) {
+        /* Commit edge: publish done above; drop paired 4 KiB
+         * Soft-TLB entries (vpn, vpn^1) and the block range. */
+        sparc64_tlb_invalidate_gva(base, size);
+        if (g->dbt != NULL) {
+            sparc64_dbt_invalidate(g->dbt, base, size);
+        }
+        (void)vm64_stxn_commit(base, size);
+        return (long)base;
+    }
+    /* Short files leave a zero tail (fresh pages are zero-filled). */
+    if (len != 0U &&
+        sysmem_fill(g, fd, offset, base, len) == -LOAD_NOMEM) {
+        /* Host-op-first abort: roll the span back (zero net mutation)
+         * and drop any paired Soft-TLB coverage it may carry. */
+        (void)sparc64_space_unmap(&g->space, base, size);
+        sparc64_tlb_invalidate_gva(base, size);
+        vm64_stxn_abort();
+        return -ENOMEM;
+    }
+    /* Label the span for /proc/self/maps (L5a, best-effort):
+     * guest fds are host fds, so readlink the translator's own fd. */
+    {
+        char link[32];
+        char target[SPARC64RT_INTERP_PATH_MAX];
+        ssize_t got;
+        int wn = snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        if (wn > 0 && (size_t)wn < sizeof(link)) {
+            got = readlink(link, target, sizeof(target) - 1U);
+            if (got > 0) {
+                target[got] = '\0';
+                sparc64_guest_proc_note_map(g, base, base + size, target);
+            }
+        }
+    }
+    sparc64_tlb_invalidate_gva(base, size);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, base, size);
+    }
+    (void)vm64_stxn_commit(base, size);
+    return (long)base;
+}
+
+long sparc64_sysmem_munmap(void *context, uint64_t addr, uint64_t len)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    uint64_t base;
+    uint64_t size;
+    sysmem_span_op_t op;
+    long hop;
+    if (g == NULL) {
+        return -EFAULT;
+    }
+    if (len == 0U) {
+        return -EINVAL;
+    }
+    /* Wave U2: 8 KiB architectural granule — a non-8K-aligned address
+     * fails with -EINVAL like Linux (mprotect below matches). */
+    if ((addr & SYSMEM_PAGE_MASK) != 0U) {
+        return -EINVAL;
+    }
+    base = addr;
+    size = sysmem_align_up(len, GUEST_PAGE_SIZE);
+    if (base < GUEST_PAGE_SIZE || size > SPARC64_TASK_SIZE - base) {
+        return -EINVAL;
+    }
+    /* 6-step legs: unmap tolerates holes (no failure leg); commit then
+     * drops paired Soft-TLB entries and the block-cache range. */
+    if (vm64_stxn_prepare() != 0) {
+        return -EFAULT;
+    }
+    op.g = g;
+    op.base = base;
+    op.size = size;
+    op.prot = 0U;
+    op.kind = SYSOP_UNMAP;
+    op.dest = UINT64_C(0);
+    op.new_size = UINT64_C(0);
+    hop = vm64_stxn_host_op(sysmem_space_op, &op);
+    if (hop != 0) {
+        return hop;
+    }
+    sparc64_tlb_invalidate_gva(base, size);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, base, size);
+    }
+    if (base >= g->brk_base && base < g->brk_cur &&
+        base + size >= g->brk_cur) {
+        g->brk_cur = base;
+    }
+    (void)vm64_stxn_commit(base, size);
+    return 0;
+}
+
+long sparc64_sysmem_mprotect(void *context, uint64_t addr, uint64_t len,
+    unsigned prot)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    uint64_t size;
+    sysmem_span_op_t op;
+    long hop;
+    if (g == NULL) {
+        return -EFAULT;
+    }
+    if (len == 0U || (prot & ~7U) != 0U) {
+        return -EINVAL;
+    }
+    if ((addr & SYSMEM_PAGE_MASK) != 0U) {
+        return -EINVAL;
+    }
+    size = sysmem_align_up(len, GUEST_PAGE_SIZE);
+    if (addr < GUEST_PAGE_SIZE || size > SPARC64_TASK_SIZE - addr) {
+        return -ENOMEM;
+    }
+    /* 6-step legs: protect mutates nothing unless every page is mapped
+     * (zero-mutation abort otherwise); commit invalidates the span. */
+    if (vm64_stxn_prepare() != 0) {
+        return -EFAULT;
+    }
+    op.g = g;
+    op.base = addr;
+    op.size = size;
+    op.prot = prot & 7U;
+    op.kind = SYSOP_PROTECT;
+    op.dest = UINT64_C(0);
+    op.new_size = UINT64_C(0);
+    /* Every page must be mapped (Linux reports ENOMEM otherwise). */
+    hop = vm64_stxn_host_op(sysmem_space_op, &op);
+    if (hop != 0) {
+        return hop;
+    }
+    /* Commit edge: permission change drops paired Soft-TLB entries
+     * (write-tag gating) and the block-cache range. */
+    sparc64_tlb_invalidate_gva(addr, size);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, addr, size);
+    }
+    (void)vm64_stxn_commit(addr, size);
+    return 0;
+}
+
+/* Permission probe over an 8 KiB-rounded span: every 4 KiB sub-page must
+ * exist (full coverage), and the result is the intersection of the
+ * sub-page permissions. All engine mutations are 8 KiB-granular with
+ * uniform permissions per span, so mixed spans do not arise in practice;
+ * the intersection is the fail-closed choice if one ever does. */
+static bool sysmem_span_perms(guest_state_t *g, uint64_t base, uint64_t len,
+    unsigned *perms_out)
+{
+    uint64_t off;
+    unsigned perms = 7U;
+    for (off = 0U; off < len; off += SYSMEM_SUB_PAGE) {
+        bool found = false;
+        size_t i;
+        for (i = 0; i < g->space.count; i++) {
+            if (g->space.pages[i].address == base + off) {
+                perms &= g->space.pages[i].permissions;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    if (perms_out != NULL) {
+        *perms_out = perms;
+    }
+    return true;
+}
+
+/* Range overlap test for the FIXED destination check. */
+static bool sysmem_overlap(uint64_t a_base, uint64_t a_len, uint64_t b_base,
+    uint64_t b_len)
+{
+    return a_base < b_base + b_len && b_base < a_base + a_len;
+}
+
+/* Free-span probe for in-place mremap growth: true when no page in
+ * [base, base + len) is mapped. A partially occupied tail is not free
+ * (the substrate would replace those pages). */
+static bool sysmem_span_free(guest_state_t *g, uint64_t base, uint64_t len)
+{
+    uint64_t off;
+    size_t i;
+    for (off = 0U; off < len; off += SYSMEM_SUB_PAGE) {
+        for (i = 0; i < g->space.count; i++) {
+            if (g->space.pages[i].address == base + off) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Guest mremap(250) on the 8 KiB ABI granule. The old address must be
+ * 8 KiB-aligned (-EINVAL otherwise, like Linux); both sizes round up to
+ * 8 KiB. Shrink (or same-size without FIXED) completes in place;
+ * growth extends in place past a free tail, else relocates via
+ * MREMAP_MAYMOVE (map/copy/unmap through the transactional substrate,
+ * which preserves bytes and permissions); without MAYMOVE and no free
+ * tail the answer is -ENOMEM. MREMAP_FIXED needs MAYMOVE, an
+ * 8 KiB-aligned non-overlapping target, and replaces the destination
+ * (matching Linux). Unmapped sources read as -EFAULT (verified against
+ * Linux aarch64); resource exhaustion reads as -ENOMEM. */
+long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
+    uint64_t old_size, uint64_t new_size, unsigned flags, uint64_t new_addr)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    uint64_t old_len;
+    uint64_t new_len;
+    uint64_t dest;
+    unsigned perms = 7U;
+    sysmem_span_op_t op;
+    long hop;
+    if (g == NULL) {
+        return -EFAULT;
+    }
+    if (old_size == 0U || old_size > SPARC64_TASK_SIZE ||
+        new_size == 0U || new_size > SPARC64_TASK_SIZE) {
+        return -EINVAL;
+    }
+    if ((old_addr & SYSMEM_PAGE_MASK) != 0U) {
+        return -EINVAL;
+    }
+    if ((flags & ~(SYSMEM_MREMAP_MAYMOVE | SYSMEM_MREMAP_FIXED)) != 0U) {
+        return -EINVAL;
+    }
+    if (((flags & SYSMEM_MREMAP_FIXED) != 0U) &&
+        ((flags & SYSMEM_MREMAP_MAYMOVE) == 0U)) {
+        return -EINVAL;
+    }
+    old_len = sysmem_align_up(old_size, GUEST_PAGE_SIZE);
+    new_len = sysmem_align_up(new_size, GUEST_PAGE_SIZE);
+    if (old_addr < GUEST_PAGE_SIZE ||
+        old_len > SPARC64_TASK_SIZE - old_addr) {
+        return -EINVAL;
+    }
+    if (new_len == old_len && (flags & SYSMEM_MREMAP_FIXED) == 0U) {
+        return (long)old_addr;
+    }
+    if ((flags & SYSMEM_MREMAP_FIXED) != 0U) {
+        /* FIXED relocates; same-address same-size FIXED is -EINVAL on
+         * Linux, and overlapping ranges are -EINVAL too. */
+        if ((new_addr & SYSMEM_PAGE_MASK) != 0U || new_addr == 0U ||
+            new_addr >= SPARC64_TASK_SIZE ||
+            new_len > SPARC64_TASK_SIZE - new_addr) {
+            return -EINVAL;
+        }
+        if (new_addr == old_addr && new_len == old_len) {
+            return -EINVAL;
+        }
+        if (sysmem_overlap(new_addr, new_len, old_addr, old_len)) {
+            return -EINVAL;
+        }
+        dest = new_addr;
+        if (!sysmem_span_perms(g, old_addr, old_len, &perms)) {
+            return -EFAULT;
+        }
+    } else if (new_len < old_len) {
+        /* Shrink in place: drop the tail (holes tolerated, like the
+         * munmap path above). */
+        if (vm64_stxn_prepare() != 0) {
+            return -EFAULT;
+        }
+        op.g = g;
+        op.base = old_addr + new_len;
+        op.size = old_len - new_len;
+        op.prot = 0U;
+        op.kind = SYSOP_UNMAP;
+        op.dest = UINT64_C(0);
+        op.new_size = UINT64_C(0);
+        hop = vm64_stxn_host_op(sysmem_space_op, &op);
+        if (hop != 0) {
+            return hop;
+        }
+        sparc64_tlb_invalidate_gva(old_addr, old_len);
+        if (g->dbt != NULL) {
+            sparc64_dbt_invalidate(g->dbt, old_addr, old_len);
+        }
+        if (old_addr + new_len >= g->brk_base &&
+            old_addr + new_len < g->brk_cur &&
+            old_addr + old_len >= g->brk_cur) {
+            g->brk_cur = old_addr + new_len;
+        }
+        (void)vm64_stxn_commit(old_addr, old_len);
+        return (long)old_addr;
+    } else if (new_len > SPARC64_TASK_SIZE - (old_addr + old_len) ||
+        !sysmem_span_free(g, old_addr + old_len, new_len - old_len)) {
+        /* No free tail past the span: relocate when MAYMOVE allows,
+         * else -ENOMEM like Linux. A source with holes reads as
+         * -EFAULT (the remap below enforces full coverage). */
+        long rc;
+        if ((flags & SYSMEM_MREMAP_MAYMOVE) == 0U) {
+            return -ENOMEM;
+        }
+        rc = sysmem_resolve_base(g, 0U, new_len, 0U, &dest);
+        if (rc != 0) {
+            return rc;
+        }
+        if (!sysmem_span_perms(g, old_addr, old_len, &perms)) {
+            return -EFAULT;
+        }
+    } else {
+        /* Free tail: extend in place (needs no MAYMOVE, like Linux). */
+        if (!sysmem_span_perms(g, old_addr, old_len, &perms)) {
+            return -EFAULT;
+        }
+        dest = old_addr;
+    }
+    if (vm64_stxn_prepare() != 0) {
+        return -EFAULT;
+    }
+    op.g = g;
+    op.base = old_addr;
+    op.size = old_len;
+    op.prot = perms;
+    op.kind = SYSOP_REMAP;
+    op.dest = dest;
+    op.new_size = new_len;
+    hop = vm64_stxn_host_op(sysmem_space_op, &op);
+    if (hop != 0) {
+        /* The substrate stamps fault_reason: unmapped source reads as
+         * -EFAULT (Linux class), range faults as -EINVAL, everything
+         * else (resource/internal) as -ENOMEM. */
+        if (g->space.fault_reason == SPARC64_FAULT_UNMAPPED) {
+            return -EFAULT;
+        }
+        if (g->space.fault_reason == SPARC64_FAULT_RANGE) {
+            return -EINVAL;
+        }
+        return -ENOMEM;
+    }
+    /* Commit edge: both spans drop paired Soft-TLB entries and the
+     * block-cache ranges. */
+    sparc64_tlb_invalidate_gva(old_addr, old_len);
+    sparc64_tlb_invalidate_gva(dest, new_len);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, old_addr, old_len);
+        sparc64_dbt_invalidate(g->dbt, dest, new_len);
+    }
+    if (old_addr != dest && old_addr >= g->brk_base &&
+        old_addr < g->brk_cur && old_addr + old_len >= g->brk_cur) {
+        g->brk_cur = dest + (g->brk_cur - old_addr);
+    }
+    (void)vm64_stxn_commit(dest, new_len);
+    return (long)dest;
+}
+
