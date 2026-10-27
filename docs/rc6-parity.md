@@ -104,6 +104,12 @@ both hosts — including on `hl` with Darwin 16 KiB backing.
   Mac: `HL=$PWD/../hyper-linux/_build/hl SYSROOT=/tmp/sparc64-sysroot
   BB_BIN=$PWD/_build/busybox ORACLE= ./tests/parity_suite.sh`
   (9 PASS, 0 FAIL, 11 GAPs: no-oracle + G4).
+- Host-direct (rt-series catalogue smoke) needs no env:
+  `sh ../rt-series/tools/run_catalogue.sh smoke --arch sparc64rt`.
+  The runner auto-fills the Mac shape (sibling `hl`, `/tmp/sparc64-sysroot`,
+  empty oracle) with `note:` provenance lines, strips unconditional `hl: `
+  harness chatter from engine captures, and reports a missing sysroot as
+  GAP rather than FAIL. Same result: 9 PASS, 0 FAIL, 11 GAP.
 
 ## Verdict
 

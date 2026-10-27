@@ -18,6 +18,13 @@
 #     Oracle legs are skipped (no qemu on the Mac); engine outputs are
 #     compared against each other and, for golden-anchored legs, against
 #     the committed goldens.
+#   Host-direct macOS (no env; used by rt-series run_catalogue.sh smoke):
+#     sh ../rt-series/tools/run_catalogue.sh smoke --arch sparc64rt
+#     Auto-fills HL (sibling hyper-linux build), SYSROOT
+#     (/tmp/sparc64-sysroot, then /usr/sparc64-linux-gnu), and ORACLE=
+#     (oracle legs GAP) when unset; each substitution prints a `note:`.
+#     `hl: ` harness chatter is stripped from engine captures so golden
+#     comparisons see guest + translator output only.
 #
 # Environment:
 #   TRANSLATOR  translator binary (default ./_build/sparc64rt)
@@ -52,6 +59,50 @@ OUTDIR="${OUTDIR:-/tmp/sparc64rt-parity}"
 SYSROOT="${SYSROOT:-${SPARC64RT_SYSROOT:-}}"
 BB_BIN="${BB_BIN:-./_build/busybox}"
 
+# ---- host-direct auto-discovery (macOS Apple Silicon) ----
+# `run_catalogue.sh smoke` invokes this runner with no environment. On a
+# Darwin host the cross-built Linux translator cannot exec natively
+# (exit 126) and qemu/sysroot are absent, which used to fail every leg.
+# Fill in the documented Mac shape automatically when the caller left
+# the corresponding variable unset; explicit settings always win and a
+# `note:` line records each substitution. Linux-container runs (native
+# exec, explicit SYSROOT) are unaffected: every branch is a no-op there.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Normalize to the repo root when invoked from elsewhere so the
+# `./_build/...` guest paths resolve (explicit absolute paths unaffected).
+if [ ! -e "./_build/guest_p1" ] && [ -e "$REPO_ROOT/_build/guest_p1" ]; then
+    cd "$REPO_ROOT" || exit 1
+    echo "note: cd $REPO_ROOT"
+fi
+if [ -z "$HL" ] && [ -z "${TRANSLATOR:-}" ] \
+    && [ "$(uname -s)" = "Darwin" ] \
+    && [ -x "$REPO_ROOT/../hyper-linux/_build/hl" ]; then
+    HL="$REPO_ROOT/../hyper-linux/_build/hl"
+    echo "note: auto HL=$HL"
+fi
+if [ -n "$ORACLE" ]; then
+    case "$ORACLE" in
+        */*) ;;
+        *)
+            if ! command -v "$ORACLE" >/dev/null 2>&1; then
+                echo "note: oracle '$ORACLE' not on PATH, oracle legs GAP"
+                ORACLE=""
+            fi
+            ;;
+    esac
+fi
+if [ -z "$SYSROOT" ]; then
+    for _sys_cand in /tmp/sparc64-sysroot /usr/sparc64-linux-gnu; do
+        if [ -d "$_sys_cand" ]; then
+            SYSROOT="$_sys_cand"
+            echo "note: auto SYSROOT=$SYSROOT"
+            break
+        fi
+    done
+    unset _sys_cand
+fi
+
 pass=0; fail=0; gap=0
 row() {
     # row <name> <status> <detail>
@@ -64,10 +115,24 @@ row() {
 }
 
 run_engine() {
-    # run_engine <engine-flag> <guest> [args...]; stdout captured by caller
+    # run_engine <engine-flag> <guest> [args...]; stdout captured by caller.
+    # Under hl, the harness logs `hl: ...` lines (e.g. binder fwd
+    # link up/gone) to stderr unconditionally (hyper-linux
+    # src/binder_driver.c, not verbose-gated), and callers merge stderr
+    # via `2>&1`. Filter exactly those host-harness lines out so golden
+    # comparisons see guest + translator output only. Guest stdout and
+    # the translator's own `sparc64rt: ...` diagnostics never carry the
+    # `hl: ` prefix (verified: stdout-only capture of the BusyBox pipe
+    # leg is a clean `3`). Exit status is preserved (no pipeline).
     eng=$1; shift
     if [ -n "$HL" ]; then
-        "$HL" "$T" "$eng" "$@"
+        _hl_err="$OUTDIR/.hl-err-$$.tmp"
+        "$HL" "$T" "$eng" "$@" 2>"$_hl_err"
+        _hl_rc=$?
+        grep -v '^hl: ' "$_hl_err" >&2 || true
+        rm -f "$_hl_err"
+        unset _hl_err
+        return "$_hl_rc"
     else
         "$T" "$eng" "$@"
     fi
@@ -75,7 +140,7 @@ run_engine() {
 
 need_sysroot() {
     if [ -z "$SYSROOT" ]; then
-        row "$1" "FAIL" "SPARC64RT_SYSROOT/SYSROOT not set"
+        row "$1" "GAP" "no sysroot on this host (set SYSROOT/SPARC64RT_SYSROOT)"
         return 1
     fi
     return 0
