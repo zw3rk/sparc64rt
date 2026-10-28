@@ -92,6 +92,18 @@ bool sparc64_mem_read(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
         return false;
     }
+    if (n > 0U) {
+        /* Backends serve whole spans natively (fault.address names the
+         * exact failing byte): one call covers window spill/fill and
+         * block transfers. On failure fall through to the byte loop so
+         * partial progress before the fault matches byte-wise. */
+        sparc64_mem_fault_t fault;
+        fault.address = va;
+        fault.reason = SPARC64_MEM_FAULT_NONE;
+        if (mem->read(mc, va, out, n, SPARC64_ACCESS_LOAD, &fault)) {
+            return true;
+        }
+    }
     for (i = 0; i < n; i++) {
         sparc64_mem_fault_t fault;
         fault.address = va + (uint64_t)i;
@@ -113,6 +125,17 @@ bool sparc64_mem_write(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
         *res = sparc64_trap(SPARC64_TRAP_STORE_ACCESS, pc, va);
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
         return false;
+    }
+    if (n > 0U) {
+        /* Same bulk-first shape as the read side: one call for the
+         * whole span, byte loop fallback preserving partial-store
+         * semantics before a fault. */
+        sparc64_mem_fault_t fault;
+        fault.address = va;
+        fault.reason = SPARC64_MEM_FAULT_NONE;
+        if (mem->write(mc, va, in, n, &fault)) {
+            return true;
+        }
     }
     for (i = 0; i < n; i++) {
         sparc64_mem_fault_t fault;

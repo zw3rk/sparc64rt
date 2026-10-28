@@ -194,7 +194,13 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     }
     sb_ubfm(b, false, ERSN, ERSN, 0U, 2U);
     if (is_save) {
+        /* Inline whenever the target window needs no spill: cansave
+         * may be 0 (steady-state window pressure) as long as this is
+         * not the one-time lazy init (cansave == 0 && canrestore == 0,
+         * where the helper arms CANSAVE = NWINDOWS - 1). */
         sb_ldst_imm(b, true, false, ES3, ECTX, 0x254U);
+        sb_ldst_imm(b, true, false, ES2, ECTX, 0x258U);
+        sb_orr_reg(b, false, ES3, ES3, ES2);
         p_slow1 = sb_cbz_placeholder(b, false, false, ES3);
         if (p_slow1 == SPARC64_DBT_NOPOS) {
             return false;
@@ -258,8 +264,19 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
             sb_ldst_imm(b, false, false, ERSN, ECTX, 0x250U);
             sb_ldst_imm(b, true, false, ES2, ECTX, 0x254U);
             sb_mov_imm32(b, ES3, 1U);
-            sb_sub_reg(b, false, false, ES2, ES2, ES3);
-            sb_ldst_imm(b, false, false, ES2, ECTX, 0x254U);
+            {
+                /* cansave saturates at 0 (interp net effect of the
+                 * 0 -> 1 -> decrement sequence): skip the decrement
+                 * when already 0 instead of underflowing to -1. */
+                size_t p_nodec = sb_cbz_placeholder(b, false, false,
+                    ES2);
+                if (p_nodec == SPARC64_DBT_NOPOS) {
+                    return false;
+                }
+                sb_sub_reg(b, false, false, ES2, ES2, ES3);
+                sb_ldst_imm(b, false, false, ES2, ECTX, 0x254U);
+                sb_patch_cb(b, p_nodec, b->count);
+            }
             sb_ldst_imm(b, true, false, ES2, ECTX, 0x258U);
             sb_cmp_imm(b, false, ES2, 7U);
             {

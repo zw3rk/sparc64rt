@@ -89,7 +89,7 @@ void fp_clear_cexc(sparc64_dbt_buf_t *b)
 {
     sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
     sb_word(b, UINT32_C(0x927be800) | ((ES3 & 31U) << 5) | (ES3 & 31U));
-    sb_ldst_imm(b, true, false, ES3, ECTX, FP_FSR_OFF);
+    sb_ldst_imm(b, false, true, ES3, ECTX, FP_FSR_OFF);
 }
 
 /* Lane P5: commit host FPSR[4:0] (IXC/UFC/OFC/DZC/IOC) into SPARC
