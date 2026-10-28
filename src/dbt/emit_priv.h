@@ -4,25 +4,16 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Lane L2c owns this file (Phase 2 card). It holds the minimal AArch64
- * code buffer plus the integer instruction encoders used by emit_int.c
- * (adapted from ../sparc32rt/src/dbt/emit_priv.h and the A64 patterns in
- * ../sparc32rt/src/rt32/a64_emit.h), and the translator-local runtime
- * helpers invoked from JIT-emitted code via BLR.
- *
- * Helpers run in the translator process and cover exactly the operations
- * whose state or checks cannot be expressed inline: guest loads/stores/
- * atomics (alignment + ASI + big-endian + mem callbacks, via the shared
- * interp backend so parity holds by construction), SAVE/RESTORE (shared
- * interp window file), and 64-bit population count. Every helper touches
- * guest memory only through the sparc64_mem_ops_t callbacks captured in
- * the emit context. All helpers return SPARC64_EXIT_NONE on success and
- * SPARC64_EXIT_UNDEF when the dispatcher must replay the faulting
- * instruction with the interpreter (replay recomputes identical traps).
- *
- * Register discipline for emitted code (see emit_int.h): x19 holds the
- * sparc64_ctx_t pointer, x9-x14 are scratch, x15 carries the exit/resume
- * guest PC, w16 the exit reason. x18 is never used.
+ * Lane L2c owns this file (Phase 2 card): the minimal AArch64 code
+ * buffer plus integer encoders used by emit_int.c, and the
+ * translator-local runtime helpers invoked from JIT code via BLR.
+ * Helpers cover loads/stores/atomics, SAVE/RESTORE, and popcount via
+ * the shared interp backend (parity by construction), touching guest
+ * memory only through sparc64_mem_ops_t. They return EXIT_NONE on
+ * success, EXIT_UNDEF when the dispatcher must replay via interp.
+ * Register discipline (see emit_int.h): x19 = ctx, x9-x14 scratch,
+ * x15 exit/resume PC, w16 exit reason, x21-x26/x7-x8 GPR cache.
+ * x18 is never used.
  */
 
 #ifndef SPARC64RT_DBT_EMIT_PRIV_H
@@ -45,7 +36,13 @@ typedef struct sparc64_dbt_buf {
     bool is_call;
     bool fp_fast_checked;
     bool fpsr_dirty;
+    uint8_t gpr_cache_valid;
+    uint8_t gpr_cache_tag[8];
 } sparc64_dbt_buf_t;
+/* 8-slot GPR cache: slot (r&7) in x21-x26,x7,x8 (x21-x26
+ * callee-saved; x7/x8 clear of the mem fast path). */
+#define E_CREG(slot) \
+    ((slot) < 6U ? 21U + (slot) : ((slot) == 6U ? 7U : 8U))
 
 /* No-instruction sentinel for reserve failure. */
 #define SPARC64_DBT_NOPOS ((size_t)(-1))
@@ -500,10 +497,7 @@ static inline void sb_ldr_x30_post(sparc64_dbt_buf_t *b)
     sb_word(b, UINT32_C(0xf84107fe));
 }
 
-/* Parameterized 16-byte host-stack spill across helper calls and delay
- * slots (same encodings as the x30 pair above; sp stays 16B-aligned).
- * H3: lets JMPL snapshot a register-indirect target before a delay
- * slot that may rotate windows or reuse the scratch set. */
+/* 16-byte host-stack spill across calls/delays (sp stays aligned). */
 static inline void sb_push64(sparc64_dbt_buf_t *b, unsigned rt)
 {
     sb_word(b, UINT32_C(0xf81f0fe0) | (rt & 31U));
@@ -514,13 +508,8 @@ static inline void sb_pop64(sparc64_dbt_buf_t *b, unsigned rt)
     sb_word(b, UINT32_C(0xf84107e0) | (rt & 31U));
 }
 
-/* ---- translator-local runtime helpers ------------------------------------
- * Static so only the including emitter (emit_int.c) emits references;
- * JIT code resolves their addresses at emit time via BLR. All helpers
- * return SPARC64_EXIT_NONE on success, SPARC64_EXIT_UNDEF when the
- * dispatcher must replay the faulting instruction with the interpreter.
- * Guest memory is touched only through the mem callbacks.
- */
+/* ---- translator-local runtime helpers (via BLR; EXIT_NONE ok,
+ * EXIT_UNDEF replays via interp; mem only through callbacks) --------- */
 
 static inline uint64_t s64_rt_popc(uint64_t v)
 {
@@ -615,8 +604,7 @@ static inline uint32_t s64_rt_mem(sparc64_ctx_t *ctx,
     return SPARC64_EXIT_UNDEF;
 }
 
-/* Window op: rd_save carries rd | save<<8; sum is the SAVE/RESTORE operand.
- * The shared interp window file performs spill/fill through mem. */
+/* Window op: rd_save carries rd | save<<8; sum is SAVE/RESTORE operand. */
 static inline uint32_t s64_rt_win(sparc64_ctx_t *ctx,
     const sparc64_mem_ops_t *mem, void *mc, uint64_t sum, uint32_t rd_save,
     uint64_t pc)
@@ -636,11 +624,7 @@ static inline uint32_t s64_rt_win(sparc64_ctx_t *ctx,
     return SPARC64_EXIT_NONE;
 }
 
-/* ---- emitter state + mechanical layer ----------------------------------
- * Scratch registers, ctx offsets, operand loaders, flag/nibble
- * builders, exits, and helper-call sequences shared by the
- * per-class emitters in emit_int.c. x18 is never used.
- */
+/* ---- emitter state + mechanical layer (shared by emit_int.c) -------- */
 
 /* Scratch allocation inside one emitted instruction. */
 #define ECTX 19u /* ctx pointer (set by L2b block prologue) */
@@ -673,25 +657,51 @@ typedef struct sparc64_emit_ctx {
 
 /* ---- tiny emit utilities ---------------------------------------------- */
 
+/* Cached guest reg: r0 is xzr, else the slot creg (0 MOVs on hit). */
+static inline unsigned e_get_gpr(sparc64_dbt_buf_t *b, unsigned rs)
+{
+    unsigned slot = (rs & 31U) & 7U;
+    unsigned creg = E_CREG(slot);
+    if ((rs & 31U) == 0U) {
+        return 31U;
+    }
+    if ((((b->gpr_cache_valid >> slot) & 1U) != 0U) &&
+        (b->gpr_cache_tag[slot] == (uint8_t)(rs & 31U))) {
+        return creg;
+    }
+    sb_ldst_imm(b, true, true, creg, ECTX, (rs & 31U) * 8U);
+    b->gpr_cache_tag[slot] = (uint8_t)(rs & 31U);
+    b->gpr_cache_valid |= (uint8_t)(1U << slot);
+    return creg;
+}
 /* Load guest register rs into xdst (r0 reads as 0 via xzr). */
 static inline void e_ld64(sparc64_dbt_buf_t *b, unsigned xdst, unsigned rs)
 {
+    unsigned s;
     if ((rs & 31U) == 0U) {
         sb_mov_zr(b, true, xdst);
         return;
     }
-    sb_ldst_imm(b, true, true, xdst, ECTX, (rs & 31U) * 8U);
+    s = e_get_gpr(b, rs);
+    if (s != xdst) {
+        sb_mov_reg(b, true, xdst, s);
+    }
 }
-
 /* Store xsrc to guest register rd (writes to r0 are dropped). */
 static inline void e_st64(sparc64_dbt_buf_t *b, unsigned rd, unsigned xsrc)
 {
+    unsigned slot = (rd & 31U) & 7U;
+    unsigned creg = E_CREG(slot);
     if ((rd & 31U) == 0U) {
         return;
     }
     sb_ldst_imm(b, false, true, xsrc, ECTX, (rd & 31U) * 8U);
+    if (xsrc != creg) {
+        sb_mov_reg(b, true, creg, xsrc);
+    }
+    b->gpr_cache_tag[slot] = (uint8_t)(rd & 31U);
+    b->gpr_cache_valid |= (uint8_t)(1U << slot);
 }
-
 /* Second ALU operand (sign-extended simm13 or register) into xdst. */
 static inline void e_src2(sparc64_dbt_buf_t *b, unsigned xdst,
     const sparc64_dec_t *d)
@@ -699,7 +709,10 @@ static inline void e_src2(sparc64_dbt_buf_t *b, unsigned xdst,
     if (d->is_imm != 0U) {
         sb_mov_imm64(b, xdst, (uint64_t)d->imm);
     } else {
-        e_ld64(b, xdst, d->rs2);
+        unsigned s = e_get_gpr(b, d->rs2);
+        if (s != xdst) {
+            sb_mov_reg(b, true, xdst, s);
+        }
     }
 }
 
@@ -709,7 +722,6 @@ static inline void e_lsl_imm32(sparc64_dbt_buf_t *b, unsigned rd, unsigned rn,
 {
     sb_ubfm(b, false, rd, rn, (32U - sh) & 31U, (31U - sh) & 31U);
 }
-
 
 /* Build an NZCV word in wF from the 4-bit guest nibble in wN and load
  * it into the host flags. Clobbers wT; the three registers must be
@@ -737,28 +749,21 @@ static inline void e_nib_to_flags(sparc64_dbt_buf_t *b, unsigned wF, unsigned wN
 }
 
 /* Capture the host NZCV set by the previous flags-setting op into the
- * guest nibble layout (N=3,Z=2,V=1,C=0) in wI. Clobbers xT. SPARC C is
- * the borrow (E02): for SUB the host carry is inverted, so the C bit is
- * taken directly from the CC condition (1 iff borrow) instead. */
+ * guest nibble layout (N=3,Z=2,V=1,C=0) in wI. Clobbers xT. Reads each
+ * flag straight from PSTATE with CSET (no MRS at all): N=MI, Z=EQ,
+ * V=VS, and C is CS (carry) or CC (borrow) for SUB (E02). */
 static inline void e_host_to_nibble(sparc64_dbt_buf_t *b, unsigned wI,
     unsigned xT, bool is_sub)
 {
-    sb_mrs_nzcv(b, xT);
-    sb_ubfm(b, false, wI, xT, 31U, 31U);
+    sb_cset(b, wI, 4U);
     e_lsl_imm32(b, wI, wI, 3U);
-    sb_ubfm(b, false, xT, xT, 30U, 30U);
+    sb_cset(b, xT, 0U);
     e_lsl_imm32(b, xT, xT, 2U);
     sb_orr_reg(b, false, wI, wI, xT);
-    sb_mrs_nzcv(b, xT);
-    sb_ubfm(b, false, xT, xT, 28U, 28U);
+    sb_cset(b, xT, 6U);
     e_lsl_imm32(b, xT, xT, 1U);
     sb_orr_reg(b, false, wI, wI, xT);
-    if (is_sub) {
-        sb_cset(b, xT, 3U);
-    } else {
-        sb_mrs_nzcv(b, xT);
-        sb_ubfm(b, false, xT, xT, 29U, 29U);
-    }
+    sb_cset(b, xT, is_sub ? 3U : 2U);
     sb_orr_reg(b, false, wI, wI, xT);
 }
 
@@ -815,6 +820,7 @@ static inline void e_fault_here(sparc64_dbt_buf_t *b, uint64_t fault_pc)
 static inline size_t e_call_faultable(sparc64_dbt_buf_t *b, uint64_t addr)
 {
     size_t p;
+    b->gpr_cache_valid = 0;
     sb_str_x30_pre(b);
     sb_mov_imm64(b, ES2, addr);
     sb_blr(b, ES2);

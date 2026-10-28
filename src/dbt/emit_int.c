@@ -85,6 +85,7 @@ static bool e_emit_delay(sparc64_emit_ctx_t *ec)
     if (d == NULL || !e_delay_is_plain(d)) {
         return false;
     }
+    ec->buf->gpr_cache_valid = 0;
     if (d->cls == (uint8_t)SPARC64_ICLS_FPU) {
         return sparc64_emit_fp(ec, d);
     }
@@ -147,32 +148,37 @@ static bool e_emit_alu_simple(sparc64_emit_ctx_t *ec,
     const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
+    unsigned s2 = ES1;
     e_ld64(b, ES0, d->rs1);
-    e_src2(b, ES1, d);
+    if (d->is_imm != 0U) {
+        sb_mov_imm64(b, ES1, (uint64_t)d->imm);
+    } else {
+        s2 = e_get_gpr(b, d->rs2);
+    }
     switch (d->op3) {
     case SPARC64_OP3_ADD:
-        sb_add_reg(b, true, false, ES0, ES0, ES1);
+        sb_add_reg(b, true, false, ES0, ES0, s2);
         break;
     case SPARC64_OP3_AND:
-        sb_logic_reg(b, UINT32_C(0x8a000000), ES0, ES0, ES1);
+        sb_logic_reg(b, UINT32_C(0x8a000000), ES0, ES0, s2);
         break;
     case SPARC64_OP3_OR:
-        sb_orr_reg(b, true, ES0, ES0, ES1);
+        sb_orr_reg(b, true, ES0, ES0, s2);
         break;
     case SPARC64_OP3_XOR:
-        sb_eor_reg(b, true, ES0, ES0, ES1);
+        sb_eor_reg(b, true, ES0, ES0, s2);
         break;
     case SPARC64_OP3_SUB:
-        sb_sub_reg(b, true, false, ES0, ES0, ES1);
+        sb_sub_reg(b, true, false, ES0, ES0, s2);
         break;
     case SPARC64_OP3_ANDN:
-        sb_bic_reg(b, true, ES0, ES0, ES1);
+        sb_bic_reg(b, true, ES0, ES0, s2);
         break;
     case SPARC64_OP3_ORN:
-        sb_orn_reg(b, true, ES0, ES0, ES1);
+        sb_orn_reg(b, true, ES0, ES0, s2);
         break;
     case SPARC64_OP3_XORN:
-        sb_orn_reg(b, true, ES2, 31U, ES1);
+        sb_orn_reg(b, true, ES2, 31U, s2);
         sb_eor_reg(b, true, ES0, ES0, ES2);
         break;
     case SPARC64_OP3_ADDX:
@@ -190,7 +196,7 @@ static bool e_emit_alu_simple(sparc64_emit_ctx_t *ec,
         sb_sbc(b, false, ES0, ES0, ES1);
         break;
     case SPARC64_OP3_MULX:
-        sb_mul(b, ES0, ES0, ES1);
+        sb_mul(b, ES0, ES0, s2);
         break;
     default:
         return false;
@@ -198,9 +204,6 @@ static bool e_emit_alu_simple(sparc64_emit_ctx_t *ec,
     e_st64(b, d->rd, ES0);
     return !b->overflow;
 }
-
-
-
 
 /* ADDCC/SUBCC/ADDXCC/SUBXCC. */
 static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
@@ -309,10 +312,6 @@ static bool e_emit_logiccc(sparc64_emit_ctx_t *ec,
     return !b->overflow;
 }
 
-
-
-
-
 /* Integer MOVcc. */
 static bool e_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
@@ -341,6 +340,7 @@ static bool e_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     e_st64(b, d->rd, ES1);
     sb_patch_b_cond(b, p_skip, e_a64_cond[d->cond & 15U] ^ 1U,
         b->count);
+    b->gpr_cache_valid &= (uint8_t)(~(1U << ((((unsigned)d->rd) & 31U) & 7U)));
     return !b->overflow;
 }
 
@@ -399,6 +399,7 @@ static bool e_emit_movr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     }
     e_st64(b, d->rd, ES1);
     sb_patch_b(b, p_done, b->count);
+    b->gpr_cache_valid &= (uint8_t)(~(1U << ((((unsigned)d->rd) & 31U) & 7U)));
     return !b->overflow;
 }
 
@@ -497,7 +498,7 @@ static bool e_emit_call(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         return false;
     }
     sb_mov_imm64(b, ES0, ec->pc);
-    sb_ldst_imm(b, false, true, ES0, ECTX, SPARC64_O7 * 8U);
+    e_st64(b, SPARC64_O7, ES0);
     if (!e_emit_delay(ec)) {
         return false;
     }
@@ -865,16 +866,17 @@ static bool e_emit_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 static bool e_emit_shift(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
+    unsigned s2 = ES1;
     e_ld64(b, ES0, d->rs1);
     if (d->is_imm != 0U) {
         sb_mov_imm64(b, ES1, ((uint64_t)d->imm) & 0xfffULL);
     } else {
-        e_ld64(b, ES1, d->rs2);
+        s2 = e_get_gpr(b, d->rs2);
     }
     if (d->xbit != 0U) {
-        sb_ubfm(b, true, ES1, ES1, 0U, 5U);
+        sb_ubfm(b, true, ES1, s2, 0U, 5U);
     } else {
-        sb_ubfm(b, true, ES1, ES1, 0U, 4U);
+        sb_ubfm(b, true, ES1, s2, 0U, 4U);
     }
     if (d->op3 == SPARC64_OP3_SLL) {
         sb_lslv(b, d->xbit != 0U, ES0, ES0, ES1);

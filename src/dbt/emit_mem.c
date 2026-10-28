@@ -655,6 +655,10 @@ bool sparc64_mem_emit_site(struct sparc64_dbt_buf *b,
         acc_sites[idx].cont_insn_offset =
             (uint16_t)((size_t)b->count * 4U);
     }
+    /* Slow-path join: the miss stub runs a C call (clobbers x7/x8) and
+     * replays rd through interp, so drop slots 6,7 and rd's slot. */
+    b->gpr_cache_valid &= (uint8_t)(~(uint8_t)((1U << 6) | (1U << 7) |
+        (1U << ((((unsigned)d->rd) & 31U) & 7U))));
     return !b->overflow;
 }
 

@@ -321,6 +321,7 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
     buf.is_call = false;
     buf.fp_fast_checked = false;
     buf.fpsr_dirty = false;
+    buf.gpr_cache_valid = 0;
     ec.buf = &buf;
     ec.mem = mem;
     ec.mc = mc;
@@ -398,9 +399,8 @@ fail:
     return NULL;
 }
 
-/* RC-U4 A1 continuation snapshot (see mem_sites.h): the pre-effect
- * JMPL/RETURN target stashed by the emitted fragment. Zero until the
- * first stashing fragment runs; only read for JMPL/RETURN dst below. */
+/* RC-U4 A1 continuation: pre-effect JMPL/RETURN target stashed by an
+ * emitted fragment (zero until first stash; read for JMPL/RETURN dst). */
 uint64_t sparc64_dbt_cti_target = UINT64_C(0);
 
 /* Delay-slot fault continuation (RC-U4 A1): a Soft-TLB miss inside a
