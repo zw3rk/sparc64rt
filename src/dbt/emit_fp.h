@@ -86,6 +86,10 @@ static inline void fp_st_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned field)
 /* Clear guest FSR.cexc (moves never raise); defined in emit_fp.c. */
 void fp_clear_cexc(sparc64_dbt_buf_t *b);
 
+/* Commit accumulated host FPSR flags into guest FSR when dirty;
+ * defined in emit_fp.c. Clears fpsr_dirty. */
+bool sparc64_emit_fp_flush(sparc64_emit_ctx_t *ec);
+
 /* FCMP/FCMPE s+d compare; defined in emit_fpcmp.c. */
 bool fp_emit_cmp(sparc64_emit_ctx_t *ec, bool is_double, unsigned cmpe,
     unsigned idx, unsigned rs1, unsigned rs2);

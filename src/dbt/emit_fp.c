@@ -64,25 +64,56 @@
 #define FP_FMOV_D_X UINT32_C(0x9e670000)
 
 /* Guest FP file base (ctx + 0x140); FSR at ctx + 0x120. */
+static bool fp_sync_fsr(sparc64_emit_ctx_t *ec);
 
-/* Rounding guard prologue: FSR.RD (bits 31:30) must be 0
- * (round-to-nearest, the host FPCR default); nonzero exits UNDEF so the
- * dispatcher replays the instruction with the reference interpreter.
- * Also clears host FPSR so fp_sync_fsr observes only this op's flags. */
+/* Rounding guard prologue: FSR.RD (bits 31:30) and FSR.TEM
+ * (bits 27:23) must both be 0 (round-to-nearest with all traps masked,
+ * the host FPCR default); nonzero exits UNDEF so the dispatcher replays
+ * the instruction with the reference interpreter. Emitted once per
+ * block (fp_fast_checked); host FPSR is cleared once per batch
+ * (fpsr_dirty) so batched arith/sqrt accumulate flags for one flush. */
 static bool fp_guard_rd0(sparc64_emit_ctx_t *ec)
 {
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_ok;
-    sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
-    sb_ubfm(b, true, ES3, ES3, 30U, 31U);
-    p_ok = sb_cbz_placeholder(b, true, false, ES3);
-    if (p_ok == SPARC64_DBT_NOPOS) {
+    if (!b->fp_fast_checked) {
+        sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
+        sb_ubfm(b, true, ES4, ES3, 23U, 27U);
+        sb_ubfm(b, true, ES3, ES3, 30U, 31U);
+        sb_orr_reg(b, true, ES3, ES3, ES4);
+        p_ok = sb_cbz_placeholder(b, true, false, ES3);
+        if (p_ok == SPARC64_DBT_NOPOS) {
+            return false;
+        }
+        if (b->fpsr_dirty) {
+            if (!fp_sync_fsr(ec)) {
+                return false;
+            }
+        }
+        e_fault_here(b, ec->fault_pc);
+        sb_patch_cb(b, p_ok, b->count);
+        b->fp_fast_checked = true;
+    }
+    if (!b->fpsr_dirty) {
+        sb_word(b, UINT32_C(0xd51b443f)); /* msr FPSR, xzr */
+        b->fpsr_dirty = true;
+    }
+    return !b->overflow;
+}
+
+/* Batched FPSR flush: commit accumulated host flags when dirty. */
+bool sparc64_emit_fp_flush(sparc64_emit_ctx_t *ec)
+{
+    if (ec == NULL || ec->buf == NULL) {
         return false;
     }
-    e_fault_here(b, ec->fault_pc);
-    sb_patch_cb(b, p_ok, b->count);
-    sb_word(b, UINT32_C(0xd51b443f)); /* msr FPSR, xzr */
-    return !b->overflow;
+    if (ec->buf->fpsr_dirty) {
+        if (!fp_sync_fsr(ec)) {
+            return false;
+        }
+        ec->buf->fpsr_dirty = false;
+    }
+    return !ec->buf->overflow;
 }
 
 void fp_clear_cexc(sparc64_dbt_buf_t *b)
@@ -168,12 +199,20 @@ static bool fp_nan_check(sparc64_emit_ctx_t *ec, bool is_double,
         return false;
     }
     sb_patch_b_cond(b, p_vs, 6U, b->count);
+    if (b->fpsr_dirty) {
+        if (!fp_sync_fsr(ec)) {
+            return false;
+        }
+    }
     e_fault_here(b, ec->fault_pc);
     sb_patch_b(b, p_end, b->count);
     return !b->overflow;
 }
 
-/* Binary arith (FADD/FSUB/FMUL/FDIV, single or double). */
+/* Binary arith (FADD/FSUB/FMUL/FDIV, single or double). Batched:
+ * guard marks dirty, flags flush at block/CTI/fault boundaries. In a
+ * CTI delay slot (ec->delay != NULL) sync immediately so the CTI exit
+ * needs no extra bookkeeping. */
 static bool fp_emit_arith(sparc64_emit_ctx_t *ec, uint32_t base,
     const sparc64_dec_t *d, bool is_double)
 {
@@ -188,7 +227,7 @@ static bool fp_emit_arith(sparc64_emit_ctx_t *ec, uint32_t base,
         fp_ld_d(b, 0U, rs1);
         fp_ld_d(b, 1U, rs2);
         fp_alu(b, base, 2U, 0U, 1U);
-        if (!fp_nan_check(ec, true, 2U) || !fp_sync_fsr(ec)) {
+        if (!fp_nan_check(ec, true, 2U)) {
             return false;
         }
         fp_st_d(b, 2U, rd);
@@ -196,16 +235,22 @@ static bool fp_emit_arith(sparc64_emit_ctx_t *ec, uint32_t base,
         fp_ld_s(b, 0U, rs1);
         fp_ld_s(b, 1U, rs2);
         fp_alu(b, base, 2U, 0U, 1U);
-        if (!fp_nan_check(ec, false, 2U) || !fp_sync_fsr(ec)) {
+        if (!fp_nan_check(ec, false, 2U)) {
             return false;
         }
         fp_st_s(b, 2U, rd);
+    }
+    if (ec->delay != NULL) {
+        if (!fp_sync_fsr(ec)) {
+            return false;
+        }
+        b->fpsr_dirty = false;
     }
     return !b->overflow;
 }
 
 /* FSQRT (single or double); the source is the rs2 field (ground truth:
- * `fsqrts %f6, %f7` encodes rs1 = 0, rs2 = 6). */
+ * `fsqrts %f6, %f7` encodes rs1 = 0, rs2 = 6). Batched like arith. */
 static bool fp_emit_sqrt(sparc64_emit_ctx_t *ec, uint32_t base,
     const sparc64_dec_t *d, bool is_double)
 {
@@ -218,17 +263,23 @@ static bool fp_emit_sqrt(sparc64_emit_ctx_t *ec, uint32_t base,
     if (is_double) {
         fp_ld_d(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
-        if (!fp_nan_check(ec, true, 1U) || !fp_sync_fsr(ec)) {
+        if (!fp_nan_check(ec, true, 1U)) {
             return false;
         }
         fp_st_d(b, 1U, rd);
     } else {
         fp_ld_s(b, 0U, rs2);
         fp_alu(b, base, 1U, 0U, 0U);
-        if (!fp_nan_check(ec, false, 1U) || !fp_sync_fsr(ec)) {
+        if (!fp_nan_check(ec, false, 1U)) {
             return false;
         }
         fp_st_s(b, 1U, rd);
+    }
+    if (ec->delay != NULL) {
+        if (!fp_sync_fsr(ec)) {
+            return false;
+        }
+        b->fpsr_dirty = false;
     }
     return !b->overflow;
 }
@@ -544,15 +595,53 @@ static bool fp_emit_one(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return false;
 }
 
+static bool fp_is_batched_arith(const sparc64_dec_t *d)
+{
+    if (d->op != 2U || d->op3 != (uint8_t)SPARC64_OP3_FPOP1) {
+        return false;
+    }
+    switch (d->opf) {
+    case 0x41U:
+    case 0x42U:
+    case 0x45U:
+    case 0x46U:
+    case 0x49U:
+    case 0x4AU:
+    case 0x4DU:
+    case 0x4EU:
+    case 0x29U:
+    case 0x2AU:
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
 bool sparc64_emit_fp(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     bool ok;
+    bool batched;
     if (ec == NULL || ec->buf == NULL || d == NULL) {
         return false;
+    }
+    batched = fp_is_batched_arith(d);
+    if (!batched) {
+        if (!sparc64_emit_fp_flush(ec)) {
+            return false;
+        }
     }
     ok = fp_emit_one(ec, d);
     if (ec->buf->overflow) {
         return false;
+    }
+    if (!ok) {
+        return false;
+    }
+    if (ec->delay != NULL) {
+        if (!sparc64_emit_fp_flush(ec)) {
+            return false;
+        }
     }
     return ok;
 }

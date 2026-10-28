@@ -43,6 +43,8 @@ typedef struct sparc64_dbt_buf {
     size_t capacity;
     bool overflow;
     bool is_call;
+    bool fp_fast_checked;
+    bool fpsr_dirty;
 } sparc64_dbt_buf_t;
 
 /* No-instruction sentinel for reserve failure. */

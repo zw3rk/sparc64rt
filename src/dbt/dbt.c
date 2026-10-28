@@ -319,6 +319,8 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
     buf.capacity = DBT_EMIT_STAGE_WORDS;
     buf.overflow = false;
     buf.is_call = false;
+    buf.fp_fast_checked = false;
+    buf.fpsr_dirty = false;
     ec.buf = &buf;
     ec.mem = mem;
     ec.mc = mc;
@@ -342,6 +344,7 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
                 goto fail;
             }
             ec.delay = &dl;
+            if (!sparc64_emit_fp_flush(&ec)) goto fail;
             if (d.cls == (uint8_t)SPARC64_ICLS_FBR) {
                 if (!sparc64_emit_fbr(&ec, &d)) {
                     goto fail;
@@ -359,11 +362,20 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
             if (!sparc64_emit_fp(&ec, &d)) {
                 goto fail;
             }
-        } else if (!sparc64_emit_int(&ec, &d)) {
-            goto fail;
+        } else {
+            if ((d.cls == (uint8_t)SPARC64_ICLS_TCC ||
+                d.cls == (uint8_t)SPARC64_ICLS_RDASR ||
+                d.cls == (uint8_t)SPARC64_ICLS_WRASR ||
+                (d.cls >= (uint8_t)SPARC64_ICLS_LOAD &&
+                    d.cls <= (uint8_t)SPARC64_ICLS_ATOMIC)) &&
+                !sparc64_emit_fp_flush(&ec)) goto fail;
+            if (!sparc64_emit_int(&ec, &d)) {
+                goto fail;
+            }
         }
         a += 4U;
         if (a == end && !term_here) {
+            if (!sparc64_emit_fp_flush(&ec)) goto fail;
             e_exit_imm(&buf, end, (uint32_t)SPARC64_EXIT_BRANCH);
         }
     }
