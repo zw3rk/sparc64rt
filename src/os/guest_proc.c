@@ -106,7 +106,10 @@ void sparc64_guest_proc_note_exec(void *guest, const char *load_path)
         }
         memcpy(abs_path, cwd, clen);
         abs_path[clen] = '/';
-        strcpy(abs_path + clen + 1U, load_path);
+        {
+            size_t llen = strlen(load_path) + 1U;
+            memcpy(abs_path + clen + 1U, load_path, llen);
+        }
         load_path = abs_path;
     }
     if (g->proc == NULL) {

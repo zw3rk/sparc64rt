@@ -32,6 +32,44 @@ static void f_ldrb(sparc64_dbt_buf_t *b, unsigned wt, unsigned xn)
     sb_word(b, UINT32_C(0x39400000) | ((xn & 31U) << 5) | (wt & 31U));
 }
 
+/* File-local pair-move helpers (kept here — not in emit_priv.h — so
+ * that shared header stays under the 900-line file discipline).
+ * LDP/STP xi-pair, signed offset scaled by 8 (byte_off < 512, % 8 == 0,
+ * covering every window-file/ctx offset used below). */
+static void sb_ldp64(sparc64_dbt_buf_t *b, unsigned rt1, unsigned rt2,
+    unsigned rn, uint32_t byte_off)
+{
+    if ((byte_off % 8U) != 0U || byte_off > 504U) {
+        b->overflow = true;
+        return;
+    }
+    sb_word(b, UINT32_C(0xA9400000) | (((byte_off / 8U) & 0x7FU) << 15) |
+        ((rt2 & 31U) << 10) | ((rn & 31U) << 5) | (rt1 & 31U));
+}
+
+static void sb_stp64(sparc64_dbt_buf_t *b, unsigned rt1, unsigned rt2,
+    unsigned rn, uint32_t byte_off)
+{
+    if ((byte_off % 8U) != 0U || byte_off > 504U) {
+        b->overflow = true;
+        return;
+    }
+    sb_word(b, UINT32_C(0xA9000000) | (((byte_off / 8U) & 0x7FU) << 15) |
+        ((rt2 & 31U) << 10) | ((rn & 31U) << 5) | (rt1 & 31U));
+}
+
+/* ADD xdst, xbase, xidx, LSL #sh (one shifted-register add). */
+static void sb_add_lsl(sparc64_dbt_buf_t *b, unsigned xdst, unsigned xbase,
+    unsigned xidx, unsigned sh)
+{
+    if (sh > 63U) {
+        b->overflow = true;
+        return;
+    }
+    sb_word(b, UINT32_C(0x8B000000) | ((xidx & 31U) << 16) |
+        ((sh & 63U) << 10) | ((xbase & 31U) << 5) | (xdst & 31U));
+}
+
 static void f_strb(sparc64_dbt_buf_t *b, unsigned wt, unsigned xn)
 {
     sb_word(b, UINT32_C(0x39000000) | ((xn & 31U) << 5) | (wt & 31U));
@@ -113,28 +151,24 @@ bool sparc64_fast_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
  * current cwp and ERSN the target window across the shuffle; ES2-ES5
  * and EPC are free temporaries. */
 
-/* Compute winfile window address: xdst = base + (xidx << shift). */
+/* Compute winfile window address: xdst = base + (xidx << shift). The
+ * base is a process-global host pointer (not ctx-relative), so the
+ * immediate materialization stays; the index scale folds into one
+ * shifted-register add (two helper calls, not four). */
 static void f_win_addr(sparc64_dbt_buf_t *b, unsigned xdst, uint64_t base,
     unsigned xidx, unsigned shift)
 {
     sb_mov_imm64(b, xdst, base);
-    sb_mov_imm32(b, ES5, shift);
-    sb_lslv(b, true, ES2, xidx, ES5);
-    sb_add_reg(b, true, false, xdst, xdst, ES2);
+    sb_add_lsl(b, xdst, xdst, xidx, shift);
 }
 
 static void f_move4(sparc64_dbt_buf_t *b, unsigned dst_base_reg,
     unsigned dst_first, unsigned src_base_reg, unsigned src_first)
 {
-    unsigned i;
-    for (i = 0U; i < 4U; i++) {
-        sb_ldst_imm(b, true, true, ES2 + i, src_base_reg,
-            (src_first + i) * 8U);
-    }
-    for (i = 0U; i < 4U; i++) {
-        sb_ldst_imm(b, false, true, ES2 + i, dst_base_reg,
-            (dst_first + i) * 8U);
-    }
+    sb_ldp64(b, ES2, ES3, src_base_reg, src_first * 8U);
+    sb_stp64(b, ES2, ES3, dst_base_reg, dst_first * 8U);
+    sb_ldp64(b, ES2, ES3, src_base_reg, (src_first + 2U) * 8U);
+    sb_stp64(b, ES2, ES3, dst_base_reg, (dst_first + 2U) * 8U);
 }
 
 bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
@@ -194,9 +228,9 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         /* winfile[cwp] = L/I image. */
         f_win_addr(b, ES4,
             (uint64_t)(uintptr_t)sparc64_win_file_base(), ES1, 7U);
-        for (i = 0U; i < 16U; i++) {
-            sb_ldst_imm(b, true, true, ES2, ECTX, (16U + i) * 8U);
-            sb_ldst_imm(b, false, true, ES2, ES4, i * 8U);
+        for (i = 0U; i < 16U; i += 2U) {
+            sb_ldp64(b, ES2, ES3, ECTX, (16U + i) * 8U);
+            sb_stp64(b, ES2, ES3, ES4, i * 8U);
         }
         /* winsp[cwp] = %sp. */
         f_win_addr(b, ES4,
@@ -217,9 +251,9 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
             f_win_addr(b, ES4,
                 (uint64_t)(uintptr_t)sparc64_win_file_base(), ERSN,
                 7U);
-            for (i = 0U; i < 8U; i++) {
-                sb_ldst_imm(b, true, true, ES2, ES4, i * 8U);
-                sb_ldst_imm(b, false, true, ES2, ECTX, (16U + i) * 8U);
+            for (i = 0U; i < 8U; i += 2U) {
+                sb_ldp64(b, ES2, ES3, ES4, i * 8U);
+                sb_stp64(b, ES2, ES3, ECTX, (16U + i) * 8U);
             }
             sb_ldst_imm(b, false, false, ERSN, ECTX, 0x250U);
             sb_ldst_imm(b, true, false, ES2, ECTX, 0x254U);
@@ -244,13 +278,13 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
             f_win_addr(b, ES4,
                 (uint64_t)(uintptr_t)sparc64_win_file_base(), ERSN,
                 7U);
-            for (i = 0U; i < 8U; i++) {
-                sb_ldst_imm(b, true, true, ES2, ES4, i * 8U);
-                sb_ldst_imm(b, false, true, ES2, ECTX, (16U + i) * 8U);
+            for (i = 0U; i < 8U; i += 2U) {
+                sb_ldp64(b, ES2, ES3, ES4, i * 8U);
+                sb_stp64(b, ES2, ES3, ECTX, (16U + i) * 8U);
             }
-            for (i = 0U; i < 8U; i++) {
-                sb_ldst_imm(b, true, true, ES2, ES4, (8U + i) * 8U);
-                sb_ldst_imm(b, false, true, ES2, ECTX, (24U + i) * 8U);
+            for (i = 0U; i < 8U; i += 2U) {
+                sb_ldp64(b, ES2, ES3, ES4, (8U + i) * 8U);
+                sb_stp64(b, ES2, ES3, ECTX, (24U + i) * 8U);
             }
             sb_ldst_imm(b, false, false, ERSN, ECTX, 0x250U);
             sb_ldst_imm(b, true, false, ES2, ECTX, 0x258U);
