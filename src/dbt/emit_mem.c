@@ -548,6 +548,26 @@ static bool mem_classify_site(const sparc64_dec_t *d, bool *is_store,
         *width = 8U;
         *is_signed = false;
         return true;
+    case SPARC64_OP3_LDF:
+        *is_store = false;
+        *width = 4U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_LDDF:
+        *is_store = false;
+        *width = 8U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_STF:
+        *is_store = true;
+        *width = 4U;
+        *is_signed = false;
+        return true;
+    case SPARC64_OP3_STDF:
+        *is_store = true;
+        *width = 8U;
+        *is_signed = false;
+        return true;
     default:
         return false;
     }
@@ -568,6 +588,8 @@ bool sparc64_mem_emit_site(struct sparc64_dbt_buf *b,
     bool is_store = false;
     unsigned width = 0U;
     bool is_signed = false;
+    bool is_fp;
+    uint32_t fp_off;
     size_t miss;
     uint32_t idx;
     if (b == NULL || d == NULL) {
@@ -579,8 +601,24 @@ bool sparc64_mem_emit_site(struct sparc64_dbt_buf *b,
     if (acc_n >= SPARC64_DBT_MAX_SITES_PER_BLOCK) {
         return false;
     }
+    is_fp = (d->op3 == (uint8_t)SPARC64_OP3_LDF ||
+        d->op3 == (uint8_t)SPARC64_OP3_LDDF ||
+        d->op3 == (uint8_t)SPARC64_OP3_STF ||
+        d->op3 == (uint8_t)SPARC64_OP3_STDF);
+    if (width == 4U) {
+        fp_off = 0x140U + (((uint32_t)d->rd ^ 1U) & 31U) * 4U;
+    } else {
+        uint32_t pair = (((uint32_t)d->rd & 1U) != 0U)
+            ? (16U + ((uint32_t)d->rd >> 1U))
+            : ((uint32_t)d->rd >> 1U);
+        fp_off = 0x140U + (pair & 31U) * 8U;
+    }
     if (is_store) {
-        e_ld64(b, 0U, d->rd);
+        if (is_fp) {
+            sb_ldst_imm(b, true, width == 8U, 0U, ECTX, fp_off);
+        } else {
+            e_ld64(b, 0U, d->rd);
+        }
     }
     e_ld64(b, 1U, d->rs1);
     e_src2(b, ES1, d);
@@ -607,7 +645,11 @@ bool sparc64_mem_emit_site(struct sparc64_dbt_buf *b,
     acc_sites[idx].reserved = 0U;
     acc_n = idx + 1U;
     if (!is_store) {
-        e_st64(b, d->rd, ES0);
+        if (is_fp) {
+            sb_ldst_imm(b, false, width == 8U, ES0, ECTX, fp_off);
+        } else {
+            e_st64(b, d->rd, ES0);
+        }
         /* Resume past the writeback: the miss path lands here with
          * ctx->r[rd] already updated by the interpreter replay. */
         acc_sites[idx].cont_insn_offset =

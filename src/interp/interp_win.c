@@ -28,16 +28,10 @@ static uint64_t interp_winfile[SPARC64_NWINDOWS][16];
  * [%sp + 2047] slot; Phase 4 fork must copy this beside winfile. */
 static uint64_t interp_winsp[SPARC64_NWINDOWS];
 /* Validity per window: win_valid[w] means winfile[w] holds the image of
- * an outstanding frame (fresh enough to reactivate without a fill).
- * Fresh windows start invalid; a SAVE stash validates the switched-out
- * (still outstanding) frame, a RESTORE stash records a dying frame and
- * so invalidates its source at once, and a fill validates its target.
- * Spill/flush consult validity, never the saturating cansave/canrestore
- * counters (those cap at 7 and lose count past 8 nested frames, causing
- * spurious fills that clobber resident images and poison winsp and the
- * %o6 chain). Validity implies the frame is outstanding, so its home
- * slot cannot overlap live descendant stack data; dead images are never
- * written back. Phase 4 fork must copy this beside winfile. */
+ * an outstanding frame. SAVE validates the switched-out frame, RESTORE
+ * invalidates its source, fills validate targets; spill/flush consult
+ * validity, never the saturating cansave/canrestore counters. Phase 4
+ * fork must copy this beside winfile. */
 static bool win_valid[SPARC64_NWINDOWS];
 
 /* Fresh-process init is lazy: sparc64_ctx_init() zeroes the counters, and
@@ -895,3 +889,8 @@ sparc64_step_result_t sparc64_exec_priv(sparc64_cpu_t *cpu,
     }
     return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
 }
+
+/* Lane P5: DBT fast-path window bases; spill/fill stay on the slow path. */
+uint64_t *sparc64_win_file_base(void) { return &interp_winfile[0][0]; }
+uint64_t *sparc64_win_sp_base(void) { return &interp_winsp[0]; }
+bool *sparc64_win_valid_base(void) { return &win_valid[0]; }

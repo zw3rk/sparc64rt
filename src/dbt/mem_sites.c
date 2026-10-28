@@ -16,10 +16,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dbt/dbt.h"
 #include "interp/interp.h"
 #include "os/guest_run_priv.h"
 #include "os/mem_space.h"
 #include "os/mem_space_split.h"
+
+/* Lane P5: live dispatcher for the EXEC write-fill guard below.
+ * dbt.c publishes it on every run/step entry; NULL (or a page covered
+ * by an emitted block) conservatively declines the fill. */
+extern sparc64_dbt_t *sparc64_dbt_live(void);
+
+/* True when an emitted (host_code) block covers the 4 KiB page. Blocks
+ * never cross pages, so the start PC's page decides. */
+static bool page_has_code(uint64_t page)
+{
+    sparc64_dbt_t *dbt = sparc64_dbt_live();
+    uint32_t i;
+    if (dbt == NULL) {
+        return true;
+    }
+    for (i = 0U; i < SPARC64_DBT_CACHE_SIZE; i++) {
+        const sparc64_dbt_block_t *b = &dbt->blocks[i];
+        if (b->valid && b->host_code != NULL &&
+            (b->start_pc & ~(uint64_t)UINT64_C(0xfff)) == page) {
+            return true;
+        }
+    }
+    return false;
+}
 
 sparc64_tlb_entry_t sparc64_dbt_tlb[SPARC64_TLB_SIZE]
     __attribute__((aligned(32)));
@@ -71,6 +96,32 @@ void sparc64_tlb_invalidate_gva(uint64_t gva, uint64_t len)
     for (i = UINT64_C(0); i < pages; i++) {
         uint64_t idx = (vpn + i) & (uint64_t)(SPARC64_TLB_SIZE - 1u);
         sparc64_dbt_tlb[idx].read_tag = SPARC64_TLB_INVALID_TAG;
+        sparc64_dbt_tlb[idx].write_tag = SPARC64_TLB_INVALID_TAG;
+    }
+}
+
+/* Lane P5: drop only the writable tags over [gva, gva+len) when fresh
+ * code lands on the page (dbt_translate). Reads keep their fills;
+ * stores miss again and the fill guard below declines them while code
+ * is present, so no fast store can run against stale code. */
+void sparc64_tlb_evict_writes(uint64_t gva, uint64_t len)
+{
+    uint64_t pages;
+    uint64_t vpn;
+    uint64_t i;
+    if (len == UINT64_C(0)) {
+        return;
+    }
+    pages = (len + UINT64_C(0xfff)) >> 12;
+    vpn = (gva >> 12) & (uint64_t)(SPARC64_TLB_SIZE - 1u);
+    if (pages >= UINT64_C(512) || pages == UINT64_C(0)) {
+        for (i = UINT64_C(0); i < (uint64_t)SPARC64_TLB_SIZE; i++) {
+            sparc64_dbt_tlb[i].write_tag = SPARC64_TLB_INVALID_TAG;
+        }
+        return;
+    }
+    for (i = UINT64_C(0); i < pages; i++) {
+        uint64_t idx = (vpn + i) & (uint64_t)(SPARC64_TLB_SIZE - 1u);
         sparc64_dbt_tlb[idx].write_tag = SPARC64_TLB_INVALID_TAG;
     }
 }
@@ -163,11 +214,12 @@ uint32_t sparc64_mem_slow_step(sparc64_ctx_t *ctx,
  * Anything unexpected (foreign mc, unmapped page, BUS view, non-heap
  * or file-backed pages) declines so the caller skips the fill: the
  * miss path stays correct, only the next access misses again.
- * Write fills additionally require a directly host-writable page
- * (WRITE without EXEC, so SMC stores keep trapping to the slow path
- * and today's block-cache behavior is unchanged). File-backed
- * (family) pages never fill: their refresh path can republish bytes
- * without TLB invalidation. */
+ * Write fills additionally require a directly host-writable page:
+ * WRITE without EXEC always fills; WRITE with EXEC (PF_X .data/.bss)
+ * fills only when no translated block covers the page (Lane P5), so
+ * SMC stores keep trapping to the slow path. File-backed (family)
+ * pages never fill: their refresh path can republish bytes without
+ * TLB invalidation. */
 static bool mem_resolve_host(void *mc, uint64_t gva,
     uintptr_t *addend_out, bool *readable_out, bool *writable_out)
 {
@@ -203,9 +255,16 @@ static bool mem_resolve_host(void *mc, uint64_t gva,
     }
     *readable_out =
         (pg->permissions & (unsigned)SPARC64_MEM_READ) != 0U;
-    *writable_out =
-        ((pg->permissions & (unsigned)SPARC64_MEM_WRITE) != 0U) &&
-        ((pg->permissions & (unsigned)SPARC64_MEM_EXEC) == 0U);
+    if (((pg->permissions & (unsigned)SPARC64_MEM_WRITE) != 0U) &&
+        ((pg->permissions & (unsigned)SPARC64_MEM_EXEC) == 0U)) {
+        *writable_out = true;
+    } else if (((pg->permissions & (unsigned)SPARC64_MEM_WRITE) != 0U) &&
+        !page_has_code(page)) {
+        /* Lane P5: PF_X .data/.bss page with no translated blocks. */
+        *writable_out = true;
+    } else {
+        *writable_out = false;
+    }
     *addend_out = (uintptr_t)bk->bytes - (uintptr_t)page;
     return true;
 }

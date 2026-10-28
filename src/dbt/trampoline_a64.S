@@ -11,12 +11,13 @@
  *
  * Register contract (matches src/dbt/dbt.h and src/core/cpu.h offsets):
  *   x0 = ctx, x1 = entry (host RX address in the DBT code arena),
- *   x2 = chaining entry for x27 (slots provisioned by dbt.c),
+ *   x2 = chain context for x27 ({ibtc, blocks, pages, epoch_ptr}),
  *   x3 = epoch word for x28 (&dbt->epoch to allow chaining).
  * Every emitted exit returns via `ret` with the resume/fault guest PC
- * in x15 and the SPARC64_EXIT_* reason in w16; the trampoline stores
- * w16 -> ctx->exit_reason (0x270) and x15 -> ctx->exit_dest (0x280)
- * and returns to the C dispatcher, which commits pc/npc from the exit.
+ * in x15 and the SPARC64_EXIT_* reason in w16; BRANCH exits chain
+ * in-trampoline (Lane P5) while any other exit stores w16 ->
+ * ctx->exit_reason (0x270) and x15 -> ctx->exit_dest (0x280) and
+ * returns to the C dispatcher, which commits pc/npc from the exit.
  * sparc64_dbt_enter_step points x28 at a zero epoch word instead, so
  * every epoch-gated chain probe bails and exactly one guest
  * instruction executes (difftest lockstep).
@@ -50,6 +51,79 @@
     /* Enter translated code; fragments return here via `ret`. */
     blr x1
 
+/* Lane P5: epoch-safe in-trampoline IBTC chaining. A BRANCH exit
+ * (reason 1, next PC in x15) probes the IBTC and the block cache
+ * exactly like dbt_ibtc_probe (valid, epoch vs *x28, key, index
+ * bounds, block valid/epoch/start, host code present, start-page
+ * version); on a hit the next fragment runs without returning to C.
+ * Any miss commits the exit to ctx and returns. x27 = chain context
+ * {ibtc, blocks, pages, epoch_ptr} (see dbt.c); x28 = live epoch
+ * word (a zero word under enter_step, so every probe bails). The
+ * chained fragment returns here via `ret`; x19/x20/x27/x28 are
+ * callee-saved and never touched by emitted code. Layout constants
+ * below mirror dbt.h and are compile-checked there. */
+.Ldbt_chain_try:
+    cmp w16, #1
+    b.ne .Ldbt_chain_commit
+    cbz x27, .Ldbt_chain_commit
+    ldr x4, [x27, #24]
+    ldr w5, [x4]
+    lsr x6, x15, #2
+    and x6, x6, #0xfff
+    ldr x7, [x27]
+    lsl x8, x6, #4
+    lsl x9, x6, #3
+    add x8, x8, x9
+    add x7, x7, x8
+    ldrb w8, [x7, #16]
+    cbz w8, .Ldbt_chain_commit
+    ldr w9, [x7, #12]
+    cmp w9, w5
+    b.ne .Ldbt_chain_commit
+    ldr x9, [x7]
+    cmp x9, x15
+    b.ne .Ldbt_chain_commit
+    ldr w9, [x7, #8]
+    cmp w9, #4, lsl #12
+    b.hs .Ldbt_chain_commit
+    ldr x10, [x27, #8]
+    lsl x11, x9, #5
+    lsl x12, x9, #4
+    add x11, x11, x12
+    add x10, x10, x11
+    ldrb w11, [x10, #28]
+    cbz w11, .Ldbt_chain_commit
+    ldr w11, [x10, #24]
+    cmp w11, w5
+    b.ne .Ldbt_chain_commit
+    ldr x11, [x10]
+    cmp x11, x15
+    b.ne .Ldbt_chain_commit
+    ldr x11, [x10, #40]
+    cbz x11, .Ldbt_chain_commit
+    lsr x12, x15, #12
+    and x13, x12, #0x1ff
+    lsl x13, x13, #4
+    ldr x14, [x27, #16]
+    add x13, x14, x13
+    ldrb w14, [x13, #12]
+    cbz w14, .Ldbt_chain_ver0
+    ldr x14, [x13]
+    cmp x14, x12
+    b.ne .Ldbt_chain_ver0
+    ldr w14, [x13, #8]
+    b .Ldbt_chain_verchk
+.Ldbt_chain_ver0:
+    mov w14, #0
+.Ldbt_chain_verchk:
+    ldr w12, [x10, #20]
+    cmp w12, w14
+    b.ne .Ldbt_chain_commit
+    mov x1, x11
+    blr x11
+    b .Ldbt_chain_try
+
+.Ldbt_chain_commit:
     /* Commit the exit: w16 -> exit_reason, x15 -> exit_dest. */
     str w16, [x19, #0x270]
     str x15, [x19, #0x280]

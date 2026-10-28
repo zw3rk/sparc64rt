@@ -4,23 +4,17 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Integer emitter with interpreter-identical semantics (--difftest).
- * Inline: SETHI, ALU + dual icc/xcc, ADDX/SUBX + cc (carry from icc.C),
- * MULX/UMUL/SMUL, UDIVX/SDIVX/UDIV/SDIV (+cc, div-by-zero trap, SDIV
- * saturation), POPC (helper), TADD/TSUB (+TV trap), MULSCC, shifts
- * (full-64 SLL/SRL, sign-31/63 SRA), MOVcc/MOVr, RDASR/WRASR user
- * state, ALIGNADDR, CALL/Bicc/BPcc/BPr/JMPL/RETURN + delays/annul,
- * Tcc (syscall gate). Helpers (emit_priv.h): mem (alignment + ASI +
- * BE via interp backend), SAVE/RESTORE (shared window file).
- * Misaligned access faults, never emulates; PRIV/FPU/FBR/odd
- * encodings fall back. Contract: x19 = ctx, scratch x9-x14, exits
- * carry PC in x15 and reason in w16; never x18.
+ * Integer emitter (--difftest). x19 = ctx, scratch x9-x14, exits
+ * carry PC in x15 and reason in w16; never x18. PRIV/FBR/odd
+ * encodings fall back; FPU delays lower via emit_fp.h (Lane P5).
  */
 
 #include "dbt/emit_int.h"
 
 #include <stdint.h>
 
+#include "dbt/emit_fast.h"
+#include "dbt/emit_fp.h"
 #include "dbt/emit_mem.h"
 #include "dbt/emit_priv.h"
 
@@ -76,6 +70,7 @@ static bool e_delay_is_plain(const sparc64_dec_t *d)
     case SPARC64_ICLS_ATOMIC:
     case SPARC64_ICLS_SAVE:
     case SPARC64_ICLS_RESTORE:
+    case SPARC64_ICLS_FPU:
         return true;
     default:
         return false;
@@ -90,10 +85,13 @@ static bool e_emit_delay(sparc64_emit_ctx_t *ec)
     if (d == NULL || !e_delay_is_plain(d)) {
         return false;
     }
+    if (d->cls == (uint8_t)SPARC64_ICLS_FPU) {
+        return sparc64_emit_fp(ec, d);
+    }
     return e_emit_one(ec, d);
 }
 
-/* True when the delay slot runs on this path (interp annul rules). */
+/* Delay runs on this path (interp annul rules). */
 static bool e_delay_runs(uint8_t cls, unsigned cond, bool taken,
     bool annul)
 {
@@ -106,7 +104,7 @@ static bool e_delay_runs(uint8_t cls, unsigned cond, bool taken,
     return !annul;
 }
 
-/* ---- per-class emitters ------------------------------------------------- */
+/* ---- per-class emitters ---- */
 
 static bool e_emit_sethi(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
@@ -116,8 +114,7 @@ static bool e_emit_sethi(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Complex ALU via helper: x0=ctx x1=op3 x2=rs1 x3=rs2-or-imm32
- * x4=is_imm x5=rd x6=pc, BLR s64_rt_alu; backend sets Y/cc/traps. */
+/* Complex ALU via helper s64_rt_alu (Y/cc/traps). */
 static size_t e_call_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -205,7 +202,7 @@ static bool e_emit_alu_simple(sparc64_emit_ctx_t *ec,
 
 
 
-/* ADDCC/SUBCC/ADDXCC/SUBXCC: icc from low 32, xcc from full 64. */
+/* ADDCC/SUBCC/ADDXCC/SUBXCC. */
 static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
     const sparc64_dec_t *d)
 {
@@ -270,7 +267,7 @@ static bool e_emit_addsubcc(sparc64_emit_ctx_t *ec,
     return !b->overflow;
 }
 
-/* Logic cc: N/Z from bit31/low32-zero (icc), bit63/full-zero (xcc). */
+/* Logic cc. */
 static bool e_emit_logiccc(sparc64_emit_ctx_t *ec,
     const sparc64_dec_t *d)
 {
@@ -316,7 +313,7 @@ static bool e_emit_logiccc(sparc64_emit_ctx_t *ec,
 
 
 
-/* Integer MOVcc: conditional move selected by the icc/xcc nibble. */
+/* Integer MOVcc. */
 static bool e_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -347,7 +344,7 @@ static bool e_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Integer MOVr: conditional move selected by the full 64-bit register. */
+/* Integer MOVr. */
 static bool e_emit_movr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -405,7 +402,7 @@ static bool e_emit_movr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* User state: %y/%ccr/%asi/%fprs/%gsr; other numbers fall back. */
+/* User state reads/writes. */
 static bool e_emit_rdasr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -466,7 +463,7 @@ static bool e_emit_wrasr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* ALIGNADDR/ALIGNADDRL: rd = sum & ~7, GSR low 3 bits = sum & 7. */
+/* ALIGNADDR/ALIGNADDRL. */
 static bool e_emit_align(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -485,14 +482,13 @@ static bool e_emit_align(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* True when the delay slot inlines; validated without emitting. */
+/* Delay slot inlines (validated without emitting). */
 static bool e_delay_plain(sparc64_emit_ctx_t *ec)
 {
     return ec->delay != NULL && e_delay_is_plain(ec->delay);
 }
 
-/* CALL: %o7 = pc, then delay, then pc += disp. Link precedes delay;
- * pristine fallback when the delay cannot inline. */
+/* CALL. */
 static bool e_emit_call(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -511,7 +507,7 @@ static bool e_emit_call(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* BPr rcond to AArch64 condition (same patch kind as emitted). */
+/* BPr rcond mapping. */
 static unsigned e_bpr_cond(unsigned rcond, bool *is_cb)
 {
     *is_cb = (rcond == 1U || rcond == 5U);
@@ -530,7 +526,7 @@ static unsigned e_bpr_cond(unsigned rcond, bool *is_cb)
     return 10U;
 }
 
-/* Bicc/BPcc/BPr: condition, annul, delay, pc/npc per reference. */
+/* Bicc/BPcc/BPr. */
 static bool e_emit_branch(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -611,15 +607,15 @@ static bool e_emit_branch(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* JMPL/RETURN: trap misaligned targets, run delay, then transfer.
- * JMPL writes rd = pc; RETURN restores first (sum to %g0), no write.
- * Target snapshotted (H3); SAVE/RESTORE delays under RETURN replay. */
+static bool e_emit_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
+    bool is_save);
+
+/* JMPL/RETURN. */
 static bool e_emit_jmpl_ret(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     bool is_ret)
 {
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_misaligned;
-    size_t p_fault;
     if (is_ret && (ec->mem == NULL || (ec->delay != NULL &&
             (ec->delay->cls == SPARC64_ICLS_SAVE ||
             ec->delay->cls == SPARC64_ICLS_RESTORE)))) {
@@ -641,13 +637,8 @@ static bool e_emit_jmpl_ret(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         e_st64(b, d->rd, ES1);
     }
     sb_push64(b, ES0);
-    if (is_ret) {
-        /* V9 A.45: the implicit restore precedes the delay slot. */
-        p_fault = e_call_win(ec, SPARC64_G0, false);
-        if (p_fault == SPARC64_DBT_NOPOS) {
-            return false;
-        }
-        e_resolve_fault(ec, p_fault);
+    if (is_ret && !e_emit_win(ec, &(sparc64_dec_t){ 0 }, false)) {
+        return false;
     }
     if (!e_emit_delay(ec)) {
         return false;
@@ -664,8 +655,7 @@ static bool e_emit_jmpl_ret(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     return !b->overflow;
 }
 
-/* Tcc: false falls through; true 0x6d..0x6f is the syscall gate,
- * other true numbers fault out to the interpreter. */
+/* Tcc. */
 static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
@@ -714,7 +704,7 @@ static bool e_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !b->overflow;
 }
 
-/* Mem via the inline Soft-TLB fast path; refusals use the backend. */
+/* Mem via Soft-TLB. */
 static bool e_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     size_t p_fault;
@@ -729,7 +719,7 @@ static bool e_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     return !ec->buf->overflow;
 }
 
-/* SAVE/RESTORE funnel through the shared window file. */
+/* SAVE/RESTORE (Lane P5 fast path, helper fallback). */
 static bool e_emit_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     bool is_save)
 {
@@ -737,6 +727,9 @@ static bool e_emit_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     size_t p_fault;
     if (ec->mem == NULL) {
         return false;
+    }
+    if (sparc64_fast_win(ec, d, is_save)) {
+        return !b->overflow;
     }
     e_ld64(b, ES0, d->rs1);
     e_src2(b, ES1, d);
@@ -833,6 +826,10 @@ static bool e_emit_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     case SPARC64_OP3_SMUL:
     case SPARC64_OP3_UDIVX:
     case SPARC64_OP3_SDIVX:
+        if (sparc64_fast_alu(ec, d)) {
+            return !ec->buf->overflow;
+        }
+        return e_emit_alu_helper(ec, d);
     case SPARC64_OP3_UDIV:
     case SPARC64_OP3_SDIV:
     case SPARC64_OP3_POPC:
@@ -864,8 +861,7 @@ static bool e_emit_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     }
 }
 
-/* Shifts: SLL/SRL with x==0 touch low32 only (V9 A.48); SRA
- * extends bit 31 (plain) or 63 (X forms). Counts mask to 5/6. */
+/* Shifts. */
 static bool e_emit_shift(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;

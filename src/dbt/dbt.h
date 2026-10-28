@@ -31,7 +31,7 @@
 /* Translation limits: up to 64 guest insns per block, stopping at
  * control transfers or guest page boundaries (never crossing pages). */
 #define SPARC64_DBT_MAX_INSNS_PER_BLOCK 64U
-#define SPARC64_DBT_CACHE_SIZE 1024U
+#define SPARC64_DBT_CACHE_SIZE 16384U
 #define SPARC64_DBT_PAGE_TABLE_SIZE 512U
 #define SPARC64_DBT_CODE_ARENA_SIZE (4U * 1024U * 1024U)
 #define SPARC64_DBT_PAGE_SHIFT 12U /* 4096-byte guest pages */

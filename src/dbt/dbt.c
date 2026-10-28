@@ -4,31 +4,11 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 2 lane L2b (docs/lanes/phase-2.md) plus coordinator RC2 emission
- * wiring. The block cache, W^X code arena, direct-chaining dispatcher,
- * IBTC, and RAS live here; integer lowering is L2c's src/dbt/emit_int.h
- * (dbt_emit_range below). Emitted blocks run natively through the
- * trampoline and exit back per instruction (BRANCH chains, SYSCALL
- * stops, anything else replays one interpreter step for precise traps).
- * Blocks the classifier marks PRIV/FPU/FBR/ILLEGAL, or whose delay slot
- * the emitter refuses, always take the interpreter fallback with
- * identical protocol.
- *
- * Exit reporting: sparc64_dbt_run returns the first non-CONTINUE step
- * result (SYSCALL with no register or pc change, precise TRAP with
- * TPC/TNPC fixup already applied by sparc64_step) so the caller handles
- * it exactly like an interpreter stop. EXIT_UNDEF-style stops (Phase 3
- * FPU/FBR markers surface as TRAP/ILLEGAL with the raw word in tval)
- * are replayed one interpreter step at a time by construction.
- *
- * W^X: emitted code (L2c) stages into the anonymous RW arena; the run
- * loop flips it to PROT_READ | PROT_EXEC and clears the I-cache (via
- * a32host.h) before any execution, reopening RW only to translate.
- * Guest data pages are never mapped PROT_EXEC.
- *
- * Invariants: every file <= 900 lines; curated C11 (no VLAs); full
- * 64-bit guest addresses, never truncated; no x18 anywhere (no inline
- * asm at all; the trampoline owns the asm and avoids x18 too).
+ * Phase 2 lane L2b: block cache, W^X arena, chaining dispatcher,
+ * IBTC, RAS. PRIV/ILLEGAL (and refused delays) fall back to interp.
+ * sparc64_dbt_run returns the first non-CONTINUE step like an
+ * interpreter stop. Invariants: <= 900 lines/file, C11, full 64-bit
+ * VAs, no x18 (asm lives in the trampoline only).
  */
 
 #include <string.h>
@@ -45,10 +25,8 @@
  * the dbt->vm edge to this single call (like the trampoline decls). */
 extern void vm64_seq_publish(uint64_t base, uint64_t size);
 
-/* Trampoline entries (trampoline_a64.S): ctx in x0, fragment entry in
- * x1, chaining entry in x2 (unused by exit-to-dispatcher fragments),
- * epoch word in x3. enter_step additionally pins x28 at a zero word
- * so any future epoch-gated chain probe bails after one fragment. */
+/* Trampoline entries: x0 = ctx, x1 = entry, x2 = chain ctx,
+ * x3 = epoch word (zero word under enter_step: probes bail). */
 extern void sparc64_dbt_enter(sparc64_ctx_t *ctx, const void *entry,
     const void *chain, const void *epoch);
 extern void sparc64_dbt_enter_step(sparc64_ctx_t *ctx, const void *entry,
@@ -61,6 +39,61 @@ extern void sparc64_dbt_enter_step(sparc64_ctx_t *ctx, const void *entry,
 #define DBT_EMIT_STAGE_WORDS (DBT_EMIT_STAGE_BYTES / 4U)
 /* Invalidate wider than this many pages courses to a full flush. */
 #define DBT_MAX_PRECISE_PAGES 4096U
+
+/* Lane P5: live dispatcher for the Soft-TLB EXEC write-fill guard
+ * (mem_sites.c page_has_code). The TLB is already process-global, so
+ * this shares its single-guest assumption; published on run/step. */
+static sparc64_dbt_t *dbt_live;
+
+sparc64_dbt_t *sparc64_dbt_live(void)
+{
+    return dbt_live;
+}
+
+/* Lane P5: in-trampoline chaining context, mirrored by the probe in
+ * trampoline_a64.S ({ibtc, blocks, pages, epoch_ptr}). Published on
+ * every run/step entry alongside dbt_live. */
+struct dbt_chain_ctx {
+    const sparc64_dbt_ibtc_t *ibtc;
+    const sparc64_dbt_block_t *blocks;
+    const sparc64_dbt_page_t *pages;
+    const uint32_t *epoch;
+};
+
+static struct dbt_chain_ctx dbt_chain;
+
+/* Trampoline probe layout contract (trampoline_a64.S hardcodes these
+ * field offsets; break the build loudly if dbt.h ever drifts). */
+_Static_assert(sizeof(sparc64_dbt_ibtc_t) == 24U, "ibtc stride");
+_Static_assert(offsetof(sparc64_dbt_ibtc_t, key) == 0U, "ibtc key");
+_Static_assert(offsetof(sparc64_dbt_ibtc_t, index) == 8U, "ibtc index");
+_Static_assert(offsetof(sparc64_dbt_ibtc_t, epoch) == 12U, "ibtc epoch");
+_Static_assert(offsetof(sparc64_dbt_ibtc_t, valid) == 16U, "ibtc valid");
+_Static_assert(sizeof(sparc64_dbt_block_t) == 48U, "block stride");
+_Static_assert(offsetof(sparc64_dbt_block_t, start_pc) == 0U, "blk start");
+_Static_assert(offsetof(sparc64_dbt_block_t, page_version) == 20U,
+    "blk pagever");
+_Static_assert(offsetof(sparc64_dbt_block_t, epoch) == 24U, "blk epoch");
+_Static_assert(offsetof(sparc64_dbt_block_t, valid) == 28U, "blk valid");
+_Static_assert(offsetof(sparc64_dbt_block_t, host_code) == 40U,
+    "blk code");
+_Static_assert(sizeof(sparc64_dbt_page_t) == 16U, "page stride");
+_Static_assert(offsetof(sparc64_dbt_page_t, vpn) == 0U, "page vpn");
+_Static_assert(offsetof(sparc64_dbt_page_t, version) == 8U, "page ver");
+_Static_assert(offsetof(sparc64_dbt_page_t, valid) == 12U, "page valid");
+
+static void dbt_publish_chain(sparc64_dbt_t *dbt)
+{
+    dbt_live = dbt;
+    dbt_chain.ibtc = &dbt->ibtc[0];
+    dbt_chain.blocks = &dbt->blocks[0];
+    dbt_chain.pages = &dbt->pages[0];
+    dbt_chain.epoch = &dbt->epoch;
+}
+
+/* Lane P5: drop Soft-TLB writable tags where fresh code lands
+ * (mem_sites.c); declared locally to keep the dbt->tlb edge here. */
+extern void sparc64_tlb_evict_writes(uint64_t gva, uint64_t len);
 
 static uint32_t dbt_cache_index(uint64_t pc)
 {
@@ -230,25 +263,14 @@ static bool dbt_is_cti(const sparc64_dec_t *d)
         d->cls == (uint8_t)SPARC64_ICLS_BICC ||
         d->cls == (uint8_t)SPARC64_ICLS_BPCC ||
         d->cls == (uint8_t)SPARC64_ICLS_BPR ||
+        d->cls == (uint8_t)SPARC64_ICLS_FBR ||
         d->cls == (uint8_t)SPARC64_ICLS_TCC;
 }
 
 /* ---- L2c emission (coordinator, RC2) ---- */
 
-/* A delay slot is emittable only as a plain data/control op: a CTI,
- * Tcc, privileged, FPU, or illegal delay ends the block before the CTI
- * (the emitter refuses it and the interpreter replays both). SETHI
- * (which covers nop) plus the no-op MEMBAR/FLUSH are accepted on top
- * of the ALU/memory baseline: without SETHI, ordinary sethi/nop
- * delay fillers silently force whole blocks into the interpreter
- * fallback (H3: 78% of CoreMark block entries fell back for this
- * reason alone). This list mirrors e_delay_is_plain in emit_int.c:
- * SETHI covers nop fillers; SAVE/RESTORE are safe because JMPL now
- * snapshots a register-indirect target before the delay slot instead
- * of re-reading it after a window rotation (interp exec_cti order;
- * the old recompute jumped into the wrong window on ret-with-
- * restore). Keep the two lists in sync: any skew reintroduces
- * silent fallback-or-divergence risk. */
+/* Emittable delay slots (mirrors e_delay_is_plain; FPU via emit_fp).
+ * CTI/Tcc/privileged/illegal delays end the block before the CTI. */
 static bool dbt_delay_emittable(const sparc64_dec_t *d)
 {
     switch (d->cls) {
@@ -269,6 +291,7 @@ static bool dbt_delay_emittable(const sparc64_dec_t *d)
     case SPARC64_ICLS_ALIGN:
     case SPARC64_ICLS_SAVE:
     case SPARC64_ICLS_RESTORE:
+    case SPARC64_ICLS_FPU:
         return true;
     default:
         return false;
@@ -319,7 +342,11 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
                 goto fail;
             }
             ec.delay = &dl;
-            if (!sparc64_emit_int(&ec, &d)) {
+            if (d.cls == (uint8_t)SPARC64_ICLS_FBR) {
+                if (!sparc64_emit_fbr(&ec, &d)) {
+                    goto fail;
+                }
+            } else if (!sparc64_emit_int(&ec, &d)) {
                 goto fail;
             }
             break;
@@ -419,8 +446,12 @@ static bool dbt_delay_continuation(const sparc64_mem_ops_t *mem, void *mc,
         taken = sparc64_eval_rcond(d.cond, ctx->r[d.rs1]);
         target = taken ? dst + (uint64_t)d.disp : dst + UINT64_C(8);
         break;
+    case SPARC64_ICLS_FBR:
+        taken = sparc64_eval_fcond(d.cond, ctx->fcc[d.cc & 3U]);
+        target = taken ? dst + (uint64_t)d.disp : dst + UINT64_C(8);
+        break;
     default:
-        /* TCC, FBR, and plain instructions replay sequentially. */
+        /* TCC and plain instructions replay sequentially. */
         return false;
     }
     /* An annulled-away delay never ran: replay the CTI itself, whose
@@ -483,10 +514,12 @@ static sparc64_step_result_t dbt_enter_block(sparc64_ctx_t *ctx,
     const sparc64_mem_ops_t *mem, void *mc, sparc64_dbt_t *dbt,
     const void *code, bool single)
 {
+    /* Lane P5: hand the trampoline the chaining context (x27); the
+     * epoch word (x28) gates every probe, including single-step. */
     if (single) {
-        sparc64_dbt_enter_step(ctx, code, NULL, &dbt->epoch);
+        sparc64_dbt_enter_step(ctx, code, &dbt_chain, &dbt->epoch);
     } else {
-        sparc64_dbt_enter(ctx, code, NULL, &dbt->epoch);
+        sparc64_dbt_enter(ctx, code, &dbt_chain, &dbt->epoch);
     }
     return dbt_commit_exit(ctx, mem, mc);
 }
@@ -548,6 +581,7 @@ static const sparc64_dbt_block_t *dbt_translate(
         case SPARC64_ICLS_BICC:
         case SPARC64_ICLS_BPCC:
         case SPARC64_ICLS_BPR:
+        case SPARC64_ICLS_FBR:
             ends_cti = true;
             end = cur + 8U; /* Delay slot executes inline. */
             stop = true;
@@ -558,7 +592,6 @@ static const sparc64_dbt_block_t *dbt_translate(
             stop = true;
             break;
         case SPARC64_ICLS_PRIV:
-        case SPARC64_ICLS_FBR:
         case SPARC64_ICLS_ILLEGAL:
             /* Rare/system/privileged: pristine interpreter fallback. */
             needs_interp = true;
@@ -598,6 +631,11 @@ static const sparc64_dbt_block_t *dbt_translate(
     b->host_code = (const void *)staging;
     dbt->cached_count += 1U;
     dbt->stat_blocks += 1U;
+    if (staging != NULL && end > pc) {
+        /* Fresh code on the page: evict writable TLB tags so later
+         * stores miss and the fill guard re-checks for code. */
+        sparc64_tlb_evict_writes(pc, end - pc);
+    }
     return b;
 }
 
@@ -616,6 +654,7 @@ sparc64_step_result_t sparc64_dbt_step_one(sparc64_dbt_t *dbt,
     if (dbt == NULL) {
         return sparc64_step(ctx, mem, mc);
     }
+    dbt_publish_chain(dbt);
     if (!dbt_fetch_classify(mem, mc, pc, &d)) {
         sparc64_step_result_t fail;
         (void)sparc64_fetch_word(mem, mc, pc, &(uint32_t){ 0U },
@@ -759,6 +798,7 @@ sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
     if (ctx == NULL || mem == NULL || dbt == NULL) {
         return dbt_internal((ctx != NULL) ? ctx->pc : UINT64_C(0));
     }
+    dbt_publish_chain(dbt);
     for (;;) {
         const sparc64_dbt_block_t *b;
         sparc64_step_result_t fail;

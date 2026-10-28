@@ -156,4 +156,8 @@ uint32_t sparc64_mem_slow_step(sparc64_ctx_t *ctx,
 void *sparc64_mem_miss(sparc64_ctx_t *ctx, uint64_t gva, uint64_t val,
     const sparc64_mem_block_t *blk, uint32_t site_idx);
 
+/* Lane P5: drop only writable Soft-TLB tags over [gva, gva+len) when
+ * fresh code lands on the page. Reads keep their fills. */
+void sparc64_tlb_evict_writes(uint64_t gva, uint64_t len);
+
 #endif /* SPARC64RT_DBT_MEM_SITES_H */

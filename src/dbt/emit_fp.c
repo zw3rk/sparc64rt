@@ -28,6 +28,8 @@
 
 #include <stdint.h>
 
+#include "dbt/emit_int.h"
+#include "dbt/emit_mem.h"
 #include "dbt/emit_priv.h"
 
 /* AArch64 scalar FP bases (Rd/Rn/Rm zero; OR the register fields in).
@@ -58,68 +60,10 @@
 #define FP_SCVTF_D_X UINT32_C(0x9e620000)
 #define FP_FCVT_D_S UINT32_C(0x1e22c000)
 #define FP_FCVT_S_D UINT32_C(0x1e624000)
-#define FP_FMOV_X_D UINT32_C(0x9e660000)
-#define FP_FMOV_W_S UINT32_C(0x1e260000)
 #define FP_FMOV_S_W UINT32_C(0x1e270000)
 #define FP_FMOV_D_X UINT32_C(0x9e670000)
-#define FP_FCMP_S UINT32_C(0x1e202000)
-#define FP_FCMP_D UINT32_C(0x1e602000)
 
 /* Guest FP file base (ctx + 0x140); FSR at ctx + 0x120. */
-#define FP_FILE_OFF 0x140U
-#define FP_FSR_OFF 0x120U
-
-/* Scalar FP data-processing with two sources: base | Rd | Rn<<5 | Rm<<16
- * (FADD/FSUB/FMUL/FDIV). Single-source ops (FSQRT/FMOV/FNEG/FABS/FCVT*)
- * use the same layout with the Rm field zero in the base. */
-static inline void fp_alu(sparc64_dbt_buf_t *b, uint32_t base, unsigned vd,
-    unsigned vn, unsigned vm)
-{
-    sb_word(b, base | (vd & 31U) | ((vn & 31U) << 5) |
-        ((vm & 31U) << 16));
-}
-
-/* Guest FP slot of single arch f[arch] (slot arch^1) and double
- * field (d[field>>1], upper bank at d[16+(field>>1)] when odd). */
-static inline unsigned fp_slot_s(unsigned arch)
-{
-    return (arch ^ 1U) & 31U;
-}
-
-static inline unsigned fp_pair_d(unsigned field)
-{
-    return ((field & 1U) != 0U) ? (16U + (field >> 1U)) : (field >> 1U);
-}
-
-/* LDR St,[x19,#off] / STR St,[x19,#off]: single arch f[arch]. */
-static inline void fp_ld_s(sparc64_dbt_buf_t *b, unsigned vt, unsigned arch)
-{
-    uint32_t off = FP_FILE_OFF + fp_slot_s(arch) * 4U;
-    sb_word(b, UINT32_C(0xbd400000) | (vt & 31U) | (19U << 5) |
-        ((off / 4U) << 10));
-}
-
-static inline void fp_st_s(sparc64_dbt_buf_t *b, unsigned vt, unsigned arch)
-{
-    uint32_t off = FP_FILE_OFF + fp_slot_s(arch) * 4U;
-    sb_word(b, UINT32_C(0xbd000000) | (vt & 31U) | (19U << 5) |
-        ((off / 4U) << 10));
-}
-
-/* LDR Dt,[x19,#off] / STR Dt,[x19,#off]: double field (even/odd). */
-static inline void fp_ld_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned field)
-{
-    uint32_t off = FP_FILE_OFF + fp_pair_d(field) * 8U;
-    sb_word(b, UINT32_C(0xfd400000) | (vt & 31U) | (19U << 5) |
-        ((off / 8U) << 10));
-}
-
-static inline void fp_st_d(sparc64_dbt_buf_t *b, unsigned vt, unsigned field)
-{
-    uint32_t off = FP_FILE_OFF + fp_pair_d(field) * 8U;
-    sb_word(b, UINT32_C(0xfd000000) | (vt & 31U) | (19U << 5) |
-        ((off / 8U) << 10));
-}
 
 /* Rounding guard prologue: FSR.RD (bits 31:30) must be 0
  * (round-to-nearest, the host FPCR default); nonzero exits UNDEF so the
@@ -141,30 +85,66 @@ static bool fp_guard_rd0(sparc64_emit_ctx_t *ec)
     return !b->overflow;
 }
 
-static void fp_clear_cexc(sparc64_dbt_buf_t *b)
+void fp_clear_cexc(sparc64_dbt_buf_t *b)
 {
     sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
     sb_word(b, UINT32_C(0x927be800) | ((ES3 & 31U) << 5) | (ES3 & 31U));
     sb_ldst_imm(b, true, false, ES3, ECTX, FP_FSR_OFF);
 }
 
-/* If the host FP op raised any IEEE exception (IOC|DZC|OFC|UFC|IXC in
- * FPSR[4:0]), exit UNDEF before writing the destination register so the
- * interpreter replays the instruction and sets FSR.cexc/aexc/TEM traps
- * identically to the oracle; otherwise clear FSR.cexc (bits 4:0). */
+/* Lane P5: commit host FPSR[4:0] (IXC/UFC/OFC/DZC/IOC) into SPARC
+ * cexc/aexc inline when (FSR.TEM & cexc) == 0 (FSR.RD == 0 already
+ * enforced by fp_guard_rd0). Permute: IXC->NX(0), DZC->DZ(1),
+ * UFC->UF(2), OFC->OF(3), IOC->NV(4); cexc overwrites bits 4:0 and
+ * accrues into aexc bits 9:5. Exits UNDEF only on a real trapped
+ * (TEM & cexc) condition; a bare IXC no longer traps. */
 static bool fp_sync_fsr(sparc64_emit_ctx_t *ec)
 {
     sparc64_dbt_buf_t *b = ec->buf;
-    size_t p_ok;
+    size_t p_noflags;
+    size_t p_notrap;
+    size_t p_done;
     sb_word(b, UINT32_C(0xd53b4420) | (ES3 & 31U)); /* mrs ES3, FPSR */
-    sb_ubfm(b, true, ES3, ES3, 0U, 4U);
-    p_ok = sb_cbz_placeholder(b, true, false, ES3);
-    if (p_ok == SPARC64_DBT_NOPOS) {
+    sb_ubfm(b, false, ES3, ES3, 0U, 4U);
+    p_noflags = sb_cbz_placeholder(b, false, false, ES3);
+    if (p_noflags == SPARC64_DBT_NOPOS) {
+        return false;
+    }
+    sb_ubfm(b, false, ES4, ES3, 4U, 4U);
+    sb_ubfm(b, false, ES5, ES3, 1U, 1U);
+    e_lsl_imm32(b, ES5, ES5, 1U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ubfm(b, false, ES5, ES3, 3U, 3U);
+    e_lsl_imm32(b, ES5, ES5, 2U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ubfm(b, false, ES5, ES3, 2U, 2U);
+    e_lsl_imm32(b, ES5, ES5, 3U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ubfm(b, false, ES5, ES3, 0U, 0U);
+    e_lsl_imm32(b, ES5, ES5, 4U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ldst_imm(b, true, true, ES5, ECTX, FP_FSR_OFF);
+    sb_ubfm(b, true, ES3, ES5, 23U, 27U);
+    sb_ands_reg(b, false, 31U, ES3, ES4);
+    p_notrap = sb_b_cond_placeholder(b, 0U);
+    if (p_notrap == SPARC64_DBT_NOPOS) {
         return false;
     }
     e_fault_here(b, ec->fault_pc);
-    sb_patch_cb(b, p_ok, b->count);
+    sb_patch_b_cond(b, p_notrap, 0U, b->count);
+    sb_mov_imm32(b, ES3, 0x1FU);
+    sb_bic_reg(b, true, ES5, ES5, ES3);
+    sb_orr_reg(b, true, ES5, ES5, ES4);
+    sb_ubfm(b, true, ES3, ES4, 59U, 58U);
+    sb_orr_reg(b, true, ES5, ES5, ES3);
+    sb_ldst_imm(b, false, true, ES5, ECTX, FP_FSR_OFF);
+    p_done = sb_b_placeholder(b);
+    if (p_done == SPARC64_DBT_NOPOS) {
+        return false;
+    }
+    sb_patch_cb(b, p_noflags, b->count);
     fp_clear_cexc(b);
+    sb_patch_b(b, p_done, b->count);
     return !b->overflow;
 }
 
@@ -438,6 +418,9 @@ static bool fp_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     if (ec->mem == NULL) {
         return false;
     }
+    if (sparc64_mem_emit_site(b, d, ec->fault_pc, ec->delay == d)) {
+        return !b->overflow;
+    }
     e_arg_ctx(b);
     sb_mov_imm64(b, 1U, (uint64_t)(uintptr_t)ec->mem);
     sb_mov_imm64(b, 2U, (uint64_t)(uintptr_t)ec->mc);
@@ -449,6 +432,33 @@ static bool fp_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     }
     e_resolve_fault(ec, p_fault);
     return !b->overflow;
+}
+
+
+/* FPOP2 dispatch (FCMP/FCMPE + FMOVcc; FMOVr/quad fall back). */
+static bool fp_emit_fpop2(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
+{
+    switch (d->opf) {
+    case 0x51U:
+        return fp_emit_cmp(ec, false, 0U, d->rd & 3U, d->rs1 & 31U,
+            d->raw & 31U);
+    case 0x52U:
+        return fp_emit_cmp(ec, true, 0U, d->rd & 3U, d->rs1 & 31U,
+            d->raw & 31U);
+    case 0x55U:
+        return fp_emit_cmp(ec, false, 1U, d->rd & 3U, d->rs1 & 31U,
+            d->raw & 31U);
+    case 0x56U:
+        return fp_emit_cmp(ec, true, 1U, d->rd & 3U, d->rs1 & 31U,
+            d->raw & 31U);
+    default:
+        break;
+    }
+    if ((d->opf & UINT32_C(0x3F)) <= 2U && (d->opf & UINT32_C(0x13C)) == 0U &&
+        (d->opf & 3U) != 0U) {
+        return fp_emit_movcc(ec, d);
+    }
+    return false;
 }
 
 /* FPOP1 dispatch on the 9-bit opf (ground-truth values above). */
@@ -520,6 +530,9 @@ static bool fp_emit_one(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     if (d->op == 2U && d->op3 == (uint8_t)SPARC64_OP3_FPOP1) {
         return fp_emit_fpop1(ec, d);
+    }
+    if (d->op == 2U && d->op3 == (uint8_t)SPARC64_OP3_FPOP2) {
+        return fp_emit_fpop2(ec, d);
     }
     if (d->op == 3U &&
         (d->op3 == (uint8_t)SPARC64_OP3_LDF ||
