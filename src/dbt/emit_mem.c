@@ -14,6 +14,7 @@
 
 #include <string.h>
 
+#include "dbt/emit_fp.h"
 #include "dbt/emit_priv.h"
 #include "dbt/mem_sites.h"
 #include "interp/interp.h"
@@ -328,6 +329,30 @@ static size_t mem_mov_imm64_fixed(sparc64_dbt_buf_t *b, unsigned rd,
     return at;
 }
 
+/* BL with a patchable 26-bit target (Lane P13-5): the cold
+ * per-site stubs BL into the shared miss subroutine, run their cache
+ * repair, and BR back to the resume address themselves. */
+static size_t enc_bl_placeholder(sparc64_dbt_buf_t *b)
+{
+    return sb_reserve(b, UINT32_C(0x94000000));
+}
+
+static void enc_patch_bl(sparc64_dbt_buf_t *b, size_t at, size_t target)
+{
+    int64_t delta;
+    if (at == SPARC64_DBT_NOPOS || at >= b->count) {
+        b->overflow = true;
+        return;
+    }
+    delta = (int64_t)target - (int64_t)at;
+    if (delta < -(1L << 25) || delta >= (1L << 25)) {
+        b->overflow = true;
+        return;
+    }
+    sb_patch(b, at, UINT32_C(0x94000000) |
+        (uint32_t)((uint64_t)(delta & 0x3ffffffLL)));
+}
+
 /* Rewrite the 4 words at a mem_mov_imm64_fixed site in place. */
 static void mem_patch_imm64(sparc64_dbt_buf_t *b, size_t at, unsigned rd,
     uint64_t v)
@@ -348,12 +373,14 @@ static void mem_patch_imm64(sparc64_dbt_buf_t *b, size_t at, unsigned rd,
     }
 }
 
-/* Shared per-block miss trampoline. Entry: x1 = gva, x0 = value
- * (stores), w4 = site index. Preserves the CCR cached in NZCV across
- * the C slow path, then resumes at the helper's address or exits for
- * dispatcher replay. x30 (the trampoline return) is spilled across
- * the BLR; x29 is untouched. The x3 record address is a fixed-width
- * placeholder until the tail carves the record and patches it. */
+/* Shared per-block miss subroutine. Entry via BL: x1 = gva, x0 =
+ * value (stores), w4 = site index. Preserves the CCR cached in NZCV
+ * and the GPR-cache homes x7/x8 across the C slow path (which may
+ * clobber every caller-saved register), then returns the resume
+ * address in x0 (NULL on fault). The fault path restores the stack
+ * and x7/x8 before exiting, so sp never leaks. x29 is untouched. The
+ * x3 record address is a fixed-width placeholder until the tail carves
+ * the record and patches it. */
 static bool mem_emit_common(struct sparc64_dbt_buf *b,
     const sparc64_mem_block_t *blk, size_t *b_patches, uint32_t n,
     size_t *blk_patch_out)
@@ -368,6 +395,8 @@ static bool mem_emit_common(struct sparc64_dbt_buf *b,
     common = b->count;
     sb_mrs_nzcv(b, 5U);
     sb_push64(b, 5U);
+    sb_push64(b, 7U);
+    sb_push64(b, 8U);
     sb_push64(b, 30U);
     sb_mov_reg(b, true, 2U, 0U); /* val */
     sb_mov_reg(b, true, 0U, 19U); /* ctx */
@@ -379,13 +408,15 @@ static bool mem_emit_common(struct sparc64_dbt_buf *b,
     sb_mov_imm64(b, 6U, (uint64_t)(uintptr_t)&sparc64_mem_miss);
     sb_blr(b, 6U); /* x0 = resume address or NULL */
     sb_pop64(b, 30U);
+    sb_pop64(b, 8U);
+    sb_pop64(b, 7U);
     sb_pop64(b, 5U);
     miss_cbz = sb_cbz_placeholder(b, true, false, 0U);
     if (miss_cbz == SPARC64_DBT_NOPOS) {
         return false;
     }
     sb_msr_nzcv(b, 5U);
-    enc_br(b, 0U);
+    sb_ret(b);
     sb_patch_cb(b, miss_cbz, b->count);
     /* Fault: replay through the dispatcher (interp is precise). */
     sb_ldst_imm(b, true, true, 15U, 19U,
@@ -398,7 +429,7 @@ static bool mem_emit_common(struct sparc64_dbt_buf *b,
         return false;
     }
     for (i = 0U; i < n; i++) {
-        sb_patch_b(b, b_patches[i], common);
+        enc_patch_bl(b, b_patches[i], common);
     }
     return true;
 }
@@ -425,14 +456,55 @@ bool sparc64_mem_emit_tail(struct sparc64_dbt_buf *b,
     }
     b_patches = patches;
     for (i = 0U; i < n; i++) {
+        /* Miss-stub cache repair (Lane P13-5): the common subroutine
+         * replays the site through interp, so ctx holds the fresh value
+         * while the cache slot still names the stale one. Integer loads
+         * and LDDF reload their destination from coherent ctx memory
+         * (the cont writeback already claims the slot), so the
+         * write-through caches never need clearing on any site. */
+        const sparc64_mem_site_t *site = &blk->sites[i];
+        bool is_store = (((unsigned)site->flags &
+            (unsigned)SPARC64_MEM_F_STORE) != 0U);
+        unsigned op3 = (site->insn_word >> 19) & 63U;
+        unsigned rd = (unsigned)site->val_or_dst_reg & 31U;
         size_t stub;
+        size_t p_fault;
         if (edges[i] == MEM_NO_EDGE) {
             return false;
         }
         stub = b->count;
         sb_patch_cb(b, edges[i], stub);
+        /* The common subroutine returns via BL, so spill the
+         * trampoline return across it; on fault the stub exits
+         * directly with the ctx-recorded reason. */
+        sb_str_x30_pre(b);
         sb_movz(b, false, 4U, 0U, (uint16_t)i);
-        b_patches[i] = sb_b_placeholder(b);
+        b_patches[i] = enc_bl_placeholder(b);
+        if (b->overflow) {
+            return false;
+        }
+        sb_ldr_x30_post(b);
+        p_fault = sb_cbz_placeholder(b, true, false, 0U);
+        if (p_fault == SPARC64_DBT_NOPOS) {
+            return false;
+        }
+        if (!is_store && op3 != (unsigned)SPARC64_OP3_LDF &&
+            op3 != (unsigned)SPARC64_OP3_LDDF) {
+            if (rd != 0U) {
+                e_ldr_gpr(b, E_CREG(rd & 7U), rd);
+            }
+        } else if (!is_store && op3 == (unsigned)SPARC64_OP3_LDDF) {
+            unsigned pair = (((rd & 1U) != 0U) ? (16U + (rd >> 1U)) :
+                (rd >> 1U)) & 31U;
+            fp_site_lddf_reload(b, pair);
+        }
+        enc_br(b, 0U);
+        sb_patch_cb(b, p_fault, b->count);
+        sb_ldst_imm(b, true, true, EPC, ECTX,
+            (uint32_t)SPARC64_CTX_EXIT_DEST_OFFSET);
+        sb_ldst_imm(b, true, false, ERSN, ECTX,
+            (uint32_t)SPARC64_CTX_EXIT_REASON_OFFSET);
+        sb_ret(b);
         if (b->overflow) {
             return false;
         }
@@ -615,7 +687,16 @@ bool sparc64_mem_emit_site(struct sparc64_dbt_buf *b,
     }
     if (is_store) {
         if (is_fp) {
-            sb_ldst_imm(b, true, width == 8U, 0U, ECTX, fp_off);
+            if (width == 8U) {
+                /* STDF reads the fp file through the write-through
+                 * double cache (hit: FMOV only, no memory load). */
+                uint32_t pair = (((uint32_t)d->rd & 1U) != 0U)
+                    ? (16U + ((uint32_t)d->rd >> 1U))
+                    : ((uint32_t)d->rd >> 1U);
+                fp_site_stdf_read(b, pair & 31U);
+            } else {
+                sb_ldst_imm(b, true, width == 8U, 0U, ECTX, fp_off);
+            }
         } else {
             e_ld64(b, 0U, d->rd);
         }
@@ -647,18 +728,31 @@ bool sparc64_mem_emit_site(struct sparc64_dbt_buf *b,
     if (!is_store) {
         if (is_fp) {
             sb_ldst_imm(b, false, width == 8U, ES0, ECTX, fp_off);
+            if (d->op3 == (uint8_t)SPARC64_OP3_LDDF) {
+                /* LDDF populates the write-through double cache from
+                 * the just-loaded value in x9. */
+                uint32_t pair = (((uint32_t)d->rd & 1U) != 0U)
+                    ? (16U + ((uint32_t)d->rd >> 1U))
+                    : ((uint32_t)d->rd >> 1U);
+                fp_site_lddf_populate(b, pair & 31U);
+            } else {
+                /* LDF writes a single reg: drop the aliased double
+                 * slot (the miss stub replay would stale it). */
+                fp_inv_s_alias(b, (unsigned)d->rd & 31U);
+            }
         } else {
             e_st64(b, d->rd, ES0);
         }
         /* Resume past the writeback: the miss path lands here with
-         * ctx->r[rd] already updated by the interpreter replay. */
+         * ctx->r[rd] already updated by the interpreter replay; the
+         * stub reloaded the cache slot, so nothing is invalidated. */
         acc_sites[idx].cont_insn_offset =
             (uint16_t)((size_t)b->count * 4U);
     }
-    /* Slow-path join: the miss stub runs a C call (clobbers x7/x8) and
-     * replays rd through interp, so drop slots 6,7 and rd's slot. */
-    b->gpr_cache_valid &= (uint8_t)(~(uint8_t)((1U << 6) | (1U << 7) |
-        (1U << ((((unsigned)d->rd) & 31U) & 7U))));
+    /* Lane P13-5: no invalidation. The common subroutine preserves
+     * x7/x8 and NZCV, x21-x26 survive C calls per AAPCS64, the stub
+     * reloads integer-load and LDDF destinations, and helper fallbacks
+     * clear the caches via e_call_faultable. */
     return !b->overflow;
 }
 

@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "core/cpu.h"
+#include "dbt/emit_mem.h"
 #include "dbt/emit_priv.h"
 
 /* Window-file bases (interp_win.c, Lane P5 accessors). */
@@ -93,6 +94,8 @@ bool sparc64_fast_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         return false;
     }
     b = ec->buf;
+    /* Lane P13-5: the SDIVX saturation compare clobbers host NZCV. */
+    b->nzcv_state = SPARC64_NZCV_NONE;
     op3 = d->op3;
     e_ld64(b, ES0, d->rs1);
     e_src2(b, ES1, d);
@@ -183,6 +186,9 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         return false;
     }
     b = ec->buf;
+    /* Lane P13-5: window rotation reads flags (CMP below) and the
+     * helper fallback, so live host NZCV dies here. */
+    b->nzcv_state = SPARC64_NZCV_NONE;
     e_ld64(b, ES0, d->rs1);
     e_src2(b, ES1, d);
     sb_add_reg(b, true, false, ES0, ES0, ES1);
@@ -193,6 +199,14 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         sb_add_imm12(b, ERSN, ES1, 1U);
     }
     sb_ubfm(b, false, ERSN, ERSN, 0U, 2U);
+    /* Hoisted window bases (Lane P13-5): the frozen cpu.h exposes no
+     * ctx-relative winfile field, so the process-global bases still
+     * materialize absolutely, but once each per SAVE/RESTORE (ES5 =
+     * file, EPC = valid; sp is used once) instead of per use. */
+    sb_mov_imm64(b, ES5,
+        (uint64_t)(uintptr_t)sparc64_win_file_base());
+    sb_mov_imm64(b, EPC,
+        (uint64_t)(uintptr_t)sparc64_win_valid_base());
     if (is_save) {
         /* Inline whenever the target window needs no spill: cansave
          * may be 0 (steady-state window pressure) as long as this is
@@ -205,8 +219,7 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         if (p_slow1 == SPARC64_DBT_NOPOS) {
             return false;
         }
-        sb_mov_imm64(b, ES4, (uint64_t)(uintptr_t)sparc64_win_valid_base());
-        sb_add_reg(b, true, false, ES4, ES4, ERSN);
+        sb_add_reg(b, true, false, ES4, EPC, ERSN);
         f_ldrb(b, ES3, ES4);
         p_slow2 = sb_cbz_placeholder(b, false, true, ES3);
         if (p_slow2 == SPARC64_DBT_NOPOS) {
@@ -218,8 +231,7 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         if (p_slow1 == SPARC64_DBT_NOPOS) {
             return false;
         }
-        sb_mov_imm64(b, ES4, (uint64_t)(uintptr_t)sparc64_win_valid_base());
-        sb_add_reg(b, true, false, ES4, ES4, ERSN);
+        sb_add_reg(b, true, false, ES4, EPC, ERSN);
         f_ldrb(b, ES3, ES4);
         p_slow2 = sb_cbz_placeholder(b, false, false, ES3);
         if (p_slow2 == SPARC64_DBT_NOPOS) {
@@ -232,8 +244,7 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
     {
         unsigned i;
         /* winfile[cwp] = L/I image. */
-        f_win_addr(b, ES4,
-            (uint64_t)(uintptr_t)sparc64_win_file_base(), ES1, 7U);
+        sb_add_lsl(b, ES4, ES5, ES1, 7U);
         for (i = 0U; i < 16U; i += 2U) {
             sb_ldp64(b, ES2, ES3, ECTX, (16U + i) * 8U);
             sb_stp64(b, ES2, ES3, ES4, i * 8U);
@@ -244,9 +255,7 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         sb_ldst_imm(b, true, true, ES2, ECTX, 14U * 8U);
         sb_ldst_imm(b, false, true, ES2, ES4, 0U);
         /* win_valid[cwp] = save. */
-        sb_mov_imm64(b, ES4,
-            (uint64_t)(uintptr_t)sparc64_win_valid_base());
-        sb_add_reg(b, true, false, ES4, ES4, ES1);
+        sb_add_reg(b, true, false, ES4, EPC, ES1);
         sb_mov_imm32(b, ES2, is_save ? 1U : 0U);
         f_strb(b, ES2, ES4);
         if (is_save) {
@@ -254,9 +263,7 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
             f_move4(b, ECTX, 24U, ECTX, 8U);
             f_move4(b, ECTX, 28U, ECTX, 12U);
             /* L = winfile[tgt]. */
-            f_win_addr(b, ES4,
-                (uint64_t)(uintptr_t)sparc64_win_file_base(), ERSN,
-                7U);
+            sb_add_lsl(b, ES4, ES5, ERSN, 7U);
             for (i = 0U; i < 8U; i += 2U) {
                 sb_ldp64(b, ES2, ES3, ES4, i * 8U);
                 sb_stp64(b, ES2, ES3, ECTX, (16U + i) * 8U);
@@ -292,9 +299,7 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
             /* O = old I, L/I = winfile[tgt]. */
             f_move4(b, ECTX, 8U, ECTX, 24U);
             f_move4(b, ECTX, 12U, ECTX, 28U);
-            f_win_addr(b, ES4,
-                (uint64_t)(uintptr_t)sparc64_win_file_base(), ERSN,
-                7U);
+            sb_add_lsl(b, ES4, ES5, ERSN, 7U);
             for (i = 0U; i < 8U; i += 2U) {
                 sb_ldp64(b, ES2, ES3, ES4, i * 8U);
                 sb_stp64(b, ES2, ES3, ECTX, (16U + i) * 8U);
@@ -322,6 +327,20 @@ bool sparc64_fast_win(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d,
         }
         if (b->overflow) {
             return false;
+        }
+        /* Lane P13-5: rotation changes windowed regs (reg >= 8) only,
+         * so drop just those GPR cache slots; cached globals
+         * (%g1..%g7) stay valid across SAVE/RESTORE, including in delay
+         * slots. The rd writeback below re-populates its own slot. */
+        {
+            unsigned s;
+            for (s = 0U; s < 8U; s++) {
+                if ((((b->gpr_cache_valid >> s) & 1U) != 0U) &&
+                    (b->gpr_cache_tag[s] & 31U) >= 8U) {
+                    b->gpr_cache_valid &=
+                        (uint8_t)(~(uint8_t)(1U << s));
+                }
+            }
         }
         e_st64(b, d->rd, ES0);
         p_end = sb_b_placeholder(b);

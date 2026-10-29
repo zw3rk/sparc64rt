@@ -314,14 +314,11 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
         return NULL;
     }
     used_before = dbt->arena_used - (size_t)DBT_EMIT_STAGE_BYTES;
+    /* Zero the whole buffer (Lane P13-5): new nzcv_state/fpr fields
+     * join the caches and stay zero-initialized per block. */
+    (void)memset(&buf, 0, sizeof(buf));
     buf.words = (uint32_t *)stage;
-    buf.count = 0U;
     buf.capacity = DBT_EMIT_STAGE_WORDS;
-    buf.overflow = false;
-    buf.is_call = false;
-    buf.fp_fast_checked = false;
-    buf.fpsr_dirty = false;
-    buf.gpr_cache_valid = 0;
     ec.buf = &buf;
     ec.mem = mem;
     ec.mc = mc;

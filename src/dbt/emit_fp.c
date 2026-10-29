@@ -76,6 +76,9 @@ static bool fp_guard_rd0(sparc64_emit_ctx_t *ec)
 {
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_ok;
+    /* Lane P13-5: guarded FP arith reads flags via FCMP, so live host
+     * NZCV dies here. */
+    b->nzcv_state = SPARC64_NZCV_NONE;
     if (!b->fp_fast_checked) {
         sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
         sb_ubfm(b, true, ES4, ES3, 23U, 27U);
@@ -112,6 +115,8 @@ bool sparc64_emit_fp_flush(sparc64_emit_ctx_t *ec)
             return false;
         }
         ec->buf->fpsr_dirty = false;
+        /* Lane P13-5: fp_sync_fsr emits ANDS, clobbering host NZCV. */
+        ec->buf->nzcv_state = SPARC64_NZCV_NONE;
     }
     return !ec->buf->overflow;
 }

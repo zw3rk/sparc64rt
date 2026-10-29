@@ -17,6 +17,10 @@
 
 #include "interp/interp_win.h"
 
+#include <string.h>
+
+#include "dbt/mem_sites.h"
+
 /* Window backing file: winfile[w][0..7] = %l, [8..15] = %i. Single global
  * file serves one guest thread (matches the Phase 1 single-threaded
  * interpreter; Phase 4 threads need a side table). */
@@ -53,6 +57,27 @@ static bool win_spill_to(const sparc64_mem_ops_t *mem, void *mc,
     const uint64_t img[16], uint64_t va, sparc64_step_result_t *res,
     uint64_t pc)
 {
+    /* Lane P13-5 Soft-TLB fast path: a whole-window spill/fill stays
+     * inside one 4 KiB page (128 bytes at [va, va + 128)), so a DBT
+     * Soft-TLB hit serves it with memcpy + bswap per word,
+     * byte-identical to the callback loop below. Misses fall through
+     * to the slow path, so fault behavior is unchanged. No guest
+     * alignment gate: stack-bias addresses are 7-mod-8 by
+     * construction, and memcpy needs none. */
+    if ((va & 0xFFFULL) <= (4096ULL - 128ULL)) {
+        uint64_t idx = (va >> 12) & (uint64_t)(SPARC64_TLB_SIZE - 1u);
+        const sparc64_tlb_entry_t *e = &sparc64_dbt_tlb[idx];
+        if (e->write_tag == (va & ~(uint64_t)0xFFFULL)) {
+            uint8_t *host =
+                (uint8_t *)(e->addend + (uintptr_t)va);
+            unsigned i;
+            for (i = 0U; i < 16U; i++) {
+                uint64_t be = __builtin_bswap64(img[i]);
+                (void)memcpy(host + 8U * (uint64_t)i, &be, 8U);
+            }
+            return true;
+        }
+    }
     uint8_t buf[SPARC64_RWINDOW_SIZE];
     unsigned i;
     for (i = 0; i < 16U; i++) {
@@ -76,6 +101,24 @@ static bool win_fill_from(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     void *mc, unsigned w, uint64_t va, sparc64_step_result_t *res,
     uint64_t pc)
 {
+    /* Lane P13-5 Soft-TLB fast path (mirror of win_spill_to): a
+     * single-page 128-byte fill served from a read-tagged TLB entry,
+     * byte-identical to the callback loop below. */
+    if ((va & 0xFFFULL) <= (4096ULL - 128ULL)) {
+        uint64_t idx = (va >> 12) & (uint64_t)(SPARC64_TLB_SIZE - 1u);
+        const sparc64_tlb_entry_t *e = &sparc64_dbt_tlb[idx];
+        if (e->read_tag == (va & ~(uint64_t)0xFFFULL)) {
+            const uint8_t *host =
+                (const uint8_t *)(e->addend + (uintptr_t)va);
+            unsigned j;
+            for (j = 0U; j < 16U; j++) {
+                uint64_t be;
+                (void)memcpy(&be, host + 8U * (uint64_t)j, 8U);
+                interp_winfile[w][j] = __builtin_bswap64(be);
+            }
+            return true;
+        }
+    }
     uint8_t buf[SPARC64_RWINDOW_SIZE];
     unsigned i;
     (void)cpu;
@@ -247,71 +290,6 @@ void sparc64_win_invalidate_all(void)
  * because low32 halves are equal, and N=0/C=0 likewise from low32).
  * SLL/SRL (x=0) shift only low32 and zero-extend (V9 A.48, E02/E04,
  * P1 oracle), while SRA (x=0) sign-extends bit 31. */
-
-/* Bicc/BPcc/Ticc/MOVcc condition over one 4-bit N/Z/V/C nibble
- * (bit 3 N, bit 2 Z, bit 1 V, bit 0 C). */
-bool sparc64_eval_cond(unsigned cond, unsigned nibble)
-{
-    bool n = (nibble & 8U) != 0U;
-    bool z = (nibble & 4U) != 0U;
-    bool v = (nibble & 2U) != 0U;
-    bool c = (nibble & 1U) != 0U;
-    switch (cond & 15U) {
-    case 0x0U: return false;
-    case 0x1U: return z;
-    case 0x2U: return z || (n != v);
-    case 0x3U: return n != v;
-    case 0x4U: return c || z;
-    case 0x5U: return c;
-    case 0x6U: return n;
-    case 0x7U: return v;
-    case 0x8U: return true;
-    case 0x9U: return !z;
-    case 0xAU: return !(z || (n != v));
-    case 0xBU: return n == v;
-    case 0xCU: return !(c || z);
-    case 0xDU: return !c;
-    case 0xEU: return !n;
-    default: return !v;
-    }
-}
-
-/* BPr/MOVr register test over the full 64-bit value. rcond skips 4. */
-bool sparc64_eval_rcond(unsigned rcond, uint64_t v)
-{
-    switch (rcond & 15U) {
-    case 1U: return v == UINT64_C(0);
-    case 2U: return (int64_t)v <= (int64_t)0;
-    case 3U: return (int64_t)v < (int64_t)0;
-    case 5U: return v != UINT64_C(0);
-    case 6U: return (int64_t)v > (int64_t)0;
-    case 7U: return (int64_t)v >= (int64_t)0;
-    default: return false;
-    }
-}
-
-/* FBfcc condition over one fcc field (0 eq, 1 lt, 2 gt, 3 unordered). */
-bool sparc64_eval_fcond(unsigned cond, uint32_t fcc)
-{
-    switch (cond & 15U) {
-    case 0x0U: return false;
-    case 0x1U: return fcc != 0U;
-    case 0x2U: return fcc == 1U || fcc == 2U;
-    case 0x3U: return fcc == 3U || fcc == 1U;
-    case 0x4U: return fcc == 1U;
-    case 0x5U: return fcc == 3U || fcc == 2U;
-    case 0x6U: return fcc == 2U;
-    case 0x7U: return fcc == 3U;
-    case 0x8U: return true;
-    case 0x9U: return fcc == 0U;
-    case 0xAU: return fcc == 0U || fcc == 3U;
-    case 0xBU: return fcc == 0U || fcc == 2U;
-    case 0xCU: return fcc != 1U;
-    case 0xDU: return fcc == 0U || fcc == 1U;
-    case 0xEU: return fcc != 2U;
-    default: return fcc != 3U;
-    }
-}
 
 /* Logic ops clear V/C; N/Z come from bit 31/low32-zero (icc) and bit 63 /
  * full-zero (xcc). */

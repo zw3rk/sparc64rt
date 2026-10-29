@@ -36,13 +36,14 @@
  * performs the __atomic operation through the interpreter.
  *
  * Block layout: the caller emits one fast path per site inline, then
- * closes the block with sparc64_mem_emit_tail, which appends the
- * 2-instruction stubs (mov w4, #k; b common) and the single per-block
- * miss trampoline (mrs x5, nzcv ... msr nzcv, x5) and redirects every
- * recorded miss edge at it. Site records are filled by the caller
- * (guest deltas, widths, flags); the fast emitter fills the three
- * code offsets (the caller then advances cont past its writeback for
- * loads, per the resume contract above). The final block record is
+ * closes the block with sparc64_mem_emit_tail, which appends one cold
+ * stub per site (mov w4, #k; bl common; cache repair; br x0) and the
+ * single per-block miss subroutine (mrs/msr nzcv plus x7/x8 save and
+ * restore, balanced on both the resume and fault paths) and redirects
+ * every recorded miss edge at it. Site records are filled by the
+ * caller (guest deltas, widths, flags); the fast emitter fills the
+ * three code offsets (the caller then advances cont past its writeback
+ * for loads, per the resume contract above). The final block record is
  * carved from the tail of the same code buffer, so its lifetime is
  * the block's: no malloc, no free, nothing to release on recycle.
  *
@@ -61,6 +62,154 @@
 
 #include "dbt/mem_sites.h"
 #include "interp/interp.h"
+#include "dbt/emit_priv.h"
+
+/* ---- translator-local memory/window runtime helpers (Lane P13-5) ----
+ * Moved here from dbt/emit_priv.h so the shared header stays under the
+ * 900-line discipline: s64_jrt_mem/s64_jrt_win replay through the shared
+ * interpreter backend (parity by construction), and e_call_mem /
+ * e_call_win emit the faultable BLR sequences used by the integer,
+ * fast-window, and FP-memory emitters. */
+
+/* Memory op: packA carries op3 | rd<<8 | rs1<<16 | rs2<<24 | is_imm<<29,
+ * raw is the instruction word (trap tval), packB carries the low 32 bits
+ * of the sign-extended immediate plus the ASI at bits 32..39. */
+static inline uint32_t s64_jrt_mem(sparc64_ctx_t *ctx,
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t pc, uint32_t pack_a,
+    uint32_t raw, uint64_t pack_b)
+{
+    sparc64_dec_t d;
+    sparc64_step_result_t r;
+    d.raw = raw;
+    d.cls = SPARC64_ICLS_ILLEGAL;
+    d.op = 3U;
+    d.op3 = (uint8_t)(pack_a & 0x3fU);
+    d.rd = (uint8_t)((pack_a >> 8) & 31U);
+    d.rs1 = (uint8_t)((pack_a >> 16) & 31U);
+    d.rs2 = (uint8_t)((pack_a >> 24) & 31U);
+    d.cond = 0U;
+    d.cc = 0U;
+    d.asi = (uint8_t)((pack_b >> 32) & 0xffU);
+    d.annul = 0U;
+    d.pred = 0U;
+    d.is_imm = (uint8_t)((pack_a >> 29) & 1U);
+    d.xbit = 0U;
+    d.imm = (int64_t)(int32_t)(pack_b & 0xffffffffULL);
+    d.disp = 0;
+    d.opf = 0U;
+    d.uimm = 0U;
+    switch (d.op3) {
+    case SPARC64_OP3_LDUW:
+    case SPARC64_OP3_LDUB:
+    case SPARC64_OP3_LDUH:
+    case SPARC64_OP3_LDD:
+    case SPARC64_OP3_LDSW:
+    case SPARC64_OP3_LDSB:
+    case SPARC64_OP3_LDSH:
+    case SPARC64_OP3_LDX:
+    case SPARC64_OP3_LDA:
+    case SPARC64_OP3_LDUBA:
+    case SPARC64_OP3_LDUHA:
+    case SPARC64_OP3_LDDA:
+    case SPARC64_OP3_LDSWA:
+    case SPARC64_OP3_LDSBA:
+    case SPARC64_OP3_LDSHA:
+    case SPARC64_OP3_LDXA:
+    case SPARC64_OP3_LDFSR:
+        d.cls = SPARC64_ICLS_LOAD;
+        r = sparc64_exec_load(ctx, mem, mc, pc, &d);
+        break;
+    case SPARC64_OP3_STW:
+    case SPARC64_OP3_STB:
+    case SPARC64_OP3_STH:
+    case SPARC64_OP3_STD:
+    case SPARC64_OP3_STX:
+    case SPARC64_OP3_STA:
+    case SPARC64_OP3_STBA:
+    case SPARC64_OP3_STHA:
+    case SPARC64_OP3_STDA:
+    case SPARC64_OP3_STXA:
+    case SPARC64_OP3_STFSR:
+        d.cls = SPARC64_ICLS_STORE;
+        r = sparc64_exec_store(ctx, mem, mc, pc, &d);
+        break;
+    case SPARC64_OP3_LDSTUB:
+    case SPARC64_OP3_LDSTUBA:
+        d.cls = SPARC64_ICLS_LDSTUB;
+        r = sparc64_exec_atomic(ctx, mem, mc, pc, &d);
+        break;
+    case SPARC64_OP3_SWAP:
+    case SPARC64_OP3_SWAPA:
+        d.cls = SPARC64_ICLS_SWAP;
+        r = sparc64_exec_atomic(ctx, mem, mc, pc, &d);
+        break;
+    default:
+        d.cls = SPARC64_ICLS_ATOMIC;
+        r = sparc64_exec_atomic(ctx, mem, mc, pc, &d);
+        break;
+    }
+    if (r.kind == SPARC64_STEP_CONTINUE) {
+        return SPARC64_EXIT_NONE;
+    }
+    return SPARC64_EXIT_UNDEF;
+}
+
+/* Window op: rd_save carries rd | save<<8; sum is SAVE/RESTORE operand. */
+static inline uint32_t s64_jrt_win(sparc64_ctx_t *ctx,
+    const sparc64_mem_ops_t *mem, void *mc, uint64_t sum, uint32_t rd_save,
+    uint64_t pc)
+{
+    sparc64_step_result_t res;
+    unsigned rd = rd_save & 31U;
+    bool is_save = ((rd_save >> 8) & 1U) != 0U;
+    if (is_save) {
+        if (!sparc64_win_save(ctx, mem, mc, sum, rd, &res, pc)) {
+            return SPARC64_EXIT_UNDEF;
+        }
+    } else {
+        if (!sparc64_win_restore(ctx, mem, mc, sum, rd, &res, pc)) {
+            return SPARC64_EXIT_UNDEF;
+        }
+    }
+    return SPARC64_EXIT_NONE;
+}
+
+/* Memory/backend call: x0=ctx x1=mem x2=mc x3=pc x4=packA x5=raw
+ * x6=packB, then BLR s64_jrt_mem with the UNDEF fault path. */
+static inline size_t e_call_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
+{
+    sparc64_dbt_buf_t *b = ec->buf;
+    uint32_t pack_a = (d->op3 & 0x3fU) | ((d->rd & 31U) << 8) |
+        ((d->rs1 & 31U) << 16) | ((d->rs2 & 31U) << 24) |
+        ((d->is_imm & 1U) << 29);
+    uint64_t pack_b = ((uint64_t)(uint32_t)d->imm) |
+        ((uint64_t)d->asi << 32);
+    e_arg_ctx(b);
+    sb_mov_imm64(b, 1U, (uint64_t)(uintptr_t)ec->mem);
+    sb_mov_imm64(b, 2U, (uint64_t)(uintptr_t)ec->mc);
+    sb_mov_imm64(b, 3U, ec->pc);
+    sb_mov_imm32(b, 4U, pack_a);
+    sb_mov_imm32(b, 5U, d->raw);
+    sb_mov_imm64(b, 6U, pack_b);
+    return e_call_faultable(b, (uint64_t)(uintptr_t)&s64_jrt_mem);
+}
+
+/* Window call: x0=ctx x1=mem x2=mc x3=sum x4=rd|save<<8 x5=pc.
+ * The SAVE/RESTORE sum arrives in ES0. */
+static inline size_t e_call_win(sparc64_emit_ctx_t *ec, unsigned rd,
+    bool is_save)
+{
+    sparc64_dbt_buf_t *b = ec->buf;
+    e_arg_ctx(b);
+    sb_mov_imm64(b, 1U, (uint64_t)(uintptr_t)ec->mem);
+    sb_mov_imm64(b, 2U, (uint64_t)(uintptr_t)ec->mc);
+    sb_mov_reg(b, true, 3U, ES0);
+    sb_mov_imm32(b, 4U, (rd & 31U) | (is_save ? 0x100U : 0U));
+    sb_mov_imm64(b, 5U, ec->pc);
+    return e_call_faultable(b, (uint64_t)(uintptr_t)&s64_jrt_win);
+}
+
+
 
 /* Code buffer owned by the block builder (defined in emit_priv.h). */
 struct sparc64_dbt_buf;

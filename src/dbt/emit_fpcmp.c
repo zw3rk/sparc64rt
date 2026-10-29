@@ -83,6 +83,8 @@ bool fp_emit_cmp(sparc64_emit_ctx_t *ec, bool is_double,
     size_t p_b_nan;
     size_t p_ord;
     size_t p_done;
+    /* Lane P13-5: FCMP clobbers host NZCV. */
+    b->nzcv_state = SPARC64_NZCV_NONE;
     if (is_double) {
         fp_ld_d(b, 0U, rs1);
         fp_ld_d(b, 1U, rs2);
@@ -324,21 +326,29 @@ bool sparc64_emit_fbr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     if (p_taken == SPARC64_DBT_NOPOS) {
         return false;
     }
-    if (fbr_delay_runs(cond, false, annul)) {
-        if (!fbr_emit_delay(ec)) {
-            return false;
-        }
-        if (ec->delay->cls == (uint8_t)SPARC64_ICLS_FPU) {
-            if (!sparc64_emit_fp_flush(ec)) {
+    {
+        sparc64_dbt_cache_snap_t snap;
+        /* Lane P13-5: the taken delay copy below must compile against
+         * this pre-branch cache state (the two copies execute
+         * exclusively). */
+        e_cache_snapshot(b, &snap);
+        if (fbr_delay_runs(cond, false, annul)) {
+            if (!fbr_emit_delay(ec)) {
                 return false;
             }
+            if (ec->delay->cls == (uint8_t)SPARC64_ICLS_FPU) {
+                if (!sparc64_emit_fp_flush(ec)) {
+                    return false;
+                }
+            }
         }
+        e_exit_imm(b, fallthrough, SPARC64_EXIT_BRANCH);
+        if (b->overflow) {
+            return false;
+        }
+        sb_patch_cb(b, p_taken, b->count);
+        e_cache_restore(b, &snap);
     }
-    e_exit_imm(b, fallthrough, SPARC64_EXIT_BRANCH);
-    if (b->overflow) {
-        return false;
-    }
-    sb_patch_cb(b, p_taken, b->count);
     if (fbr_delay_runs(cond, true, annul)) {
         if (!fbr_emit_delay(ec)) {
             return false;

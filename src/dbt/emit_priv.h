@@ -38,7 +38,32 @@ typedef struct sparc64_dbt_buf {
     bool fpsr_dirty;
     uint8_t gpr_cache_valid;
     uint8_t gpr_cache_tag[8];
+    /* Live host NZCV origin (Lane P13-5): 0 = invalid, otherwise the
+     * width (icc vs xcc) and kind of the last flag-setting cc op, so a
+     * following Bicc/BPcc/MOVcc can branch on the live flags with zero
+     * setup. Any emitter whose runtime path may modify host NZCV
+     * (helper calls, Soft-TLB CMP, FP FCMP/ANDS, SAVE/RESTORE) clears
+     * this to 0; e_emit_addsubcc/e_emit_logiccc set it. */
+    uint8_t nzcv_state;
+    /* Write-through double FPR cache in callee-saved d8..d15 (Lane
+     * P13-5, Invariant 1): bit set when d(8+slot) holds the guest
+     * double pair fpr_tag[slot]; ctx memory stays coherent, so faults
+     * and helper calls need no flush. Single-precision writes
+     * invalidate the aliased pair slot. */
+    uint8_t fpr_valid;
+    uint8_t fpr_tag[8];
 } sparc64_dbt_buf_t;
+/* Live-NZCV states (nzcv_state above): kind of the flag-setting cc op
+ * (ADD, SUB, LOGIC) by icc/xcc width of the live host flags. SUB sets
+ * host C = !borrow so every condition maps directly; ADD and LOGIC
+ * restrict the carry/zero-sensitive conditions (see emit_cond.c). */
+#define SPARC64_NZCV_NONE 0U
+#define SPARC64_NZCV_ADD_ICC 1U
+#define SPARC64_NZCV_ADD_XCC 2U
+#define SPARC64_NZCV_SUB_ICC 3U
+#define SPARC64_NZCV_SUB_XCC 4U
+#define SPARC64_NZCV_LOGIC_ICC 5U
+#define SPARC64_NZCV_LOGIC_XCC 6U
 /* 8-slot GPR cache: slot (r&7) in x21-x26,x7,x8 (x21-x26
  * callee-saved; x7/x8 clear of the mem fast path). */
 #define E_CREG(slot) \
@@ -521,109 +546,6 @@ static inline uint64_t s64_rt_popc(uint64_t v)
     return n;
 }
 
-/* Memory op: packA carries op3 | rd<<8 | rs1<<16 | rs2<<24 | is_imm<<29,
- * raw is the instruction word (trap tval), packB carries the low 32 bits
- * of the sign-extended immediate plus the ASI at bits 32..39. */
-static inline uint32_t s64_rt_mem(sparc64_ctx_t *ctx,
-    const sparc64_mem_ops_t *mem, void *mc, uint64_t pc, uint32_t pack_a,
-    uint32_t raw, uint64_t pack_b)
-{
-    sparc64_dec_t d;
-    sparc64_step_result_t r;
-    d.raw = raw;
-    d.cls = SPARC64_ICLS_ILLEGAL;
-    d.op = 3U;
-    d.op3 = (uint8_t)(pack_a & 0x3fU);
-    d.rd = (uint8_t)((pack_a >> 8) & 31U);
-    d.rs1 = (uint8_t)((pack_a >> 16) & 31U);
-    d.rs2 = (uint8_t)((pack_a >> 24) & 31U);
-    d.cond = 0U;
-    d.cc = 0U;
-    d.asi = (uint8_t)((pack_b >> 32) & 0xffU);
-    d.annul = 0U;
-    d.pred = 0U;
-    d.is_imm = (uint8_t)((pack_a >> 29) & 1U);
-    d.xbit = 0U;
-    d.imm = (int64_t)(int32_t)(pack_b & 0xffffffffULL);
-    d.disp = 0;
-    d.opf = 0U;
-    d.uimm = 0U;
-    switch (d.op3) {
-    case SPARC64_OP3_LDUW:
-    case SPARC64_OP3_LDUB:
-    case SPARC64_OP3_LDUH:
-    case SPARC64_OP3_LDD:
-    case SPARC64_OP3_LDSW:
-    case SPARC64_OP3_LDSB:
-    case SPARC64_OP3_LDSH:
-    case SPARC64_OP3_LDX:
-    case SPARC64_OP3_LDA:
-    case SPARC64_OP3_LDUBA:
-    case SPARC64_OP3_LDUHA:
-    case SPARC64_OP3_LDDA:
-    case SPARC64_OP3_LDSWA:
-    case SPARC64_OP3_LDSBA:
-    case SPARC64_OP3_LDSHA:
-    case SPARC64_OP3_LDXA:
-    case SPARC64_OP3_LDFSR:
-        d.cls = SPARC64_ICLS_LOAD;
-        r = sparc64_exec_load(ctx, mem, mc, pc, &d);
-        break;
-    case SPARC64_OP3_STW:
-    case SPARC64_OP3_STB:
-    case SPARC64_OP3_STH:
-    case SPARC64_OP3_STD:
-    case SPARC64_OP3_STX:
-    case SPARC64_OP3_STA:
-    case SPARC64_OP3_STBA:
-    case SPARC64_OP3_STHA:
-    case SPARC64_OP3_STDA:
-    case SPARC64_OP3_STXA:
-    case SPARC64_OP3_STFSR:
-        d.cls = SPARC64_ICLS_STORE;
-        r = sparc64_exec_store(ctx, mem, mc, pc, &d);
-        break;
-    case SPARC64_OP3_LDSTUB:
-    case SPARC64_OP3_LDSTUBA:
-        d.cls = SPARC64_ICLS_LDSTUB;
-        r = sparc64_exec_atomic(ctx, mem, mc, pc, &d);
-        break;
-    case SPARC64_OP3_SWAP:
-    case SPARC64_OP3_SWAPA:
-        d.cls = SPARC64_ICLS_SWAP;
-        r = sparc64_exec_atomic(ctx, mem, mc, pc, &d);
-        break;
-    default:
-        d.cls = SPARC64_ICLS_ATOMIC;
-        r = sparc64_exec_atomic(ctx, mem, mc, pc, &d);
-        break;
-    }
-    if (r.kind == SPARC64_STEP_CONTINUE) {
-        return SPARC64_EXIT_NONE;
-    }
-    return SPARC64_EXIT_UNDEF;
-}
-
-/* Window op: rd_save carries rd | save<<8; sum is SAVE/RESTORE operand. */
-static inline uint32_t s64_rt_win(sparc64_ctx_t *ctx,
-    const sparc64_mem_ops_t *mem, void *mc, uint64_t sum, uint32_t rd_save,
-    uint64_t pc)
-{
-    sparc64_step_result_t res;
-    unsigned rd = rd_save & 31U;
-    bool is_save = ((rd_save >> 8) & 1U) != 0U;
-    if (is_save) {
-        if (!sparc64_win_save(ctx, mem, mc, sum, rd, &res, pc)) {
-            return SPARC64_EXIT_UNDEF;
-        }
-    } else {
-        if (!sparc64_win_restore(ctx, mem, mc, sum, rd, &res, pc)) {
-            return SPARC64_EXIT_UNDEF;
-        }
-    }
-    return SPARC64_EXIT_NONE;
-}
-
 /* ---- emitter state + mechanical layer (shared by emit_int.c) -------- */
 
 /* Scratch allocation inside one emitted instruction. */
@@ -701,6 +623,59 @@ static inline void e_st64(sparc64_dbt_buf_t *b, unsigned rd, unsigned xsrc)
     }
     b->gpr_cache_tag[slot] = (uint8_t)(rd & 31U);
     b->gpr_cache_valid |= (uint8_t)(1U << slot);
+}
+/* Reload the cached home of guest register rs from ctx (Lane P13-5:
+ * the per-site miss stub restores the slot after an interp replay so
+ * the write-through cache never needs clearing on loads). */
+static inline void e_ldr_gpr(sparc64_dbt_buf_t *b, unsigned creg,
+    unsigned rs)
+{
+    sb_ldst_imm(b, true, true, creg, ECTX, (rs & 31U) * 8U);
+}
+/* Write xsrc to guest register rd (MOV + STR, never touches NZCV). */
+static inline void e_set_gpr(sparc64_dbt_buf_t *b, unsigned rd,
+    unsigned xsrc)
+{
+    e_st64(b, rd, xsrc);
+}
+/* Delay-slot double-emission snapshot (Lane P13-5): the not-taken and
+ * taken delay copies execute exclusively, so the taken copy must be
+ * compiled against the pre-branch cache state, not the state the
+ * not-taken copy leaves behind. NZCV needs no snapshot (delays either
+ * preserve it identically or clear/re-set it on both copies). */
+typedef struct {
+    uint8_t gpr_valid;
+    uint8_t gpr_tag[8];
+    uint8_t fpr_valid;
+    uint8_t fpr_tag[8];
+} sparc64_dbt_cache_snap_t;
+static inline void e_cache_snapshot(const sparc64_dbt_buf_t *b,
+    sparc64_dbt_cache_snap_t *s)
+{
+    unsigned i;
+    if (b == NULL || s == NULL) {
+        return;
+    }
+    s->gpr_valid = b->gpr_cache_valid;
+    s->fpr_valid = b->fpr_valid;
+    for (i = 0U; i < 8U; i++) {
+        s->gpr_tag[i] = b->gpr_cache_tag[i];
+        s->fpr_tag[i] = b->fpr_tag[i];
+    }
+}
+static inline void e_cache_restore(sparc64_dbt_buf_t *b,
+    const sparc64_dbt_cache_snap_t *s)
+{
+    unsigned i;
+    if (b == NULL || s == NULL) {
+        return;
+    }
+    b->gpr_cache_valid = s->gpr_valid;
+    b->fpr_valid = s->fpr_valid;
+    for (i = 0U; i < 8U; i++) {
+        b->gpr_cache_tag[i] = s->gpr_tag[i];
+        b->fpr_tag[i] = s->fpr_tag[i];
+    }
 }
 /* Second ALU operand (sign-extended simm13 or register) into xdst. */
 static inline void e_src2(sparc64_dbt_buf_t *b, unsigned xdst,
@@ -820,7 +795,12 @@ static inline void e_fault_here(sparc64_dbt_buf_t *b, uint64_t fault_pc)
 static inline size_t e_call_faultable(sparc64_dbt_buf_t *b, uint64_t addr)
 {
     size_t p;
+    /* Helpers may clobber x7/x8, d8..d15, and host NZCV at runtime, so
+     * every faultable call invalidates the GPR/FPR caches and the live
+     * NZCV state (Lane P13-5). */
     b->gpr_cache_valid = 0;
+    b->fpr_valid = 0;
+    b->nzcv_state = SPARC64_NZCV_NONE;
     sb_str_x30_pre(b);
     sb_mov_imm64(b, ES2, addr);
     sb_blr(b, ES2);
@@ -841,41 +821,6 @@ static inline void e_resolve_fault(sparc64_emit_ctx_t *ec, size_t p)
 static inline void e_arg_ctx(sparc64_dbt_buf_t *b)
 {
     sb_mov_reg(b, true, 0U, ECTX);
-}
-
-/* Memory/backend call: x0=ctx x1=mem x2=mc x3=pc x4=packA x5=raw
- * x6=packB, then BLR s64_rt_mem with the UNDEF fault path. */
-static inline size_t e_call_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
-{
-    sparc64_dbt_buf_t *b = ec->buf;
-    uint32_t pack_a = (d->op3 & 0x3fU) | ((d->rd & 31U) << 8) |
-        ((d->rs1 & 31U) << 16) | ((d->rs2 & 31U) << 24) |
-        ((d->is_imm & 1U) << 29);
-    uint64_t pack_b = ((uint64_t)(uint32_t)d->imm) |
-        ((uint64_t)d->asi << 32);
-    e_arg_ctx(b);
-    sb_mov_imm64(b, 1U, (uint64_t)(uintptr_t)ec->mem);
-    sb_mov_imm64(b, 2U, (uint64_t)(uintptr_t)ec->mc);
-    sb_mov_imm64(b, 3U, ec->pc);
-    sb_mov_imm32(b, 4U, pack_a);
-    sb_mov_imm32(b, 5U, d->raw);
-    sb_mov_imm64(b, 6U, pack_b);
-    return e_call_faultable(b, (uint64_t)(uintptr_t)&s64_rt_mem);
-}
-
-/* Window call: x0=ctx x1=mem x2=mc x3=sum x4=rd|save<<8 x5=pc.
- * The SAVE/RESTORE sum arrives in ES0. */
-static inline size_t e_call_win(sparc64_emit_ctx_t *ec, unsigned rd,
-    bool is_save)
-{
-    sparc64_dbt_buf_t *b = ec->buf;
-    e_arg_ctx(b);
-    sb_mov_imm64(b, 1U, (uint64_t)(uintptr_t)ec->mem);
-    sb_mov_imm64(b, 2U, (uint64_t)(uintptr_t)ec->mc);
-    sb_mov_reg(b, true, 3U, ES0);
-    sb_mov_imm32(b, 4U, (rd & 31U) | (is_save ? 0x100U : 0U));
-    sb_mov_imm64(b, 5U, ec->pc);
-    return e_call_faultable(b, (uint64_t)(uintptr_t)&s64_rt_win);
 }
 
 /* Seed the host carry from the icc.C bit in wM (0/1) for ADC: C = bit. */
