@@ -1,0 +1,11 @@
+PAGESZ-OK value=8192
+MMAP-OK
+MPROTECT-OK
+EXEC-OK
+WPROT-OK
+RW-OK
+XPROT-OK
+NONE-OK
+TAIL-OK
+P6P-PASS
+difftest: 0 divergences (N steps, guest exit 0)

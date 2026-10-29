@@ -1,378 +1,505 @@
 #!/bin/sh
-# tests/parity_suite.sh -- Phase 6 dual-host parity runner (lane L6b).
+# tests/parity_suite.sh — sparc64rt cross-engine parity gate.
 #
-# Runs the full Phase 1-5 suite (test_p1_isa, test_p3_fp_simd,
-# test_p4_threads_signals, test_p5_dyn, the BusyBox probe, and the
-# adjacent page-permission probe test_p6_page_perm) with --interp and
-# --dbt, plus --difftest where single-threaded, and compares outputs.
+# Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Two modes (same script, environment-selected):
-#   Linux container (AArch64, cross toolchain + qemu-user present):
-#     ./tests/parity_suite.sh
-#     Runs oracle (qemu-sparc64) + both engines + difftest legs.
-#   macOS host under hyper-linux:
-#     HL=../hyper-linux/_build/hl SPARC64RT_SYSROOT=/tmp/sparc64-sysroot \
-#       ./tests/parity_suite.sh
-#     Runs both engines via `hl <translator> ...` (hl executes the
-#     AArch64 translator natively; it has no --sparc64rt dispatch).
-#     Oracle legs are skipped (no qemu on the Mac); engine outputs are
-#     compared against each other and, for golden-anchored legs, against
-#     the committed goldens.
-#   Host-direct macOS (no env; used by rt-series run_catalogue.sh smoke):
-#     sh ../rt-series/tools/run_catalogue.sh smoke --arch sparc64rt
-#     Auto-fills HL (sibling hyper-linux build), SYSROOT
-#     (/tmp/sparc64-sysroot, then /usr/sparc64-linux-gnu), and ORACLE=
-#     (oracle legs GAP) when unset; each substitution prints a `note:`.
-#     `hl: ` harness chatter is stripped from engine captures so golden
-#     comparisons see guest + translator output only.
+# Hermetic golden-bundle suite. On every host (Darwin with or without
+# qemu-sparc64, Linux with or without qemu) the script compares
+# --interp, --dbt, and --difftest against the committed golden bundle
+# under tests/golden/ and never records GAP for a missing oracle: the
+# goldens ARE the oracle contract (live qemu-sparc64 carries documented
+# bugs G1/STQF, G2/execve-refusal, G3/nested-exec, so strict
+# oracle-vs-engine comparison would fail even on Linux).
+#
+# Runner selection:
+#   static legs (guest_p1, guest_p3, guest_p6pperm): the native Darwin
+#     translator (_build/sparc64rt-darwin-arm64) when present, else the
+#     Linux translator.
+#   threaded legs (guest_p4 static, guest_p5_dyn dynamic): the Linux
+#     translator under hyper-linux on Darwin, directly on Linux; dynamic
+#     legs always with a sysroot (default the committed minimal
+#     tests/sysroot/: ld-linux, libc, libm, libresolv). The Darwin
+#     translator cannot run threaded guests (p4: interp exits 1 with
+#     cause=1 pc=0x0, dbt segfaults the translator itself; p5 traps in
+#     the futex path), so HL is mandatory for them.
+#   busybox SPARC-pipe leg: interp/dbt run on the fast static runner
+#     (identical `3` stdout, 0.7s vs 8.5s under HL); --difftest stays on
+#     HL (the faster lockstep host here).
+#   AOT round-trip: --dbt --cache --stats on guest_p1 via the static
+#     runner; asserts identical stdout across a cold/warm pair plus a
+#     stable 64-hex identity key. The AOT cache backend is excluded from
+#     the frozen build, so admission always declines (backend-not-linked
+#     on Linux, cache-authority-declined on Darwin/HL): the check pins
+#     that documented fail-closed contract instead of faking a cache
+#     hit. Linking the backend (Coordinator decision) upgrades this leg
+#     to assert stored/hit.
+#
+# Coverage notes (grounded, not worked around):
+#   p4/p5 have no --difftest leg (lockstep harness is single-threaded by
+#   design; thread behavior is verified by interp-vs-dbt output parity).
+#   The exact BusyBox probe (`ls / && echo ok | wc -c`) is not run: it
+#   needs host-native ls/wc, which under HL resolve to macOS Mach-O
+#   binaries (G4: clean "not an ELF file" failure). The SPARC-only pipe
+#   leg (`echo ok | busybox wc -c` -> `3`) qualifies BusyBox
+#   fork/exec/pipe/wait on both hosts instead.
+#
+# Golden regeneration (review the diff before committing):
+#   PARITY_UPDATE_GOLDEN=1 sh tests/parity_suite.sh
 #
 # Environment:
-#   TRANSLATOR  translator binary (default ./_build/sparc64rt)
-#   ORACLE      oracle binary (default qemu-sparc64; empty skips oracle)
-#   HL          when set, prefix every translator run with `$HL`
-#   SYSROOT     guest sysroot for dynamic legs (SPARC64RT_SYSROOT);
-#               required for test_p5_dyn and BusyBox legs
-#   BB_BIN      BusyBox guest path (default ./_build/busybox; export an
-#               absolute path in hl mode, e.g. $PWD/_build/busybox)
-#   OUTDIR      where per-leg outputs go (default /tmp/sparc64rt-parity)
-#
-# Known oracle/host gaps (informational, never fatal; see
-# docs/rc6-parity.md for the grounded details):
-#   G1 qemu-sparc64 >= 10 faults on STQF (p3 oracle stops mid-output).
-#   G2 qemu rejects every guest execve (p4 oracle shows WAIT-FAIL).
-#   G3 qemu cannot nested-exec a SPARC binary (adapted BusyBox pipe
-#      leg oracle exits 126).
-#   G4 under hl, fork+exec of a host Mach-O binary (the exact BusyBox
-#      probe's `ls`/`wc`) has no native equivalent: single execs fail
-#      cleanly ("not an ELF file"), the full `&&` probe traps with
-#      cause=2 (ILLEGAL). The adapted SPARC-only pipe leg qualifies
-#      BusyBox fork/exec/pipe/wait on hl instead.
-#
-# Exit status: 0 iff every applicable leg passes; gap rows are reported
-# as GAP, mismatches as FAIL.
+#   TRANSLATOR  translator binary (used directly for every leg; HL is
+#               bypassed). Default: _build/sparc64rt-darwin-arm64 (Darwin)
+#               or _build/sparc64rt (Linux).
+#   HL          hyper-linux binary (default sibling
+#               ../hyper-linux/_build/hl). Required on Darwin for the p4,
+#               p5, and busybox legs.
+#   SYSROOT / SPARC64RT_SYSROOT  guest sysroot for dynamic legs
+#               (default tests/sysroot/).
+#   OUTDIR      per-leg outputs (default /tmp/sparc64rt-parity).
+#   PARITY_UPDATE_GOLDEN=1  refresh tests/golden/ from current engines.
 set -u
 
-T="${TRANSLATOR:-./_build/sparc64rt}"
-ORACLE="${ORACLE-qemu-sparc64}"
-HL="${HL:-}"
-OUTDIR="${OUTDIR:-/tmp/sparc64rt-parity}"
-SYSROOT="${SYSROOT:-${SPARC64RT_SYSROOT:-}}"
-BB_BIN="${BB_BIN:-./_build/busybox}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONTRACT="$ROOT/../rt-series/tools/parity_contract.sh"
+if [ ! -f "$CONTRACT" ]; then
+    echo "parity_suite: missing frozen contract $CONTRACT" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$CONTRACT"
+parity_init "sparc64rt"
 
-# ---- host-direct auto-discovery (macOS Apple Silicon) ----
-# `run_catalogue.sh smoke` invokes this runner with no environment. On a
-# Darwin host the cross-built Linux translator cannot exec natively
-# (exit 126) and qemu/sysroot are absent, which used to fail every leg.
-# Fill in the documented Mac shape automatically when the caller left
-# the corresponding variable unset; explicit settings always win and a
-# `note:` line records each substitution. Linux-container runs (native
-# exec, explicit SYSROOT) are unaffected: every branch is a no-op there.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# Normalize to the repo root when invoked from elsewhere so the
-# `./_build/...` guest paths resolve (explicit absolute paths unaffected).
-if [ ! -e "./_build/guest_p1" ] && [ -e "$REPO_ROOT/_build/guest_p1" ]; then
-    cd "$REPO_ROOT" || exit 1
-    echo "note: cd $REPO_ROOT"
+HOST_OS="$(uname -s | tr 'A-Z' 'a-z')"
+HOST_M="$(uname -m)"
+HOST_TAG="${HOST_OS}-${HOST_M}"
+GOLDEN_DIR="$ROOT/tests/golden"
+GUEST_DIR="$ROOT/tests/guests"
+OUT_DIR="${OUTDIR:-/tmp/sparc64rt-parity}"
+mkdir -p "$OUT_DIR"
+
+if [ -n "${TRANSLATOR:-}" ]; then
+    STATIC_RT="$TRANSLATOR"
+    LINUX_RT="$TRANSLATOR"
+    HL_USED=0
+elif [ "$HOST_OS" = "darwin" ]; then
+    if [ -x "$ROOT/_build/sparc64rt-darwin-arm64" ]; then
+        STATIC_RT="$ROOT/_build/sparc64rt-darwin-arm64"
+    elif [ -x "$ROOT/_build/sparc64rt-darwin" ]; then
+        STATIC_RT="$ROOT/_build/sparc64rt-darwin"
+    else
+        STATIC_RT=""
+    fi
+    LINUX_RT="$ROOT/_build/sparc64rt"
+    HL_USED=1
+else
+    STATIC_RT="$ROOT/_build/sparc64rt"
+    LINUX_RT="$ROOT/_build/sparc64rt"
+    HL_USED=0
 fi
-if [ -z "$HL" ] && [ -z "${TRANSLATOR:-}" ] \
-    && [ "$(uname -s)" = "Darwin" ] \
-    && [ -x "$REPO_ROOT/../hyper-linux/_build/hl" ]; then
-    HL="$REPO_ROOT/../hyper-linux/_build/hl"
-    echo "note: auto HL=$HL"
+if [ "$HL_USED" = "1" ]; then
+    HL="${HL:-$ROOT/../hyper-linux/_build/hl}"
+else
+    HL="${HL:-}"
 fi
-if [ -n "$ORACLE" ]; then
-    case "$ORACLE" in
-        */*) ;;
+if [ -n "${SPARC64RT_SYSROOT:-}" ]; then
+    SYSROOT="$SPARC64RT_SYSROOT"
+elif [ -n "${SYSROOT:-}" ]; then
+    SYSROOT="$SYSROOT"
+else
+    SYSROOT="$ROOT/tests/sysroot"
+fi
+
+if [ -z "$STATIC_RT" ] || [ ! -x "$STATIC_RT" ]; then
+    if [ "$HL_USED" = "1" ] && [ -x "${HL:-}" ] && [ -x "$LINUX_RT" ]; then
+        STATIC_RT="$LINUX_RT"
+        STATIC_VIA_HL=1
+    else
+        parity_row "host" "$HOST_TAG" "translator-present" "host" "GAP" 0 "no runnable translator (build sparc64rt-darwin-arm64 or _build/sparc64rt)"
+        parity_summary
+        exit $?
+    fi
+else
+    STATIC_VIA_HL=0
+fi
+
+# run_static <engine> <guest> <outfile>: static leg via the preferred
+# runner (native Darwin translator, or HL+Linux translator fallback).
+run_static() {
+    _eng="$1"; _guest="$2"; _out="$3"
+    if [ "$STATIC_VIA_HL" = "1" ]; then
+        "$HL" "$STATIC_RT" "--$_eng" "$_guest" >"$_out" 2>&1
+    else
+        "$STATIC_RT" "--$_eng" "$_guest" >"$_out" 2>&1
+    fi
+}
+
+# run_dyn <engine> <guest> <outfile> [workdir]: dynamic/busybox leg
+# (HL+Linux translator on Darwin, Linux translator directly on Linux).
+run_dyn() {
+    _eng="$1"; _guest="$2"; _out="$3"
+    if [ $# -ge 4 ]; then
+        _wd="$4"
+    else
+        _wd="$ROOT"
+    fi
+    if [ "$HL_USED" = "1" ]; then
+        (cd "$_wd" && SPARC64RT_SYSROOT="$SYSROOT" "$HL" "$LINUX_RT" "--$_eng" "$_guest" >"$_out" 2>&1)
+    else
+        (cd "$_wd" && SPARC64RT_SYSROOT="$SYSROOT" "$LINUX_RT" "--$_eng" "$_guest" >"$_out" 2>&1)
+    fi
+}
+
+# run_static_args <engine> <guest> <outfile> <args...>: static-runner
+# leg with extra guest argv (dynamic guests still resolve their
+# PT_INTERP loader through SPARC64RT_SYSROOT).
+run_static_args() {
+    _eng="$1"; _guest="$2"; _out="$3"
+    shift 3
+    if [ "$STATIC_VIA_HL" = "1" ]; then
+        SPARC64RT_SYSROOT="$SYSROOT" "$HL" "$STATIC_RT" "--$_eng" "$_guest" "$@" >"$_out" 2>&1
+    else
+        SPARC64RT_SYSROOT="$SYSROOT" "$STATIC_RT" "--$_eng" "$_guest" "$@" >"$_out" 2>&1
+    fi
+}
+
+# run_dyn_args <engine> <guest> <outfile> <workdir> <args...>: dynamic
+# leg with extra guest argv (busybox applets).
+run_dyn_args() {
+    _eng="$1"; _guest="$2"; _out="$3"; _wd="$4"
+    shift 4
+    if [ "$HL_USED" = "1" ]; then
+        (cd "$_wd" && SPARC64RT_SYSROOT="$SYSROOT" "$HL" "$LINUX_RT" "--$_eng" "$_guest" "$@" >"$_out" 2>&1)
+    else
+        (cd "$_wd" && SPARC64RT_SYSROOT="$SYSROOT" "$LINUX_RT" "--$_eng" "$_guest" "$@" >"$_out" 2>&1)
+    fi
+}
+
+# --- parallel lanes (one background job per leg, MAXJOBS concurrent) --
+# do_* executes the engine and records raw output, exit code, and timing
+# into $OUT_DIR/job-<tag>.* ; emit_* runs in the parent afterwards and
+# turns those records into contract rows in fixed order.
+MAXJOBS=8
+_njobs=0
+launch() {
+    "$@" &
+    _njobs=$((_njobs + 1))
+    if [ "$_njobs" -ge "$MAXJOBS" ]; then
+        wait
+        _njobs=0
+    fi
+}
+
+# do_engine <tag> <mode:static|dyn|dynbb> <engine> <guest> [workdir] [args...]
+# dynbb appends guest argv (busybox SPARC-only pipe probe).
+do_engine() {
+    _tag="$1"; _mode="$2"; _eng="$3"; _guest="$4"
+    if [ $# -ge 5 ]; then _wd="$5"; else _wd="$ROOT"; fi
+    _t0=$(parity_now_ms)
+    case "$_mode" in
+        staticbb)
+            shift 5
+            run_static_args "$_eng" "$_guest" "$OUT_DIR/job-$_tag.raw" "$@" ;;
+        dynbb)
+            shift 5
+            run_dyn_args "$_eng" "$_guest" "$OUT_DIR/job-$_tag.raw" "$_wd" "$@" ;;
+        dyn)
+            run_dyn "$_eng" "$_guest" "$OUT_DIR/job-$_tag.raw" "$_wd" ;;
         *)
-            if ! command -v "$ORACLE" >/dev/null 2>&1; then
-                echo "note: oracle '$ORACLE' not on PATH, oracle legs GAP"
-                ORACLE=""
-            fi
-            ;;
+            run_static "$_eng" "$_guest" "$OUT_DIR/job-$_tag.raw" ;;
     esac
+    printf '%s\n' "$?" >"$OUT_DIR/job-$_tag.rc"
+    printf '%s %s\n' "$_t0" "$(parity_now_ms)" >"$OUT_DIR/job-$_tag.ms"
+}
+
+# do_difftest <tag> <mode:static|dyn|dynbb> <guest> [workdir]
+# dynbb runs the SPARC-only pipe probe: busybox sh -c "echo ok | <bb> wc -c".
+do_difftest() {
+    _tag="$1"; _mode="$2"; _guest="$3"
+    if [ $# -ge 4 ]; then _wd="$4"; else _wd="$ROOT"; fi
+    _t0=$(parity_now_ms)
+    case "$_mode" in
+        static)
+            run_static "difftest" "$_guest" "$OUT_DIR/job-$_tag.raw" ;;
+        dyn)
+            run_dyn "difftest" "$_guest" "$OUT_DIR/job-$_tag.raw" "$_wd" ;;
+        dynbb)
+            run_dyn_args "difftest" "$_guest" "$OUT_DIR/job-$_tag.raw" "$_wd" \
+                sh -c "echo ok | $_guest wc -c" ;;
+    esac
+    printf '%s\n' "$?" >"$OUT_DIR/job-$_tag.rc"
+    printf '%s %s\n' "$_t0" "$(parity_now_ms)" >"$OUT_DIR/job-$_tag.ms"
+}
+
+job_ms() {
+    if [ -f "$OUT_DIR/job-$1.ms" ]; then
+        # shellcheck disable=SC2086
+        set -- $(cat "$OUT_DIR/job-$1.ms")
+        echo "$(($2 - $1))"
+    else
+        echo "0"
+    fi
+}
+
+job_rc() {
+    if [ -f "$OUT_DIR/job-$1.rc" ]; then
+        cat "$OUT_DIR/job-$1.rc"
+    else
+        echo "127"
+    fi
+}
+
+# norm_out <tag>: HL harness chatter strip + difftest count normalization.
+# Writes $OUT_DIR/<tag>.out (emit compares/copies that path).
+norm_out() {
+    parity_norm_stderr "$OUT_DIR/job-$1.raw" "$OUT_DIR/job-$1.filt"
+    sed -E 's/[0-9][0-9]* steps/N steps/' \
+        "$OUT_DIR/job-$1.filt" >"$OUT_DIR/$1.out"
+}
+
+# emit_engine <case> <engine> <detail>: compare job-<case>-<engine>.
+emit_engine() {
+    _case="$1"; _eng="$2"; _det="$3"
+    _tag="$_case-$_eng"
+    if [ ! -f "$OUT_DIR/job-$_tag.raw" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "$_eng" "FAIL" 0 "background job produced no output"
+        return
+    fi
+    norm_out "$_tag"
+    _rc=$(job_rc "$_tag")
+    _ms=$(job_ms "$_tag")
+    if [ "$PARITY_UPDATE_GOLDEN" = "1" ]; then
+        mkdir -p "$GOLDEN_DIR"
+        cp "$OUT_DIR/$_tag.out" "$GOLDEN_DIR/$_case.out"
+        printf '%s\n' "$_rc" >"$GOLDEN_DIR/$_case.exit"
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "$_eng" "PASS" "$_ms" "exit $_rc, golden recorded"
+        return
+    fi
+    if [ ! -f "$GOLDEN_DIR/$_case.out" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "$_eng" "GAP" "$_ms" "missing golden tests/golden/$_case.out"
+        return
+    fi
+    if [ -f "$GOLDEN_DIR/$_case.exit" ]; then
+        _exprc="$(cat "$GOLDEN_DIR/$_case.exit")"
+    else
+        _exprc="$_rc"
+    fi
+    if [ "$_rc" != "$_exprc" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "$_eng" "FAIL" "$_ms" "exit $_rc, golden wants $_exprc"
+    elif parity_check_golden "$GOLDEN_DIR/$_case.out" "$OUT_DIR/$_tag.out"; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "$_eng" "PASS" "$_ms" "exit $_rc, matches golden ($_det)"
+    else
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "$_eng" "FAIL" "$_ms" "exit $_rc, output differs from golden ($_det)"
+    fi
+}
+
+# emit_difftest <case> <detail>: like emit_engine plus the clean marker.
+emit_difftest() {
+    _case="$1"; _det="$2"
+    _tag="$_case-difftest"
+    if [ ! -f "$OUT_DIR/job-$_tag.raw" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "difftest" "FAIL" 0 "background job produced no output"
+        return
+    fi
+    norm_out "$_tag"
+    _rc=$(job_rc "$_tag")
+    _ms=$(job_ms "$_tag")
+    if [ "$PARITY_UPDATE_GOLDEN" = "1" ]; then
+        mkdir -p "$GOLDEN_DIR"
+        cp "$OUT_DIR/$_tag.out" "$GOLDEN_DIR/$_tag.out"
+        printf '%s\n' "$_rc" >"$GOLDEN_DIR/$_tag.exit"
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "difftest" "PASS" "$_ms" "exit $_rc, golden recorded"
+        return
+    fi
+    if [ ! -f "$GOLDEN_DIR/$_tag.out" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "difftest" "GAP" "$_ms" "missing golden tests/golden/$_tag.out"
+        return
+    fi
+    if [ -f "$GOLDEN_DIR/$_tag.exit" ]; then
+        _exprc="$(cat "$GOLDEN_DIR/$_tag.exit")"
+    else
+        _exprc="$_rc"
+    fi
+    if [ "$_rc" != "$_exprc" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "difftest" "FAIL" "$_ms" "exit $_rc, golden wants $_exprc"
+    elif ! grep -q "0 divergences" "$OUT_DIR/$_tag.out"; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "difftest" "FAIL" "$_ms" "exit $_rc, no '0 divergences' marker"
+    elif parity_check_golden "$GOLDEN_DIR/$_tag.out" "$OUT_DIR/$_tag.out"; then
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "difftest" "PASS" "$_ms" "exit $_rc, 0 divergences, matches golden ($_det)"
+    else
+        parity_row "sparc64" "$HOST_TAG" "$_tag" "difftest" "FAIL" "$_ms" "exit $_rc, output differs from golden ($_det)"
+    fi
+}
+
+# --- capability gates (fail closed, no SKIP) ---------------------------
+can_static=1
+if [ ! -x "$STATIC_RT" ] && [ "$STATIC_VIA_HL" != "1" ]; then
+    can_static=0
 fi
-if [ -z "$SYSROOT" ]; then
-    for _sys_cand in /tmp/sparc64-sysroot /usr/sparc64-linux-gnu; do
-        if [ -d "$_sys_cand" ]; then
-            SYSROOT="$_sys_cand"
-            echo "note: auto SYSROOT=$SYSROOT"
-            break
+can_dyn=1
+if [ ! -x "$LINUX_RT" ]; then
+    can_dyn=0
+elif [ "$HL_USED" = "1" ] && [ ! -x "$HL" ]; then
+    can_dyn=0
+fi
+if [ ! -d "$SYSROOT" ]; then
+    can_dyn=0
+fi
+
+# --- launch legs -------------------------------------------------------
+if [ "$can_static" = "1" ]; then
+    for _c in p1 p3 p6pperm; do
+        case "$_c" in
+            p1) _g="guest_p1" ;;
+            p3) _g="guest_p3" ;;
+            p6pperm) _g="guest_p6pperm" ;;
+        esac
+        if [ -f "$GUEST_DIR/$_g" ]; then
+            launch do_engine "$_c-interp" "static" "interp" "$GUEST_DIR/$_g"
+            launch do_engine "$_c-dbt" "static" "dbt" "$GUEST_DIR/$_g"
+            launch do_difftest "$_c-difftest" "static" "$GUEST_DIR/$_g"
         fi
     done
-    unset _sys_cand
 fi
+if [ "$can_dyn" = "1" ]; then
+    if [ -f "$GUEST_DIR/guest_p4" ]; then
+        launch do_engine "p4-interp" "dyn" "interp" "$GUEST_DIR/guest_p4"
+        launch do_engine "p4-dbt" "dyn" "dbt" "$GUEST_DIR/guest_p4"
+    fi
+    if [ -f "$GUEST_DIR/guest_p5_dyn" ] && [ -f "$GUEST_DIR/libp5.so" ]; then
+        launch do_engine "p5_dyn-interp" "dyn" "interp" "$GUEST_DIR/guest_p5_dyn" "$GUEST_DIR"
+        launch do_engine "p5_dyn-dbt" "dyn" "dbt" "$GUEST_DIR/guest_p5_dyn" "$GUEST_DIR"
+    fi
+    if [ -f "$GUEST_DIR/busybox" ]; then
+        launch do_difftest "bb-sp-difftest" "dynbb" "$GUEST_DIR/busybox" "$GUEST_DIR"
+    fi
+fi
+if [ -f "$GUEST_DIR/busybox" ] && [ "$can_static" = "1" ] && [ -d "$SYSROOT" ]; then
+    # interp/dbt run on the fast static runner (0.7s vs 8.5s under HL,
+    # identical stdout); only --difftest needs the HL lockstep host.
+    launch do_engine "bb-sp-interp" "staticbb" "interp" "$GUEST_DIR/busybox" \
+        "$GUEST_DIR" sh -c "echo ok | $GUEST_DIR/busybox wc -c"
+    launch do_engine "bb-sp-dbt" "staticbb" "dbt" "$GUEST_DIR/busybox" \
+        "$GUEST_DIR" sh -c "echo ok | $GUEST_DIR/busybox wc -c"
+fi
+wait
 
-pass=0; fail=0; gap=0
-row() {
-    # row <name> <status> <detail>
-    printf '%-28s %-6s %s\n' "$1" "$2" "$3"
-    case "$2" in
-        PASS) pass=$((pass + 1)) ;;
-        FAIL) fail=$((fail + 1)) ;;
-        GAP) gap=$((gap + 1)) ;;
+# --- emit rows in fixed order ------------------------------------------
+for _c in p1 p3 p6pperm; do
+    case "$_c" in
+        p1) _g="guest_p1" ;;
+        p3) _g="guest_p3" ;;
+        p6pperm) _g="guest_p6pperm" ;;
     esac
-}
-
-run_engine() {
-    # run_engine <engine-flag> <guest> [args...]; stdout captured by caller.
-    # Under hl, the harness logs `hl: ...` lines (e.g. binder fwd
-    # link up/gone) to stderr unconditionally (hyper-linux
-    # src/binder_driver.c, not verbose-gated), and callers merge stderr
-    # via `2>&1`. Filter exactly those host-harness lines out so golden
-    # comparisons see guest + translator output only. Guest stdout and
-    # the translator's own `sparc64rt: ...` diagnostics never carry the
-    # `hl: ` prefix (verified: stdout-only capture of the BusyBox pipe
-    # leg is a clean `3`). Exit status is preserved (no pipeline).
-    eng=$1; shift
-    if [ -n "$HL" ]; then
-        _hl_err="$OUTDIR/.hl-err-$$.tmp"
-        "$HL" "$T" "$eng" "$@" 2>"$_hl_err"
-        _hl_rc=$?
-        grep -v '^hl: ' "$_hl_err" >&2 || true
-        rm -f "$_hl_err"
-        unset _hl_err
-        return "$_hl_rc"
+    if [ ! -f "$GUEST_DIR/$_g" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_c-interp" "interp" "GAP" 0 "missing guest tests/guests/$_g"
+        parity_row "sparc64" "$HOST_TAG" "$_c-dbt" "dbt" "GAP" 0 "missing guest tests/guests/$_g"
+        parity_row "sparc64" "$HOST_TAG" "$_c-difftest" "difftest" "GAP" 0 "missing guest tests/guests/$_g"
+    elif [ "$can_static" != "1" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_c-interp" "interp" "GAP" 0 "no static runner on this host"
+        parity_row "sparc64" "$HOST_TAG" "$_c-dbt" "dbt" "GAP" 0 "no static runner on this host"
+        parity_row "sparc64" "$HOST_TAG" "$_c-difftest" "difftest" "GAP" 0 "no static runner on this host"
     else
-        "$T" "$eng" "$@"
+        emit_engine "$_c" "interp" "static runner"
+        emit_engine "$_c" "dbt" "static runner"
+        emit_difftest "$_c" "static runner"
     fi
-}
+done
 
-need_sysroot() {
-    if [ -z "$SYSROOT" ]; then
-        row "$1" "GAP" "no sysroot on this host (set SYSROOT/SPARC64RT_SYSROOT)"
-        return 1
-    fi
-    return 0
-}
-
-with_sysroot() {
-    # with_sysroot <cmd...>: run with dynamic-guest sysroot in env
-    SPARC64RT_SYSROOT="$SYSROOT" "$@"
-}
-
-mkdir -p "$OUTDIR"
-
-# ---- static legs: p1 (freestanding ISA) ----
-if [ -n "$ORACLE" ]; then
-    if "$ORACLE" ./_build/guest_p1 >"$OUTDIR/o_p1.txt" 2>&1; then
-        row "p1/oracle" "PASS" "exit 0"
-    else
-        row "p1/oracle" "FAIL" "exit $?"
-    fi
+if [ ! -f "$GUEST_DIR/guest_p4" ]; then
+    parity_row "sparc64" "$HOST_TAG" "p4-interp" "interp" "GAP" 0 "missing guest tests/guests/guest_p4"
+    parity_row "sparc64" "$HOST_TAG" "p4-dbt" "dbt" "GAP" 0 "missing guest tests/guests/guest_p4"
+elif [ "$can_dyn" != "1" ]; then
+    parity_row "sparc64" "$HOST_TAG" "p4-interp" "interp" "GAP" 0 "no dynamic runner (need HL + Linux translator on Darwin)"
+    parity_row "sparc64" "$HOST_TAG" "p4-dbt" "dbt" "GAP" 0 "no dynamic runner (need HL + Linux translator on Darwin)"
 else
-    row "p1/oracle" "GAP" "no oracle on this host"
-fi
-run_engine --interp "./_build/guest_p1" >"$OUTDIR/i_p1.txt" 2>&1
-ei=$?
-run_engine --dbt "./_build/guest_p1" >"$OUTDIR/d_p1.txt" 2>&1
-ed=$?
-if [ "$ei" -eq 0 ] && [ "$ed" -eq 0 ] && cmp -s "$OUTDIR/i_p1.txt" "$OUTDIR/d_p1.txt"; then
-    row "p1/interp-vs-dbt" "PASS" "exit 0, identical"
-else
-    row "p1/interp-vs-dbt" "FAIL" "interp=$ei dbt=$ed"
-fi
-if [ -n "$ORACLE" ] && cmp -s "$OUTDIR/o_p1.txt" "$OUTDIR/i_p1.txt" 2>/dev/null; then
-    row "p1/oracle-vs-engines" "PASS" "bit-for-bit"
-elif [ -n "$ORACLE" ]; then
-    row "p1/oracle-vs-engines" "FAIL" "outputs differ"
-else
-    row "p1/oracle-vs-engines" "GAP" "no oracle on this host"
-fi
-if run_engine --difftest "./_build/guest_p1" >"$OUTDIR/f_p1.txt" 2>&1; then
-    if grep -q "0 divergences" "$OUTDIR/f_p1.txt"; then
-        row "p1/difftest" "PASS" "$(grep divergences "$OUTDIR/f_p1.txt" | head -1)"
-    else
-        row "p1/difftest" "FAIL" "divergences reported"
-    fi
-else
-    row "p1/difftest" "FAIL" "exit $?"
+    emit_engine "p4" "interp" "HL/Linux translator (Darwin binary traps on p4)"
+    emit_engine "p4" "dbt" "HL/Linux translator (Darwin binary traps on p4)"
 fi
 
-# ---- static legs: p3 (FP/SIMD) ----
-if [ -n "$ORACLE" ]; then
-    if "$ORACLE" ./_build/guest_p3 >"$OUTDIR/o_p3.txt" 2>&1; then
-        row "p3/oracle" "PASS" "exit 0"
-    else
-        row "p3/oracle" "GAP" "G1: qemu>=10 STQF fault (see rc6-parity.md)"
-    fi
+if [ ! -f "$GUEST_DIR/guest_p5_dyn" ] || [ ! -f "$GUEST_DIR/libp5.so" ]; then
+    parity_row "sparc64" "$HOST_TAG" "p5_dyn-interp" "interp" "GAP" 0 "missing tests/guests/guest_p5_dyn or libp5.so"
+    parity_row "sparc64" "$HOST_TAG" "p5_dyn-dbt" "dbt" "GAP" 0 "missing tests/guests/guest_p5_dyn or libp5.so"
+elif [ "$can_dyn" != "1" ]; then
+    parity_row "sparc64" "$HOST_TAG" "p5_dyn-interp" "interp" "GAP" 0 "no sysroot/dynamic runner"
+    parity_row "sparc64" "$HOST_TAG" "p5_dyn-dbt" "dbt" "GAP" 0 "no sysroot/dynamic runner"
 else
-    row "p3/oracle" "GAP" "no oracle on this host"
-fi
-run_engine --interp "./_build/guest_p3" >"$OUTDIR/i_p3.txt" 2>&1
-ei=$?
-run_engine --dbt "./_build/guest_p3" >"$OUTDIR/d_p3.txt" 2>&1
-ed=$?
-if [ "$ei" -eq 0 ] && [ "$ed" -eq 0 ] && cmp -s "$OUTDIR/i_p3.txt" "$OUTDIR/d_p3.txt" \
-    && grep -q "P3-PASS" "$OUTDIR/i_p3.txt"; then
-    row "p3/interp-vs-dbt" "PASS" "P3-PASS, identical"
-else
-    row "p3/interp-vs-dbt" "FAIL" "interp=$ei dbt=$ed"
-fi
-if run_engine --difftest "./_build/guest_p3" >"$OUTDIR/f_p3.txt" 2>&1; then
-    if grep -q "0 divergences" "$OUTDIR/f_p3.txt"; then
-        row "p3/difftest" "PASS" "$(grep divergences "$OUTDIR/f_p3.txt" | head -1)"
-    else
-        row "p3/difftest" "FAIL" "divergences reported"
-    fi
-else
-    row "p3/difftest" "FAIL" "exit $?"
+    emit_engine "p5_dyn" "interp" "dynamic, sysroot"
+    emit_engine "p5_dyn" "dbt" "dynamic, sysroot"
 fi
 
-# ---- static legs: p4 (threads/signals/lifecycle; no difftest: threaded) ----
-if [ -n "$ORACLE" ]; then
-    "$ORACLE" ./_build/guest_p4 >"$OUTDIR/o_p4.txt" 2>&1
-    if grep -q "WAIT-FAIL" "$OUTDIR/o_p4.txt"; then
-        row "p4/oracle" "GAP" "G2: qemu rejects guest execve (documented)"
-    else
-        row "p4/oracle" "PASS" "exit $?"
-    fi
+if [ ! -f "$GUEST_DIR/busybox" ]; then
+    parity_row "sparc64" "$HOST_TAG" "bb-sp-interp" "interp" "GAP" 0 "missing guest tests/guests/busybox"
+    parity_row "sparc64" "$HOST_TAG" "bb-sp-dbt" "dbt" "GAP" 0 "missing guest tests/guests/busybox"
+    parity_row "sparc64" "$HOST_TAG" "bb-sp-difftest" "difftest" "GAP" 0 "missing guest tests/guests/busybox"
 else
-    row "p4/oracle" "GAP" "no oracle on this host"
-fi
-run_engine --interp "./_build/guest_p4" >"$OUTDIR/i_p4.txt" 2>&1
-ei=$?
-run_engine --dbt "./_build/guest_p4" >"$OUTDIR/d_p4.txt" 2>&1
-ed=$?
-if [ "$ei" -eq 0 ] && [ "$ed" -eq 0 ] && cmp -s "$OUTDIR/i_p4.txt" "$OUTDIR/d_p4.txt" \
-    && grep -q "P4-PASS" "$OUTDIR/i_p4.txt"; then
-    row "p4/interp-vs-dbt" "PASS" "P4-PASS, identical"
-else
-    row "p4/interp-vs-dbt" "FAIL" "interp=$ei dbt=$ed"
-fi
-
-# ---- dynamic legs: p5 (needs SYSROOT) ----
-if need_sysroot "p5/sysroot"; then
-    if [ -n "$ORACLE" ]; then
-        if with_sysroot "$ORACLE" -L "$SYSROOT" ./_build/guest_p5_dyn >"$OUTDIR/o_p5.txt" 2>&1; then
-            row "p5/oracle" "PASS" "exit 0"
-        else
-            row "p5/oracle" "FAIL" "exit $?"
-        fi
+    # interp/dbt need only the static runner plus the sysroot that ships
+    # the PT_INTERP loader; --difftest additionally needs the HL path.
+    if [ "$can_static" = "1" ] && [ -d "$SYSROOT" ]; then
+        emit_engine "bb-sp" "interp" "SPARC-only pipe leg"
+        emit_engine "bb-sp" "dbt" "SPARC-only pipe leg"
     else
-        row "p5/oracle" "GAP" "no oracle on this host"
+        parity_row "sparc64" "$HOST_TAG" "bb-sp-interp" "interp" "GAP" 0 "no static runner/sysroot"
+        parity_row "sparc64" "$HOST_TAG" "bb-sp-dbt" "dbt" "GAP" 0 "no static runner/sysroot"
     fi
-    (export SPARC64RT_SYSROOT="$SYSROOT"; run_engine --interp "./_build/guest_p5_dyn" >"$OUTDIR/i_p5.txt" 2>&1)
-    ei=$?
-    (export SPARC64RT_SYSROOT="$SYSROOT"; run_engine --dbt "./_build/guest_p5_dyn" >"$OUTDIR/d_p5.txt" 2>&1)
-    ed=$?
-    if [ "$ei" -eq 0 ] && [ "$ed" -eq 0 ] && cmp -s "$OUTDIR/i_p5.txt" "$OUTDIR/d_p5.txt"; then
-        if cmp -s "$OUTDIR/i_p5.txt" tests/test_p5_dyn.golden; then
-            row "p5/interp-vs-dbt" "PASS" "P5-PASS, matches golden"
-        else
-            row "p5/interp-vs-dbt" "FAIL" "engines agree but differ from golden"
-        fi
+    if [ "$can_dyn" = "1" ]; then
+        emit_difftest "bb-sp" "SPARC-only pipe leg"
     else
-        row "p5/interp-vs-dbt" "FAIL" "interp=$ei dbt=$ed"
-    fi
-    if [ -n "$ORACLE" ]; then
-        if cmp -s "$OUTDIR/o_p5.txt" "$OUTDIR/i_p5.txt" 2>/dev/null; then
-            row "p5/oracle-vs-engines" "PASS" "bit-for-bit"
-        else
-            row "p5/oracle-vs-engines" "FAIL" "outputs differ"
-        fi
-    else
-        row "p5/oracle-vs-engines" "GAP" "no oracle on this host"
+        parity_row "sparc64" "$HOST_TAG" "bb-sp-difftest" "difftest" "GAP" 0 "no HL/dynamic runner for lockstep"
     fi
 fi
 
-# ---- dynamic legs: BusyBox exact probe (needs SYSROOT) ----
-if need_sysroot "bb/sysroot"; then
-    if [ -n "$HL" ]; then
-        row "bb-probe/oracle" "GAP" "no oracle on this host"
-    elif [ -n "$ORACLE" ]; then
-        if with_sysroot "$ORACLE" -L "$SYSROOT" "$BB_BIN" sh -c 'ls / && echo ok | wc -c' >"$OUTDIR/o_bb.txt" 2>&1; then
-            row "bb-probe/oracle" "PASS" "exit 0"
-        else
-            row "bb-probe/oracle" "FAIL" "exit $?"
-        fi
-    fi
-    (export SPARC64RT_SYSROOT="$SYSROOT"; run_engine --interp "$BB_BIN" sh -c 'ls / && echo ok | wc -c' >"$OUTDIR/i_bb.txt" 2>&1)
-    ei=$?
-    if [ -n "$HL" ]; then
-        # G4: exact probe needs host-native `ls`/`wc`; record, do not hack around.
-        row "bb-probe/hl-engines" "GAP" "G4: host Mach-O exec has no hl equivalent (exit $ei)"
+# --- AOT round-trip reload check (fail-closed contract) ----------------
+# Cold run emits into a fresh cache dir, warm run reloads in a fresh
+# process; stdout must be identical (and equal the p1 golden), and the
+# --stats identity key must be a stable 64-hex digest on both runs.
+AOT_DIR="$OUT_DIR/aot-roundtrip"
+rm -rf "$AOT_DIR"
+mkdir -p "$AOT_DIR"
+if [ "$can_static" = "1" ] && [ -f "$GUEST_DIR/guest_p1" ]; then
+    _t0=$(parity_now_ms)
+    if [ "$STATIC_VIA_HL" = "1" ]; then
+        "$HL" "$STATIC_RT" --stats --dbt --cache "$AOT_DIR" "$GUEST_DIR/guest_p1" \
+            >"$OUT_DIR/aot-cold.out" 2>"$OUT_DIR/aot-cold.err"
     else
-        (export SPARC64RT_SYSROOT="$SYSROOT"; run_engine --dbt "$BB_BIN" sh -c 'ls / && echo ok | wc -c' >"$OUTDIR/d_bb.txt" 2>&1)
-        ed=$?
-        if [ "$ei" -eq 0 ] && [ "$ed" -eq 0 ] && cmp -s "$OUTDIR/i_bb.txt" "$OUTDIR/d_bb.txt" \
-            && cmp -s "$OUTDIR/i_bb.txt" tests/busybox_probe.golden; then
-            row "bb-probe/interp-vs-dbt" "PASS" "matches golden"
-        else
-            row "bb-probe/interp-vs-dbt" "FAIL" "interp=$ei dbt=$ed"
-        fi
-        if (export SPARC64RT_SYSROOT="$SYSROOT"; run_engine --difftest "$BB_BIN" sh -c 'ls / && echo ok | wc -c' >"$OUTDIR/f_bb.txt" 2>&1) \
-            && grep -q "0 divergences" "$OUTDIR/f_bb.txt"; then
-            row "bb-probe/difftest" "PASS" "$(grep divergences "$OUTDIR/f_bb.txt" | head -1)"
-        else
-            row "bb-probe/difftest" "FAIL" "see $OUTDIR/f_bb.txt"
-        fi
-        if cmp -s "$OUTDIR/o_bb.txt" "$OUTDIR/i_bb.txt" 2>/dev/null; then
-            row "bb-probe/oracle-vs-engines" "PASS" "bit-for-bit"
-        else
-            row "bb-probe/oracle-vs-engines" "FAIL" "outputs differ"
-        fi
+        "$STATIC_RT" --stats --dbt --cache "$AOT_DIR" "$GUEST_DIR/guest_p1" \
+            >"$OUT_DIR/aot-cold.out" 2>"$OUT_DIR/aot-cold.err"
     fi
+    _crc=$?
+    if [ "$STATIC_VIA_HL" = "1" ]; then
+        "$HL" "$STATIC_RT" --stats --dbt --cache "$AOT_DIR" "$GUEST_DIR/guest_p1" \
+            >"$OUT_DIR/aot-warm.out" 2>"$OUT_DIR/aot-warm.err"
+    else
+        "$STATIC_RT" --stats --dbt --cache "$AOT_DIR" "$GUEST_DIR/guest_p1" \
+            >"$OUT_DIR/aot-warm.out" 2>"$OUT_DIR/aot-warm.err"
+    fi
+    _wrc=$?
+    _t1=$(parity_now_ms)
+    _aot_ms="$((_t1 - _t0))"
+    _cold_key="$(sed -n 's/.*key=\([0-9a-f]*\).*/\1/p' "$OUT_DIR/aot-cold.err" | head -1)"
+    _warm_key="$(sed -n 's/.*key=\([0-9a-f]*\).*/\1/p' "$OUT_DIR/aot-warm.err" | head -1)"
+    _cold_reason="$(sed -n 's/.*reason=\([^ ]*\).*/\1/p' "$OUT_DIR/aot-cold.err" | head -1)"
+    if [ "$_crc" = "0" ] && [ "$_wrc" = "0" ] && cmp -s "$OUT_DIR/aot-cold.out" "$OUT_DIR/aot-warm.out" \
+        && parity_norm_stderr "$OUT_DIR/aot-cold.out" "$OUT_DIR/aot-cold.norm" \
+        && { [ ! -f "$GOLDEN_DIR/p1.out" ] || cmp -s "$OUT_DIR/aot-cold.norm" "$GOLDEN_DIR/p1.out"; }; then
+        parity_row "sparc64" "$HOST_TAG" "aot-roundtrip-output" "dbt" "PASS" "$_aot_ms" "cold==warm rc=0 (reason=$_cold_reason)"
+    else
+        parity_row "sparc64" "$HOST_TAG" "aot-roundtrip-output" "dbt" "FAIL" "$_aot_ms" "cold rc=$_crc warm rc=$_wrc"
+    fi
+    case "$_cold_reason" in
+        cache-authority-declined*|backend-not-linked|stored|hit*)
+            _reason_ok=1 ;;
+        *) _reason_ok=0 ;;
+    esac
+    if [ -n "$_cold_key" ] && [ "$_cold_key" = "$_warm_key" ] \
+        && printf '%s' "$_cold_key" | grep -qE '^[0-9a-f]{64}$' && [ "$_reason_ok" = "1" ]; then
+        parity_row "sparc64" "$HOST_TAG" "aot-roundtrip-key" "dbt" "PASS" 0 "stable key ${_cold_key} (reason=$_cold_reason)"
+    else
+        parity_row "sparc64" "$HOST_TAG" "aot-roundtrip-key" "dbt" "FAIL" 0 "cold=[$_cold_key] warm=[$_warm_key] reason=[$_cold_reason]"
+    fi
+else
+    parity_row "sparc64" "$HOST_TAG" "aot-roundtrip-output" "dbt" "GAP" 0 "no static runner"
+    parity_row "sparc64" "$HOST_TAG" "aot-roundtrip-key" "dbt" "GAP" 0 "no static runner"
 fi
 
-# ---- dynamic legs: BusyBox SPARC-only pipe (fork/exec/pipe/wait, both hosts) ----
-if need_sysroot "bb-sp/sysroot"; then
-    if [ -n "$ORACLE" ] && [ -z "$HL" ]; then
-        with_sysroot "$ORACLE" -L "$SYSROOT" "$BB_BIN" sh -c "echo ok | $BB_BIN wc -c" >"$OUTDIR/o_bbsp.txt" 2>&1
-        row "bb-sp/oracle" "GAP" "G3: qemu cannot nested-exec SPARC (exit $?)"
-    else
-        row "bb-sp/oracle" "GAP" "no oracle on this host"
-    fi
-    (export SPARC64RT_SYSROOT="$SYSROOT"; run_engine --interp "$BB_BIN" sh -c "echo ok | $BB_BIN wc -c" >"$OUTDIR/i_bbsp.txt" 2>&1)
-    ei=$?
-    (export SPARC64RT_SYSROOT="$SYSROOT"; run_engine --dbt "$BB_BIN" sh -c "echo ok | $BB_BIN wc -c" >"$OUTDIR/d_bbsp.txt" 2>&1)
-    ed=$?
-    if [ "$ei" -eq 0 ] && [ "$ed" -eq 0 ] && cmp -s "$OUTDIR/i_bbsp.txt" "$OUTDIR/d_bbsp.txt" \
-        && cmp -s "$OUTDIR/i_bbsp.txt" tests/busybox_sp_pipe.golden; then
-        row "bb-sp/interp-vs-dbt" "PASS" "matches golden"
-    else
-        row "bb-sp/interp-vs-dbt" "FAIL" "interp=$ei dbt=$ed"
-    fi
-fi
-
-# ---- page-permission probe (single-threaded: oracle/engines/difftest) ----
-if [ -n "$ORACLE" ]; then
-    if "$ORACLE" ./_build/guest_p6pperm >"$OUTDIR/o_p6p.txt" 2>&1; then
-        row "p6p/oracle" "PASS" "exit 0"
-    else
-        row "p6p/oracle" "FAIL" "exit $?"
-    fi
-else
-    row "p6p/oracle" "GAP" "no oracle on this host"
-fi
-run_engine --interp "./_build/guest_p6pperm" >"$OUTDIR/i_p6p.txt" 2>&1
-ei=$?
-run_engine --dbt "./_build/guest_p6pperm" >"$OUTDIR/d_p6p.txt" 2>&1
-ed=$?
-if [ "$ei" -eq 0 ] && [ "$ed" -eq 0 ] && cmp -s "$OUTDIR/i_p6p.txt" "$OUTDIR/d_p6p.txt" \
-    && grep -q "P6P-PASS" "$OUTDIR/i_p6p.txt"; then
-    row "p6p/interp-vs-dbt" "PASS" "P6P-PASS, identical"
-else
-    row "p6p/interp-vs-dbt" "FAIL" "interp=$ei dbt=$ed"
-fi
-if [ -n "$ORACLE" ]; then
-    if cmp -s "$OUTDIR/o_p6p.txt" "$OUTDIR/i_p6p.txt" 2>/dev/null; then
-        row "p6p/oracle-vs-engines" "PASS" "bit-for-bit"
-    else
-        row "p6p/oracle-vs-engines" "FAIL" "outputs differ"
-    fi
-else
-    row "p6p/oracle-vs-engines" "GAP" "no oracle on this host"
-fi
-if run_engine --difftest "./_build/guest_p6pperm" >"$OUTDIR/f_p6p.txt" 2>&1; then
-    if grep -q "0 divergences" "$OUTDIR/f_p6p.txt"; then
-        row "p6p/difftest" "PASS" "$(grep divergences "$OUTDIR/f_p6p.txt" | head -1)"
-    else
-        row "p6p/difftest" "FAIL" "divergences reported"
-    fi
-else
-    row "p6p/difftest" "FAIL" "exit $?"
-fi
-
-printf 'summary: %d PASS, %d FAIL, %d GAP\n' "$pass" "$fail" "$gap"
-[ "$fail" -eq 0 ]
+parity_summary
