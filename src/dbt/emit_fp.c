@@ -477,6 +477,9 @@ static bool fp_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     if (sparc64_mem_emit_site(b, d, ec->fault_pc, ec->delay == d)) {
         return !b->overflow;
     }
+    if (!sparc64_emit_fp_flush(ec)) {
+        return false;
+    }
     e_arg_ctx(b);
     sb_mov_imm64(b, 1U, (uint64_t)(uintptr_t)ec->mem);
     sb_mov_imm64(b, 2U, (uint64_t)(uintptr_t)ec->mc);
@@ -602,6 +605,13 @@ static bool fp_emit_one(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 
 static bool fp_is_batched_arith(const sparc64_dec_t *d)
 {
+    if (d->op == 3U &&
+        (d->op3 == (uint8_t)SPARC64_OP3_LDF ||
+            d->op3 == (uint8_t)SPARC64_OP3_LDDF ||
+            d->op3 == (uint8_t)SPARC64_OP3_STF ||
+            d->op3 == (uint8_t)SPARC64_OP3_STDF)) {
+        return true;
+    }
     if (d->op != 2U || d->op3 != (uint8_t)SPARC64_OP3_FPOP1) {
         return false;
     }

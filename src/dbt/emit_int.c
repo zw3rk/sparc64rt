@@ -541,6 +541,9 @@ static bool e_emit_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     size_t p_fault;
     if (ec->mem == NULL || !sparc64_mem_emit_site(ec->buf, d,
         ec->fault_pc, ec->delay == d)) {
+        if (!sparc64_emit_fp_flush(ec)) {
+            return false;
+        }
         p_fault = (ec->mem == NULL) ? SPARC64_DBT_NOPOS : e_call_mem(ec, d);
         if (p_fault == SPARC64_DBT_NOPOS) {
             return false;

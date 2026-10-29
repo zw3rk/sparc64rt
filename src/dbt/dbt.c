@@ -364,7 +364,7 @@ static const void *dbt_emit_range(sparc64_dbt_t *dbt,
             if ((d.cls == (uint8_t)SPARC64_ICLS_TCC ||
                 d.cls == (uint8_t)SPARC64_ICLS_RDASR ||
                 d.cls == (uint8_t)SPARC64_ICLS_WRASR ||
-                (d.cls >= (uint8_t)SPARC64_ICLS_LOAD &&
+                (d.cls >= (uint8_t)SPARC64_ICLS_LDSTUB &&
                     d.cls <= (uint8_t)SPARC64_ICLS_ATOMIC)) &&
                 !sparc64_emit_fp_flush(&ec)) goto fail;
             if (!sparc64_emit_int(&ec, &d)) {
