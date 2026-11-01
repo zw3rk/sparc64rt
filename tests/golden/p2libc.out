@@ -1,0 +1,6 @@
+hello sparc64
+dec=42 hex=2a str=rt char=Z
+malloc-sum=36
+sorted=1,2,3,4,5,6,7,8
+file=sparc64-libc-file
+p2-libc: PASS

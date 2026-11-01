@@ -249,11 +249,11 @@ job_rc() {
     fi
 }
 
-# norm_out <tag>: HL harness chatter strip + difftest count normalization.
+# norm_out <tag>: HL chatter strip + difftest/bench normalization.
 # Writes $OUT_DIR/<tag>.out (emit compares/copies that path).
 norm_out() {
     parity_norm_stderr "$OUT_DIR/job-$1.raw" "$OUT_DIR/job-$1.filt"
-    sed -E 's/[0-9][0-9]* steps/N steps/' \
+    sed -E 's/[0-9][0-9]* steps/N steps/; s/ (us|ops_sec)=[0-9]+/ \1=N/g; s/ total_us=[0-9]+/ total_us=N/g' \
         "$OUT_DIR/job-$1.filt" >"$OUT_DIR/$1.out"
 }
 
@@ -347,12 +347,15 @@ if [ ! -d "$SYSROOT" ]; then
 fi
 
 # --- launch legs -------------------------------------------------------
+BENCH_SPARC="$ROOT/../rt-series/_build/bench/bench-sparc64"
 if [ "$can_static" = "1" ]; then
-    for _c in p1 p3 p6pperm; do
+    for _c in p1 p3 p6pperm p2libc h1_smc; do
         case "$_c" in
             p1) _g="guest_p1" ;;
             p3) _g="guest_p3" ;;
             p6pperm) _g="guest_p6pperm" ;;
+            p2libc) _g="guest_p2libc" ;;
+            h1_smc) _g="guest_h1_smc" ;;
         esac
         if [ -f "$GUEST_DIR/$_g" ]; then
             launch do_engine "$_c-interp" "static" "interp" "$GUEST_DIR/$_g"
@@ -360,6 +363,10 @@ if [ "$can_static" = "1" ]; then
             launch do_difftest "$_c-difftest" "static" "$GUEST_DIR/$_g"
         fi
     done
+    if [ -x "$BENCH_SPARC" ]; then
+        launch do_engine "bench_smoke-interp" "staticbb" "interp" "$BENCH_SPARC" "$ROOT" --smoke
+        launch do_engine "bench_smoke-dbt" "staticbb" "dbt" "$BENCH_SPARC" "$ROOT" --smoke
+    fi
 fi
 if [ "$can_dyn" = "1" ]; then
     if [ -f "$GUEST_DIR/guest_p4" ]; then
@@ -370,6 +377,20 @@ if [ "$can_dyn" = "1" ]; then
         launch do_engine "p5_dyn-interp" "dyn" "interp" "$GUEST_DIR/guest_p5_dyn" "$GUEST_DIR"
         launch do_engine "p5_dyn-dbt" "dyn" "dbt" "$GUEST_DIR/guest_p5_dyn" "$GUEST_DIR"
     fi
+    if [ -f "$GUEST_DIR/guest_h4_cxx" ] && [ -f "$GUEST_DIR/libh4.so" ]; then
+        launch do_engine "h4_cxx-interp" "dyn" "interp" "$GUEST_DIR/guest_h4_cxx" "$GUEST_DIR"
+        launch do_engine "h4_cxx-dbt" "dyn" "dbt" "$GUEST_DIR/guest_h4_cxx" "$GUEST_DIR"
+    fi
+    for _tg in p3torture-sparc64 tcg-sparc64; do
+        case "$_tg" in
+            p3torture-sparc64) _tc="p3_torture" ;;
+            tcg-sparc64) _tc="tcg_smoke" ;;
+        esac
+        if [ -f "$GUEST_DIR/$_tg" ]; then
+            launch do_engine "$_tc-interp" "dyn" "interp" "$GUEST_DIR/$_tg"
+            launch do_engine "$_tc-dbt" "dyn" "dbt" "$GUEST_DIR/$_tg"
+        fi
+    done
     if [ -f "$GUEST_DIR/busybox" ]; then
         launch do_difftest "bb-sp-difftest" "dynbb" "$GUEST_DIR/busybox" "$GUEST_DIR"
     fi
@@ -385,11 +406,13 @@ fi
 wait
 
 # --- emit rows in fixed order ------------------------------------------
-for _c in p1 p3 p6pperm; do
+for _c in p1 p3 p6pperm p2libc h1_smc; do
     case "$_c" in
         p1) _g="guest_p1" ;;
         p3) _g="guest_p3" ;;
         p6pperm) _g="guest_p6pperm" ;;
+        p2libc) _g="guest_p2libc" ;;
+        h1_smc) _g="guest_h1_smc" ;;
     esac
     if [ ! -f "$GUEST_DIR/$_g" ]; then
         parity_row "sparc64" "$HOST_TAG" "$_c-interp" "interp" "GAP" 0 "missing guest tests/guests/$_g"
@@ -426,6 +449,45 @@ elif [ "$can_dyn" != "1" ]; then
 else
     emit_engine "p5_dyn" "interp" "dynamic, sysroot"
     emit_engine "p5_dyn" "dbt" "dynamic, sysroot"
+fi
+
+if [ ! -f "$GUEST_DIR/guest_h4_cxx" ] || [ ! -f "$GUEST_DIR/libh4.so" ]; then
+    parity_row "sparc64" "$HOST_TAG" "h4_cxx-interp" "interp" "GAP" 0 "missing tests/guests/guest_h4_cxx or libh4.so"
+    parity_row "sparc64" "$HOST_TAG" "h4_cxx-dbt" "dbt" "GAP" 0 "missing tests/guests/guest_h4_cxx or libh4.so"
+elif [ "$can_dyn" != "1" ]; then
+    parity_row "sparc64" "$HOST_TAG" "h4_cxx-interp" "interp" "GAP" 0 "no sysroot/dynamic runner"
+    parity_row "sparc64" "$HOST_TAG" "h4_cxx-dbt" "dbt" "GAP" 0 "no sysroot/dynamic runner"
+else
+    emit_engine "h4_cxx" "interp" "dynamic, sysroot (HL for threads)"
+    emit_engine "h4_cxx" "dbt" "dynamic, sysroot (HL for threads)"
+fi
+
+for _tc in p3_torture tcg_smoke; do
+    case "$_tc" in
+        p3_torture) _tg="p3torture-sparc64" ;;
+        tcg_smoke) _tg="tcg-sparc64" ;;
+    esac
+    if [ ! -f "$GUEST_DIR/$_tg" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tc-interp" "interp" "GAP" 0 "missing guest tests/guests/$_tg"
+        parity_row "sparc64" "$HOST_TAG" "$_tc-dbt" "dbt" "GAP" 0 "missing guest tests/guests/$_tg"
+    elif [ "$can_dyn" != "1" ]; then
+        parity_row "sparc64" "$HOST_TAG" "$_tc-interp" "interp" "GAP" 0 "no dynamic runner (need HL on Darwin for threads)"
+        parity_row "sparc64" "$HOST_TAG" "$_tc-dbt" "dbt" "GAP" 0 "no dynamic runner (need HL on Darwin for threads)"
+    else
+        emit_engine "$_tc" "interp" "static threaded via HL/Linux (Darwin traps)"
+        emit_engine "$_tc" "dbt" "static threaded via HL/Linux (Darwin traps)"
+    fi
+done
+
+if [ ! -x "$BENCH_SPARC" ]; then
+    parity_row "sparc64" "$HOST_TAG" "bench_smoke-interp" "interp" "GAP" 0 "missing bench $BENCH_SPARC"
+    parity_row "sparc64" "$HOST_TAG" "bench_smoke-dbt" "dbt" "GAP" 0 "missing bench $BENCH_SPARC"
+elif [ "$can_static" != "1" ]; then
+    parity_row "sparc64" "$HOST_TAG" "bench_smoke-interp" "interp" "GAP" 0 "no static runner"
+    parity_row "sparc64" "$HOST_TAG" "bench_smoke-dbt" "dbt" "GAP" 0 "no static runner"
+else
+    emit_engine "bench_smoke" "interp" "bench --smoke (timings normalized)"
+    emit_engine "bench_smoke" "dbt" "bench --smoke (timings normalized)"
 fi
 
 if [ ! -f "$GUEST_DIR/busybox" ]; then
