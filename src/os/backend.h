@@ -53,10 +53,11 @@ void  rt_host_jit_free(void *buf, size_t size);
  *          issuing non-blocking `O_NONBLOCK` I/O. Any `sig_seq` increment writes 1 byte
  *          to `ws->wake_pipe_wr`, so `kevent` wakes immediately with zero lost-wakeup window!
  *      (b) Futex (`rt_host_futex_wait_bitset`): checks `ws->sig_seq != expected_seq`
- *          under the bucket lock and sleeps via `__ulock_wait2`; signal notification
- *          calls `__ulock_wake(..., ULF_WAKE_ALL)` on `ws->ulock_addr`.
+ *          under the futex table lock and sleeps on the per-waiter condition variable
+ *          in bounded timed slices; signal notification atomically increments
+ *          `ws->sig_seq` and writes 1 byte to `ws->wake_pipe_wr`.
  *      (c) Process wait (`wait4`/`waitid`) & sleep (`clock_nanosleep`): waits on worker
- *          `kqueue` (`EVFILT_PROC` / `EVFILT_TIMER` + `ws->wake_pipe_rd`). */
+ *          `kqueue` / wake pipe (`EVFILT_PROC` + `ws->wake_pipe_rd`). */
 typedef struct {
     _Atomic uint32_t  sig_seq;
     _Atomic uint32_t  in_commit_window;

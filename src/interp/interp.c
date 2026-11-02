@@ -226,8 +226,11 @@ static sparc64_step_result_t exec_single(sparc64_cpu_t *cpu,
 }
 
 /* Delay-slot execution: fetches, decodes, and runs the single delay
- * instruction. A nested CTI takes over the transfer (outer cancelled);
- * any stop result propagates with pc/npc unchanged. */
+ * instruction with cpu->pc already at delay_pc and cpu->npc already at
+ * the outer CTI's post-delay target. A nested CTI takes over the
+ * transfer; any stop result (trap or syscall) propagates with cpu->pc
+ * and cpu->npc preserved so the caller/syscall handler sees the pending
+ * transfer target in cpu->npc. */
 static bool exec_delay(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     void *mc, uint64_t delay_pc, sparc64_step_result_t *res)
 {
@@ -246,32 +249,28 @@ static bool exec_delay(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
         dd.cls == (uint8_t)SPARC64_ICLS_BPR ||
         dd.cls == (uint8_t)SPARC64_ICLS_FBR) {
         *res = exec_cti(cpu, mem, mc, delay_pc, &dd);
-        if (res->kind != SPARC64_STEP_CONTINUE) {
-            return false;
-        }
-        return true;
+        return res->kind == SPARC64_STEP_CONTINUE;
     }
     if (dd.cls == (uint8_t)SPARC64_ICLS_TCC) {
         /* A trap-condition in the delay slot evaluates normally: a false
-         * condition is a nop, a true one stops the outer transfer. */
+         * condition is a nop, a true one stops with cpu->pc/npc intact. */
         r = exec_tcc(cpu, delay_pc, &dd);
-        if (r.kind != SPARC64_STEP_CONTINUE) {
-            *res = r;
-            return false;
-        }
-        return true;
+    } else {
+        r = exec_single(cpu, mem, mc, delay_pc, &dd);
     }
-    r = exec_single(cpu, mem, mc, delay_pc, &dd);
     if (r.kind != SPARC64_STEP_CONTINUE) {
         *res = r;
         return false;
     }
+    cpu->pc = cpu->npc;
+    cpu->npc += 4U;
     return true;
 }
 
 /* Control transfer at pc (cpu->npc == pc + 4): delay slot, annul, and
- * pc/npc update. Returns CONTINUE with pc/npc committed, or a stop
- * result (misaligned target, delay fault) with pc/npc unchanged. */
+ * pc/npc update. Publishes (delay_pc, target) into (cpu->pc, cpu->npc)
+ * before running the delay slot so a delay-slot syscall or trap sees
+ * the pending branch destination in cpu->npc. */
 static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
     const sparc64_mem_ops_t *mem, void *mc, uint64_t pc, const sparc64_dec_t *d)
 {
@@ -280,12 +279,13 @@ static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
     sparc64_step_result_t res;
     bool taken = true;
     if (d->cls == (uint8_t)SPARC64_ICLS_CALL) {
+        target = pc + (uint64_t)d->disp; /* mod 2^64 */
         sparc64_wreg(cpu, SPARC64_O7, pc);
+        cpu->pc = npc;
+        cpu->npc = target;
         if (!exec_delay(cpu, mem, mc, npc, &res)) {
             return res;
         }
-        cpu->pc = pc + (uint64_t)d->disp; /* mod 2^64 */
-        cpu->npc = cpu->pc + 4U;
         return sparc64_step_ok(pc);
     }
     if (d->cls == (uint8_t)SPARC64_ICLS_RETURN) {
@@ -302,11 +302,11 @@ static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
             pc)) {
             return res;
         }
+        cpu->pc = npc;
+        cpu->npc = target;
         if (!exec_delay(cpu, mem, mc, npc, &res)) {
             return res;
         }
-        cpu->pc = target;
-        cpu->npc = target + 4U;
         return sparc64_step_ok(pc);
     }
     if (d->cls == (uint8_t)SPARC64_ICLS_JMPL) {
@@ -317,11 +317,11 @@ static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
         sparc64_wreg(cpu, d->rd, pc);
+        cpu->pc = npc;
+        cpu->npc = target;
         if (!exec_delay(cpu, mem, mc, npc, &res)) {
             return res;
         }
-        cpu->pc = target;
-        cpu->npc = target + 4U;
         return sparc64_step_ok(pc);
     }
     /* Branches: condition, target, annul (BA,a always skips, E02). */
@@ -336,30 +336,20 @@ static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
     } else {
         taken = sparc64_eval_rcond(d->cond, sparc64_rreg(cpu, d->rs1));
     }
-    target = pc + (uint64_t)d->disp; /* mod 2^64 */
+    target = taken ? (pc + (uint64_t)d->disp) : (npc + 4U);
     if (d->annul != 0U) {
         bool skip = taken ? (d->cond == 8U &&
                 d->cls != (uint8_t)SPARC64_ICLS_BPR) : true;
         if (skip) {
-            if (taken) {
-                cpu->pc = target;
-                cpu->npc = target + 4U;
-            } else {
-                cpu->pc = npc + 4U;
-                cpu->npc = npc + 8U;
-            }
+            cpu->pc = target;
+            cpu->npc = target + 4U;
             return sparc64_step_ok(pc);
         }
     }
+    cpu->pc = npc;
+    cpu->npc = target;
     if (!exec_delay(cpu, mem, mc, npc, &res)) {
         return res;
-    }
-    if (taken) {
-        cpu->pc = target;
-        cpu->npc = target + 4U;
-    } else {
-        cpu->pc = npc + 4U;
-        cpu->npc = npc + 8U;
     }
     return sparc64_step_ok(pc);
 }
@@ -489,9 +479,11 @@ sparc64_step_result_t sparc64_step_with_insn(sparc64_cpu_t *cpu,
         }
         break;
     }
-    if (res.kind == SPARC64_STEP_TRAP) {
-        /* Trap context is precise: TPC names the faulting instruction
-         * (the delay slot when the delay faults), TNPC its successor. */
+    if (res.kind == SPARC64_STEP_TRAP &&
+        (cpu->pc != res.pc || cpu->npc == UINT64_C(0))) {
+        /* Trap context is precise: TPC names the faulting instruction;
+         * preserve cpu->npc when exec_cti or dbt_delay_continuation
+         * already published the pending branch destination. */
         cpu->pc = res.pc;
         cpu->npc = res.pc + 4U;
     }

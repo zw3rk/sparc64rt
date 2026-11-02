@@ -16,19 +16,12 @@
 #include "dbt/emit_int.h"
 #include "dbt/emit_priv.h"
 
-/* Lane P5: FP condition taken-mask over fcc values 0..3, indexed by
- * the 4-bit FP condition (mirrors interp fp_cctest). */
-static const uint32_t fp_taken_mask[16] = {
-    0x0U, 0xEU, 0x6U, 0xAU, 0x2U, 0xCU, 0x4U, 0x8U,
-    0xFU, 0x1U, 0x9U, 0x5U, 0xDU, 0x3U, 0xBU, 0x7U
-};
-
 /* Load fcc[idx] and reduce (cond, fcc) to taken 0/1 in ES4. */
 static void fp_taken_compute(sparc64_dbt_buf_t *b, unsigned cond,
     unsigned idx)
 {
     sb_ldst_imm(b, true, false, ES3, ECTX, 0x240U + (idx & 3U) * 4U);
-    sb_mov_imm32(b, ES4, fp_taken_mask[cond & 15U]);
+    sb_mov_imm32(b, ES4, sparc64_fp_cond_mask(cond));
     sb_lsrv(b, false, ES4, ES4, ES3);
     sb_ubfm(b, false, ES4, ES4, 0U, 0U);
 }

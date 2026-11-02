@@ -83,7 +83,8 @@ check-abi-invariants: ## Build and run tests/check_abi_invariants.c when present
 
 check-thr-granule: ## Build and run the host-atomic 4K-granule regression test (Wave U2)
 	$(HOST_CC) $(CFLAGS) -Isrc tests/test_thr_resolve_granule.c \
-		src/os/threads.c src/os/mem_space.c src/os/mem_space_write.c \
+		src/os/threads.c src/os/sync_sig.c src/os/mem_space.c \
+		src/os/mem_space_write.c $(wildcard src/interp/*.c) \
 		-o $(BUILD_DIR)/test_thr_resolve_granule -pthread && \
 	./$(BUILD_DIR)/test_thr_resolve_granule
 

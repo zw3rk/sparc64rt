@@ -10,7 +10,7 @@
  * lock serializing interp/DBT execution across threads (the interp
  * winfile and the DBT window helper share process-global state), and the
  * host-__atomic fast path for CASA/CASXA/LDSTUB/SWAP shared by the interp
- * exec_atomic and the DBT s64_rt_mem path.
+ * exec_atomic and the DBT s64_jrt_mem path.
  *
  * SPARC clone argument order (arch/sparc: o3 is tls, o4 is child_tidptr;
  * the qemu-sparc64 oracle maps o2=ptid, o3=tls, o4=ctid):

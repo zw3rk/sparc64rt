@@ -842,4 +842,16 @@ static inline void e_load_carry(sparc64_dbt_buf_t *b, unsigned wM)
     sb_ubfm(b, false, wM, wM, 0U, 0U);
 }
 
+/* SPARC V9 4-bit FP condition taken-mask over fcc values 0..3 (mirrors
+ * interp fp_cctest), shared by integer MOVcc (%fcc0..%fcc3) and FP
+ * FMOVcc/FBfcc lowering. */
+static inline uint32_t sparc64_fp_cond_mask(unsigned cond)
+{
+    static const uint32_t mask[16] = {
+        0x0U, 0xEU, 0x6U, 0xAU, 0x2U, 0xCU, 0x4U, 0x8U,
+        0xFU, 0x1U, 0x9U, 0x5U, 0xDU, 0x3U, 0xBU, 0x7U
+    };
+    return mask[cond & 15U];
+}
+
 #endif /* SPARC64RT_DBT_EMIT_PRIV_H */

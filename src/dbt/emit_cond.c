@@ -181,10 +181,6 @@ static bool e_delay_plain(sparc64_emit_ctx_t *ec)
 /* Integer MOVcc (%icc/%xcc and %fcc0..%fcc3). */
 bool sparc64_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
-    static const uint32_t fcond_mask[16] = {
-        0x0U, 0xEU, 0x6U, 0xAU, 0x2U, 0xCU, 0x4U, 0x8U,
-        0xFU, 0x1U, 0x9U, 0x5U, 0xDU, 0x3U, 0xBU, 0x7U
-    };
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_skip;
     unsigned acond;
@@ -215,7 +211,7 @@ bool sparc64_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         sb_orr_reg(b, false, ES0, 31U, ES2);
         sb_patch_cb(b, p_have, b->count);
         sb_ubfm(b, false, ES0, ES0, 0U, 1U);
-        sb_mov_imm32(b, ES2, fcond_mask[d->cond & 15U]);
+        sb_mov_imm32(b, ES2, sparc64_fp_cond_mask(d->cond));
         sb_lsrv(b, false, ES2, ES2, ES0);
         sb_ubfm(b, false, ES2, ES2, 0U, 0U);
         e_src2(b, ES1, d);

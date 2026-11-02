@@ -11,6 +11,7 @@
 #include "os/backend.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -65,17 +66,12 @@ static int linux_signo(int dar_sig)
 #define RT_DARWIN_WORKERS 256u
 static struct {
     pthread_mutex_t mu;
-    int init;
     uint64_t ids[RT_DARWIN_WORKERS];
     pthread_t ths[RT_DARWIN_WORKERS];
-} g_workers;
+} g_workers = { PTHREAD_MUTEX_INITIALIZER, { 0 }, { 0 } };
 
 static void workers_lock(void)
 {
-    if (!g_workers.init) {
-        (void)pthread_mutex_init(&g_workers.mu, NULL);
-        g_workers.init = 1;
-    }
     (void)pthread_mutex_lock(&g_workers.mu);
 }
 
@@ -154,19 +150,10 @@ static int futex_match(const struct darwin_futex_waiter *w,
             w->key.mount_id == key->mount_id &&
             w->key.offset == key->offset;
     }
-    return w->uaddr == uaddr;
-}
-
-static void futex_broadcast_all_signals(void)
-{
-    unsigned i;
-    futex_lock();
-    for (i = 0u; i < RT_FUTEX_WAITERS; i++) {
-        if (g_futex_q[i].used) {
-            (void)pthread_cond_broadcast(&g_futex_q[i].cv);
-        }
+    if (w->has_key && w->uaddr == NULL) {
+        return 0;
     }
-    (void)pthread_mutex_unlock(&g_futex_mu);
+    return w->uaddr == uaddr;
 }
 
 /* 4. worker sync + preemption */
@@ -210,10 +197,11 @@ void rt_host_worker_sync_destroy(rt_worker_sync_t *ws)
 void rt_host_worker_notify_signal(rt_worker_sync_t *ws)
 {
     static const char one = 'x';
+    int saved_errno = errno;
     if (ws == NULL || ws->wake_pipe_wr < 0) { return; }
     atomic_fetch_add_explicit(&ws->sig_seq, 1u, memory_order_release);
     (void)write(ws->wake_pipe_wr, &one, 1u);
-    futex_broadcast_all_signals();
+    errno = saved_errno;
 }
 
 int rt_host_preempt_worker(uint64_t host_tid)
@@ -250,26 +238,52 @@ int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr,
     if (pinned_host_uaddr == NULL || bitset == 0u) { return -22; }
     if (timeout != NULL) {
         struct timespec now_rt;
-        int64_t delta_ns;
+        int64_t d_sec;
+        long d_nsec;
         if (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
+            return -22;
+        }
+        if (!is_abs_timeout && timeout->tv_sec < 0) {
             return -22;
         }
         if (clock_gettime(CLOCK_REALTIME, &now_rt) != 0) { return neg_errno(); }
         if (is_abs_timeout) {
             struct timespec now_clk;
+            uint64_t u_sec;
             int clk = clock_realtime ? CLOCK_REALTIME : CLOCK_MONOTONIC;
             if (clock_gettime((clockid_t)clk, &now_clk) != 0) { return neg_errno(); }
-            delta_ns = ((int64_t)timeout->tv_sec - (int64_t)now_clk.tv_sec) * 1000000000L +
-                ((int64_t)timeout->tv_nsec - (int64_t)now_clk.tv_nsec);
+            if (timeout->tv_sec < now_clk.tv_sec ||
+                (timeout->tv_sec == now_clk.tv_sec &&
+                 timeout->tv_nsec <= now_clk.tv_nsec)) {
+                return -110;
+            }
+            u_sec = (uint64_t)timeout->tv_sec - (uint64_t)now_clk.tv_sec;
+            d_nsec = timeout->tv_nsec - now_clk.tv_nsec;
+            if (d_nsec < 0) {
+                u_sec -= 1u;
+                d_nsec += 1000000000L;
+            }
+            d_sec = u_sec > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)u_sec;
         } else {
-            delta_ns = (int64_t)timeout->tv_sec * 1000000000L + (int64_t)timeout->tv_nsec;
+            if (timeout->tv_sec == 0 && timeout->tv_nsec == 0) {
+                return -110;
+            }
+            d_sec = (int64_t)timeout->tv_sec;
+            d_nsec = timeout->tv_nsec;
         }
-        if (delta_ns <= 0) { return -110; }
-        abstime.tv_sec = now_rt.tv_sec + (time_t)(delta_ns / 1000000000L);
-        abstime.tv_nsec = now_rt.tv_nsec + (long)(delta_ns % 1000000000L);
-        if (abstime.tv_nsec >= 1000000000L) {
-            abstime.tv_sec += 1;
-            abstime.tv_nsec -= 1000000000L;
+        {
+            int64_t max_add = INT64_MAX - 1 - (int64_t)now_rt.tv_sec;
+            if (d_sec > max_add) {
+                abstime.tv_sec = (time_t)(INT64_MAX - 1);
+                abstime.tv_nsec = 0;
+            } else {
+                abstime.tv_sec = (time_t)((int64_t)now_rt.tv_sec + d_sec);
+                abstime.tv_nsec = now_rt.tv_nsec + d_nsec;
+                if (abstime.tv_nsec >= 1000000000L) {
+                    abstime.tv_sec += 1;
+                    abstime.tv_nsec -= 1000000000L;
+                }
+            }
         }
         have_deadline = 1;
     }
@@ -307,10 +321,35 @@ int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr,
             ret = -4;
             break;
         }
-        if (have_deadline) {
+        if (have_deadline || ws != NULL) {
+            struct timespec wait_ts;
+            int slice_is_deadline = (ws == NULL);
+            if (ws != NULL) {
+                struct timespec now_rt;
+                if (clock_gettime(CLOCK_REALTIME, &now_rt) != 0) {
+                    ret = neg_errno();
+                    break;
+                }
+                wait_ts.tv_sec = now_rt.tv_sec;
+                wait_ts.tv_nsec = now_rt.tv_nsec + 10000000L;
+                if (wait_ts.tv_nsec >= 1000000000L) {
+                    wait_ts.tv_sec += 1;
+                    wait_ts.tv_nsec -= 1000000000L;
+                }
+                if (have_deadline &&
+                    (abstime.tv_sec < wait_ts.tv_sec ||
+                     (abstime.tv_sec == wait_ts.tv_sec &&
+                      abstime.tv_nsec <= wait_ts.tv_nsec))) {
+                    wait_ts = abstime;
+                    slice_is_deadline = 1;
+                }
+            } else {
+                wait_ts = abstime;
+            }
             rc = pthread_cond_timedwait(&g_futex_q[(unsigned)slot].cv,
-                &g_futex_mu, &abstime);
-            if (rc == ETIMEDOUT && !g_futex_q[(unsigned)slot].woken) {
+                &g_futex_mu, &wait_ts);
+            if (rc == ETIMEDOUT && !g_futex_q[(unsigned)slot].woken &&
+                slice_is_deadline) {
                 ret = -110;
                 break;
             }
@@ -355,6 +394,9 @@ int64_t rt_host_futex_requeue(_Atomic uint32_t *pinned_host_uaddr1,
     if (pinned_host_uaddr1 == NULL || wake_count < 0 || requeue_count < 0) {
         return -22;
     }
+    if (requeue_count > 0 && (key1 == NULL || key2 == NULL)) {
+        return -22;
+    }
     futex_lock();
     if (host_endian_cmp_val != NULL) {
         uint32_t cur = atomic_load_explicit(pinned_host_uaddr1,
@@ -374,17 +416,16 @@ int64_t rt_host_futex_requeue(_Atomic uint32_t *pinned_host_uaddr1,
             (void)pthread_cond_signal(&w->cv);
             woken++;
         } else if (requeued < requeue_count) {
-            if (key2 != NULL) {
-                w->key = *key2;
-                w->has_key = 1;
-            }
+            w->key = *key2;
+            w->has_key = 1;
+            w->uaddr = NULL;
             requeued++;
         } else {
             break;
         }
     }
     (void)pthread_mutex_unlock(&g_futex_mu);
-    return (int64_t)woken;
+    return (int64_t)woken + (int64_t)requeued;
 }
 
 /* 7b. clocks + random */
@@ -405,19 +446,61 @@ int64_t rt_host_clock_nanosleep(int linux_clk_id, int linux_flags,
     uint32_t expected_seq)
 {
     struct timespec rel;
-    (void)ws;
-    (void)expected_seq;
-    if (req == NULL) { return -22; }
+    if (req == NULL || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L) {
+        return -22;
+    }
+    if (ws != NULL &&
+        atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) {
+        return -4;
+    }
     if ((linux_flags & 1) != 0) {
         struct timespec now;
         if (clock_gettime((clockid_t)linux_clk_id, &now) != 0) { return neg_errno(); }
         rel.tv_sec = req->tv_sec - now.tv_sec;
         rel.tv_nsec = req->tv_nsec - now.tv_nsec;
         if (rel.tv_nsec < 0) { rel.tv_sec -= 1; rel.tv_nsec += 1000000000L; }
-        if (rel.tv_sec < 0) { return 0; }
-        req = &rel;
+        if (rel.tv_sec < 0 || (rel.tv_sec == 0 && rel.tv_nsec == 0)) { return 0; }
+    } else {
+        if (req->tv_sec < 0) { return -22; }
+        rel = *req;
     }
-    return nanosleep(req, rem) != 0 ? neg_errno() : 0;
+    if (ws != NULL && ws->wake_pipe_rd >= 0) {
+        struct timespec start, after;
+        struct pollfd pfd;
+        int timeout_ms, r;
+        (void)clock_gettime(CLOCK_MONOTONIC, &start);
+        if (rel.tv_sec > 2147483) {
+            timeout_ms = 2147483647;
+        } else {
+            int64_t ms = (int64_t)rel.tv_sec * 1000L + (int64_t)(rel.tv_nsec / 1000000L);
+            if (ms == 0 && rel.tv_nsec > 0) { ms = 1; }
+            timeout_ms = ms > 2147483647L ? 2147483647 : (int)ms;
+        }
+        pfd.fd = ws->wake_pipe_rd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        r = poll(&pfd, 1u, timeout_ms);
+        if (r > 0 && (pfd.revents & POLLIN) != 0) {
+            char tmp[32];
+            (void)read(ws->wake_pipe_rd, tmp, sizeof(tmp));
+        }
+        if ((r < 0 && errno == EINTR) || r > 0 ||
+            atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) {
+            if ((linux_flags & 1) == 0 && rem != NULL &&
+                clock_gettime(CLOCK_MONOTONIC, &after) == 0) {
+                int64_t el_sec = (int64_t)after.tv_sec - (int64_t)start.tv_sec;
+                long el_ns = after.tv_nsec - start.tv_nsec;
+                if (el_ns < 0) { el_sec -= 1; el_ns += 1000000000L; }
+                rem->tv_sec = rel.tv_sec - (time_t)el_sec;
+                rem->tv_nsec = rel.tv_nsec - el_ns;
+                if (rem->tv_nsec < 0) { rem->tv_sec -= 1; rem->tv_nsec += 1000000000L; }
+                if (rem->tv_sec < 0) { rem->tv_sec = 0; rem->tv_nsec = 0; }
+            }
+            return -4;
+        }
+        return r < 0 ? neg_errno() : 0;
+    }
+    return nanosleep(&rel, (linux_flags & 1) != 0 ? NULL : rem) != 0 ? neg_errno() : 0;
 }
 
 int64_t rt_host_getrandom(void *buf, size_t buflen, unsigned int linux_flags)

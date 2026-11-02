@@ -293,7 +293,48 @@ int64_t rt_host_openat(int dirfd, const char *path, int linux_flags, uint32_t mo
     }
     return r;
 }
-int64_t rt_host_close(int fd) { return libret(close(fd)); }
+/* S64-R2-6: per-fd cached DIR* stream for paginated getdents64. */
+#define RT_DIR_SLOTS 32u
+struct rt_dir_slot {
+    int used;
+    int fd;
+    dev_t dev;
+    ino_t ino;
+    DIR *dir;
+    int has_pending;
+    struct dirent pending;
+    int64_t pending_off;
+};
+static pthread_mutex_t g_dir_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct rt_dir_slot g_dirs[RT_DIR_SLOTS];
+static void darwin_dir_invalidate(int fd) {
+    unsigned i;
+    if (fd < 0) { return; }
+    (void)pthread_mutex_lock(&g_dir_mu);
+    for (i = 0u; i < RT_DIR_SLOTS; i++) {
+        if (g_dirs[i].used && g_dirs[i].fd == fd) {
+            if (g_dirs[i].dir != NULL) { (void)closedir(g_dirs[i].dir); }
+            g_dirs[i].dir = NULL;
+            g_dirs[i].used = 0;
+            g_dirs[i].has_pending = 0;
+        }
+    }
+    (void)pthread_mutex_unlock(&g_dir_mu);
+}
+static void darwin_dir_seek(int fd, int64_t offset, int linux_whence) {
+    unsigned i;
+    if (fd < 0 || linux_whence != 0 || offset < 0) { return; }
+    (void)pthread_mutex_lock(&g_dir_mu);
+    for (i = 0u; i < RT_DIR_SLOTS; i++) {
+        if (g_dirs[i].used && g_dirs[i].fd == fd && g_dirs[i].dir != NULL) {
+            if (offset == 0) { rewinddir(g_dirs[i].dir); }
+            else { seekdir(g_dirs[i].dir, (long)offset); }
+            g_dirs[i].has_pending = 0;
+        }
+    }
+    (void)pthread_mutex_unlock(&g_dir_mu);
+}
+int64_t rt_host_close(int fd) { darwin_dir_invalidate(fd); return libret(close(fd)); }
 int64_t rt_host_read(int fd, void *buf, size_t count, rt_worker_sync_t *ws, uint32_t expected_seq) {
     struct darwin_fdop a = { fd, 0, RT_FDOP_READ, buf, count, NULL, 0u, NULL };
     return darwin_spin_fd(fd, 0, ws, expected_seq, &a);
@@ -312,7 +353,10 @@ int64_t rt_host_writev(int fd, const struct iovec *iov, int iovcnt, rt_worker_sy
     struct darwin_fdop a = { fd, 0, RT_FDOP_WRITEV, NULL, (size_t)iovcnt, (const void *)iov, 0u, NULL };
     return darwin_spin_fd(fd, 1, ws, expected_seq, &a);
 }
-int64_t rt_host_lseek(int fd, int64_t offset, int linux_whence) { return libret(lseek(fd, (off_t)offset, linux_whence)); }
+int64_t rt_host_lseek(int fd, int64_t offset, int linux_whence) {
+    darwin_dir_seek(fd, offset, linux_whence);
+    return libret(lseek(fd, (off_t)offset, linux_whence));
+}
 struct rt_linux_statx {
     uint32_t stx_mask, stx_blksize; uint64_t stx_attributes; uint32_t stx_nlink, stx_uid, stx_gid;
     uint16_t stx_mode, pad0; uint64_t stx_ino, stx_size, stx_blocks, stx_attributes_mask;
@@ -383,24 +427,68 @@ int64_t rt_host_copy_file_range(int fd_in, int64_t *off_in, int fd_out, int64_t 
 int64_t rt_host_fsync(int fd, int datasync_only) { (void)datasync_only; return fcntl(fd, F_FULLFSYNC) != 0 ? libret(fsync(fd)) : 0; }
 struct rt_linux_dirent64 { uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type; char d_name[]; };
 int64_t rt_host_getdents64(int fd, void *linux_dirent64_buf, size_t buf_size) {
-    char *out = (char *)linux_dirent64_buf; size_t used = 0u; int dupfd; DIR *dir; struct dirent *de;
+    char *out = (char *)linux_dirent64_buf; size_t used = 0u;
+    struct stat st; struct rt_dir_slot *slot = NULL; unsigned i; int free_idx = -1;
     if (out == NULL || buf_size == 0U) { return -22; }
-    dupfd = dup(fd); if (dupfd < 0) { return neg_errno(); }
-    dir = fdopendir(dupfd); if (dir == NULL) { int e = errno; (void)close(dupfd); return -(int64_t)e; }
-    while ((de = readdir(dir)) != NULL) {
-        struct rt_linux_dirent64 *rec; size_t namlen = 0u, reclen, i;
+    if (fstat(fd, &st) != 0) { return neg_errno(); }
+    if (!S_ISDIR(st.st_mode)) { return -20; }
+    (void)pthread_mutex_lock(&g_dir_mu);
+    for (i = 0u; i < RT_DIR_SLOTS; i++) {
+        if (g_dirs[i].used && g_dirs[i].fd == fd) {
+            if (g_dirs[i].dev == st.st_dev && g_dirs[i].ino == st.st_ino) {
+                slot = &g_dirs[i];
+            } else {
+                if (g_dirs[i].dir != NULL) { (void)closedir(g_dirs[i].dir); }
+                g_dirs[i].dir = NULL; g_dirs[i].used = 0; g_dirs[i].has_pending = 0;
+                if (free_idx < 0) { free_idx = (int)i; }
+            }
+            break;
+        }
+        if (!g_dirs[i].used && free_idx < 0) { free_idx = (int)i; }
+    }
+    if (slot == NULL) {
+        int dupfd = dup(fd);
+        DIR *dir;
+        if (dupfd < 0) { int e = errno; (void)pthread_mutex_unlock(&g_dir_mu); return -(int64_t)e; }
+        (void)fcntl(dupfd, F_SETFD, FD_CLOEXEC);
+        dir = fdopendir(dupfd);
+        if (dir == NULL) { int e = errno; (void)close(dupfd); (void)pthread_mutex_unlock(&g_dir_mu); return -(int64_t)e; }
+        if (free_idx < 0) {
+            free_idx = 0;
+            if (g_dirs[0].used && g_dirs[0].dir != NULL) { (void)closedir(g_dirs[0].dir); }
+        }
+        slot = &g_dirs[(unsigned)free_idx];
+        slot->used = 1; slot->fd = fd; slot->dev = st.st_dev; slot->ino = st.st_ino;
+        slot->dir = dir; slot->has_pending = 0; slot->pending_off = 0;
+    }
+    for (;;) {
+        const struct dirent *de; int64_t d_off; struct rt_linux_dirent64 *rec;
+        size_t namlen = 0u, reclen, k;
+        if (slot->has_pending) {
+            de = &slot->pending; d_off = slot->pending_off;
+        } else {
+            struct dirent *rde = readdir(slot->dir);
+            if (rde == NULL) { break; }
+            d_off = (int64_t)telldir(slot->dir);
+            slot->pending = *rde; slot->pending_off = d_off; slot->has_pending = 1;
+            de = &slot->pending;
+        }
         while (de->d_name[namlen] != '\0') { namlen++; }
         reclen = (size_t)((19u + namlen + 1u + 7u) & ~7u);
-        if (used + reclen > buf_size) { break; }
+        if (used + reclen > buf_size) {
+            if (used == 0u) { (void)pthread_mutex_unlock(&g_dir_mu); return -22; }
+            break;
+        }
+        slot->has_pending = 0;
         rec = (struct rt_linux_dirent64 *)(out + used);
-        rec->d_ino = (uint64_t)de->d_ino; rec->d_off = (int64_t)telldir(dir);
+        rec->d_ino = (uint64_t)de->d_ino; rec->d_off = d_off;
         rec->d_reclen = (uint16_t)reclen; rec->d_type = de->d_type;
-        for (i = 0u; i <= namlen; i++) { rec->d_name[i] = de->d_name[i]; }
-        for (i = namlen + 1u; i < reclen - 19u; i++) { rec->d_name[i] = '\0'; }
+        for (k = 0u; k <= namlen; k++) { rec->d_name[k] = de->d_name[k]; }
+        for (k = namlen + 1u; k < reclen - 19u; k++) { rec->d_name[k] = '\0'; }
         used += reclen;
     }
-    (void)closedir(dir);
-    return used == 0u ? 0 : (int64_t)used;
+    (void)pthread_mutex_unlock(&g_dir_mu);
+    return (int64_t)used;
 }
 int64_t rt_host_fcntl(int fd, int linux_cmd, uint64_t arg) {
     if (linux_cmd == 1030) {
@@ -416,6 +504,7 @@ int64_t rt_host_dup(int oldfd) { return libret(dup(oldfd)); }
 int64_t rt_host_dup3(int oldfd, int newfd, int linux_flags) {
     int r;
     if ((linux_flags & ~02000000) != 0) { return -22; }
+    darwin_dir_invalidate(newfd);
     r = dup2(oldfd, newfd); if (r < 0) { return neg_errno(); }
     if ((linux_flags & 02000000) != 0) { (void)fcntl(r, F_SETFD, FD_CLOEXEC); }
     return (int64_t)r;
@@ -593,12 +682,20 @@ static void darwin_sigmask_leave(const sigset_t *saved, int have_saved) {
 }
 int64_t rt_host_ppoll(void *linux_pollfds, size_t nfds, const struct timespec *rel_timeout, const uint64_t *linux_sigmask, rt_worker_sync_t *ws, uint32_t expected_seq) {
     struct pollfd *fds = NULL; sigset_t saved_mask; int have_saved = 0, timeout_ms = -1, r, has_wake = 0; size_t i, total = nfds;
+    if (linux_sigmask != NULL && (ws == NULL || ws->wake_pipe_rd < 0)) { return -22; }
     if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { return -4; }
     if (ws != NULL && ws->wake_pipe_rd >= 0) { total++; has_wake = 1; }
     if (rel_timeout != NULL) {
-        int64_t ms = (int64_t)rel_timeout->tv_sec * 1000L + (int64_t)rel_timeout->tv_nsec / 1000000L;
-        if (ms == 0 && rel_timeout->tv_nsec > 0) { ms = 1; }
-        timeout_ms = ms > 2147483647L ? 2147483647 : (ms < 0 ? 0 : (int)ms);
+        if (rel_timeout->tv_nsec < 0 || rel_timeout->tv_nsec >= 1000000000L) { return -22; }
+        if (rel_timeout->tv_sec < 0) {
+            timeout_ms = 0;
+        } else if (rel_timeout->tv_sec > 2147483) {
+            timeout_ms = 2147483647;
+        } else {
+            int64_t ms = (int64_t)rel_timeout->tv_sec * 1000L + (int64_t)rel_timeout->tv_nsec / 1000000L;
+            if (ms == 0 && rel_timeout->tv_nsec > 0) { ms = 1; }
+            timeout_ms = ms > 2147483647L ? 2147483647 : (int)ms;
+        }
     }
     if (total > 0u) {
         fds = (struct pollfd *)malloc(total * sizeof(*fds));
@@ -607,10 +704,16 @@ int64_t rt_host_ppoll(void *linux_pollfds, size_t nfds, const struct timespec *r
         if (has_wake) { fds[nfds].fd = ws->wake_pipe_rd; fds[nfds].events = POLLIN; fds[nfds].revents = 0; }
     }
     darwin_sigmask_enter(linux_sigmask, &saved_mask, &have_saved);
+    if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) {
+        darwin_sigmask_leave(&saved_mask, have_saved);
+        free(fds);
+        return -4;
+    }
     r = poll(fds, (nfds_t)total, timeout_ms);
     darwin_sigmask_leave(&saved_mask, have_saved);
     if (r < 0) { int e = errno; free(fds); return -(int64_t)e; }
     if (has_wake && (fds[nfds].revents & POLLIN) != 0) { char tmp[32]; (void)read(ws->wake_pipe_rd, tmp, sizeof(tmp)); free(fds); return -4; }
+    if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { free(fds); return -4; }
     if (r > 0 && nfds > 0u) { for (i = 0u; i < nfds; i++) { (void)memcpy((char *)linux_pollfds + i * sizeof(*fds), &fds[i], sizeof(*fds)); } }
     free(fds); return (int64_t)r;
 }
@@ -679,21 +782,37 @@ int64_t rt_host_epoll_ctl(int epfd, int op, int fd, const void *linux_epoll_even
 }
 int64_t rt_host_epoll_pwait(int epfd, void *linux_epoll_events_out, int maxevents, int timeout_ms, const uint64_t *linux_sigmask, rt_worker_sync_t *ws, uint32_t expected_seq) {
     struct rt_epoll_slot *slot = epoll_lookup(epfd);
-    struct kevent *evlist; struct timespec ts, *tsp = NULL; sigset_t saved_mask; int have_saved = 0, n, got = 0; unsigned i, j;
+    struct kevent *evlist, wake_ev; struct timespec ts, *tsp = NULL; sigset_t saved_mask;
+    int have_saved = 0, has_wake = 0, n, got = 0; unsigned i, j;
     if (slot == NULL || linux_epoll_events_out == NULL || maxevents <= 0) { return -22; }
+    if (linux_sigmask != NULL && (ws == NULL || ws->wake_pipe_rd < 0)) { return -22; }
     if (maxevents > 1024) { maxevents = 1024; }
     if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { return -4; }
     evlist = (struct kevent *)malloc((size_t)maxevents * sizeof(*evlist));
     if (evlist == NULL) { return -12; }
+    if (ws != NULL && ws->wake_pipe_rd >= 0) {
+        EV_SET(&wake_ev, (uintptr_t)ws->wake_pipe_rd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+        if (kevent(slot->kq, &wake_ev, 1, NULL, 0, NULL) == 0) { has_wake = 1; }
+    }
     if (timeout_ms >= 0) { ts.tv_sec = timeout_ms / 1000; ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L; tsp = &ts; }
     darwin_sigmask_enter(linux_sigmask, &saved_mask, &have_saved);
+    if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) {
+        darwin_sigmask_leave(&saved_mask, have_saved);
+        if (has_wake) { EV_SET(&wake_ev, (uintptr_t)ws->wake_pipe_rd, EVFILT_READ, EV_DELETE, 0, 0, NULL); (void)kevent(slot->kq, &wake_ev, 1, NULL, 0, NULL); }
+        free(evlist);
+        return -4;
+    }
     n = kevent(slot->kq, NULL, 0, evlist, maxevents, tsp);
     darwin_sigmask_leave(&saved_mask, have_saved);
+    if (has_wake) { EV_SET(&wake_ev, (uintptr_t)ws->wake_pipe_rd, EVFILT_READ, EV_DELETE, 0, 0, NULL); (void)kevent(slot->kq, &wake_ev, 1, NULL, 0, NULL); }
     if (n < 0) { int e = errno; free(evlist); return -(int64_t)e; }
     for (i = 0u; i < (unsigned)n; i++) {
         unsigned char *dst = (unsigned char *)linux_epoll_events_out + (size_t)got * 12u;
-        uint32_t e32 = 0u; uint64_t d64 = 0u; int fd = (int)evlist[i].ident;
-        for (j = 0u; j < RT_EPOLL_INTERESTS; j++) { if (slot->interests[j].fd == fd) { d64 = slot->interests[j].data; break; } }
+        uint32_t e32 = 0u; uint64_t d64 = 0u; int fd = (int)evlist[i].ident, matched = 0;
+        for (j = 0u; j < RT_EPOLL_INTERESTS; j++) { if (slot->interests[j].fd == fd) { d64 = slot->interests[j].data; matched = 1; break; } }
+        if (!matched && has_wake && fd == ws->wake_pipe_rd) {
+            char tmp[32]; (void)read(ws->wake_pipe_rd, tmp, sizeof(tmp)); free(evlist); return -4;
+        }
         if (evlist[i].filter == EVFILT_READ) { e32 |= 0x1u; } else if (evlist[i].filter == EVFILT_WRITE) { e32 |= 0x4u; }
         if ((evlist[i].flags & EV_ERROR) != 0u) { e32 |= 0x8u | 0x10u; }
         (void)memcpy(dst, &e32, sizeof(e32)); (void)memcpy(dst + 4u, &d64, sizeof(d64)); got++;

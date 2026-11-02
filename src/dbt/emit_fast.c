@@ -9,7 +9,7 @@
  * via UNDEF exactly like the helper. SAVE/RESTORE with no spill/fill
  * shuffle the shared window file inline (cansave > 0 / canrestore > 0
  * plus the validity gate); every other case funnels through the
- * existing s64_rt_win helper, so semantics match by construction.
+ * existing s64_jrt_win helper, so semantics match by construction.
  */
 
 #include "dbt/emit_fast.h"

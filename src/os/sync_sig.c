@@ -482,7 +482,7 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
     put_u64be(&frame[0x1c0], tstate);
     put_u64be(&frame[0x1c8], ctx->pc);
     put_u64be(&frame[0x1d0], ctx->npc);
-    put_u64be(&frame[0x1d8], ctx->y);
+    put_u32be(&frame[0x1d8], (uint32_t)ctx->y);
     put_u32be(&frame[0x1dc], SPARC64_PT_REGS_MAGIC);
     /* fpu_save @0x1e0 points at the inline tail @un+0x210 (always
      * present); stack @0x1e8 is the current altstack unchanged;
@@ -587,7 +587,7 @@ long sparc64_sync_sig_return(sparc64_ctx_t *ctx,
     for (i = 1U; i < 16U; i++) {
         ctx->r[i] = get_u64be(&frame[0x140 + 8U * (uint64_t)i]);
     }
-    ctx->y = get_u64be(&frame[0x1d8]);
+    ctx->y = (uint64_t)get_u32be(&frame[0x1d8]);
     tstate = get_u64be(&frame[0x1c0]);
     ctx->ccr = (tstate >> 32) & UINT64_C(0xff);
     ctx->asi = (uint32_t)((tstate >> 24) & UINT64_C(0xff));

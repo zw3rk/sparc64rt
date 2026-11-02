@@ -118,7 +118,7 @@ static int engine_setjmp_trap(sparc64_ctx_t *ctx,
     }
     engine_put64(&jb[0x00], ENGINE_SETJMP_MAGIC);
     engine_put64(&jb[0x08], ctx->r[SPARC64_SP]);
-    engine_put64(&jb[0x10], pc + 4U);
+    engine_put64(&jb[0x10], ctx->npc);
     engine_put64(&jb[0x18], (uint64_t)ctx->cwp);
     engine_put64(&jb[0x20], ctx->r[SPARC64_G1]);
     engine_put64(&jb[0x28], ctx->r[SPARC64_G2]);
@@ -145,10 +145,10 @@ static int engine_setjmp_trap(sparc64_ctx_t *ctx,
     if (!ops->write(ops->context, base, jb, (uint64_t)sizeof(jb))) {
         return 1;
     }
-    /* First return: 0 in %g1, resume at the retl past the ta. */
+    /* First return: 0 in %g1, resume at ctx->npc (past the ta). */
     ctx->r[SPARC64_G1] = UINT64_C(0);
-    ctx->pc = pc + 4U;
-    ctx->npc = pc + 8U;
+    ctx->pc = ctx->npc;
+    ctx->npc = ctx->pc + 4U;
     return 0;
 }
 

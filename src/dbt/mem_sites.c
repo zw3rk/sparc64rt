@@ -6,7 +6,7 @@
  *
  * Implements mem_sites.h: the process-global 128 KiB Soft-TLB, range
  * invalidation, per-block records, and the interpreter-backed slow path
- * used by the emitted per-block miss trampoline and by emit_rt.c.
+ * used by the emitted per-block miss trampoline.
  * Correctness comes from replaying the exact guest instruction with
  * sparc64_step, so DBT/interp parity holds by construction.
  */

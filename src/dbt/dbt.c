@@ -591,11 +591,14 @@ sparc64_step_result_t sparc64_dbt_step_one(sparc64_dbt_t *dbt,
             !dbt_delay_emittable(&dl)) return sparc64_step(ctx, mem, mc);
         span = 8U;
     }
-    if (dbt->arena_published &&
-        a32h_wx_reopen(dbt->arena_base, a32h_page_span(dbt->arena_used)) == 0) {
+    if (dbt->arena_published) {
+        if (a32h_wx_reopen(dbt->arena_base,
+                a32h_page_span(dbt->arena_used)) != 0) {
+            return sparc64_step(ctx, mem, mc);
+        }
         dbt->arena_published = false;
     }
-    if (!dbt->arena_published) dbt->arena_used = 0U;
+    dbt->arena_used = 0U;
     code = dbt_emit_range(dbt, mem, mc, pc, pc + span);
     if (code == NULL || !dbt_publish(dbt)) return sparc64_step(ctx, mem, mc);
     return dbt_enter_block(ctx, mem, mc, dbt, code, false);
@@ -732,8 +735,6 @@ sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
             }
             if (known && dbt_is_cti(&d)) {
                 dbt_note_transfer(dbt, &d, npc0, ctx->pc);
-            }
-            if (b->ends_cti) {
                 break; /* CTI consumed its delay slot; chain next. */
             }
         }
