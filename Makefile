@@ -9,7 +9,7 @@
 # or: nix build .#sparc64rt (uses the configured aarch64-linux builder).
 
 .DEFAULT_GOAL := help
-.PHONY: help all build check check-line-limits check-abi-invariants check-thr-granule check-rc-u2 darwin-sparc64rt clean
+.PHONY: help all build check test check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r3-darwin darwin-sparc64rt clean
 MAKEFLAGS += -j8
 
 BUILD_DIR := _build
@@ -27,7 +27,9 @@ LDFLAGS_STATIC_PIE := -static-pie
 # (src/os/backend_darwin.c, built by build-darwin instead).
 EXCLUDED_SRCS := \
 	src/os/backend_darwin.c \
-	src/os/backend_darwin_sync.c
+	src/os/backend_darwin_sync.c \
+	src/os/backend_darwin_futex.c \
+	src/os/threads_darwin.c
 
 ALL_C_SRCS := $(shell find src -name '*.c')
 LINUX_C_SRCS := $(filter-out $(EXCLUDED_SRCS),$(ALL_C_SRCS))
@@ -82,8 +84,10 @@ check-abi-invariants: ## Build and run tests/check_abi_invariants.c when present
 	fi
 
 check-thr-granule: ## Build and run the host-atomic 4K-granule regression test (Wave U2)
-	$(HOST_CC) $(CFLAGS) -Isrc tests/test_thr_resolve_granule.c \
-		src/os/threads.c src/os/sync_sig.c src/os/mem_space.c \
+	$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_thr_resolve_granule.c \
+		src/os/threads.c src/os/threads_darwin.c src/vm/vm64.c \
+		src/os/backend_darwin_sync.c src/os/backend_darwin_futex.c \
+		src/os/sync_sig.c src/os/mem_space.c \
 		src/os/mem_space_write.c $(wildcard src/interp/*.c) \
 		-o $(BUILD_DIR)/test_thr_resolve_granule -pthread && \
 	./$(BUILD_DIR)/test_thr_resolve_granule
@@ -145,3 +149,26 @@ check-rc-u2: ## Build and run the RC-U2 8 KiB COW/EOF gate test (Lane A3)
 		src/dbt/aot/format.c \
 		-o $(BUILD_DIR)/test_rc_u2_8k_cow_eof && \
 	./$(BUILD_DIR)/test_rc_u2_8k_cow_eof
+
+# ---- Round-3 remediation gates (S64-R3-1..S64-R3-7) --------------------------
+check-r3: ## Build and run the Round-3 file-registry regression test (S64-R3-1/2/3)
+	$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r3_registry.c \
+		src/os/guest_run_sysmem_file.c src/os/sysmem_file_fill.c \
+		src/os/mem_space.c src/os/mem_space_write.c \
+		src/vm/vm64.c src/vm/vm_file.c \
+		-o $(BUILD_DIR)/test_r3_registry && \
+	./$(BUILD_DIR)/test_r3_registry
+
+check-r3-darwin: ## Build and run the Round-3 Darwin backend test (S64-R3-4/5/6/7)
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r3_darwin.c \
+			src/os/backend_darwin.c src/os/backend_darwin_sync.c \
+			src/os/backend_darwin_futex.c src/os/threads_darwin.c \
+			src/os/mem_space.c src/os/mem_space_write.c \
+			-o $(BUILD_DIR)/test_r3_darwin -pthread && \
+		./$(BUILD_DIR)/test_r3_darwin; \
+	else \
+		echo "check-r3-darwin: Darwin-only backend, pass"; \
+	fi
+
+test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r3-darwin ## Host-side gates with -Werror (no cross toolchain needed)

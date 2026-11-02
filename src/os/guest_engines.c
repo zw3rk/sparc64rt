@@ -20,6 +20,7 @@
 #include "dbt/difftest.h"
 #include "interp/interp_win.h"
 #include "os/guest_run_priv.h"
+#include "vm/vm64.h"
 
 /* Active quiescence worker table (src/vm/vm64.c); local externs keep
  * this TU off the shared headers, matching guest_run_sysmem.c. */
@@ -297,15 +298,25 @@ int run_dbt(guest_state_t *g, sparc64_ctx_t *ctx,
      * per-thread (no cache locking); re-assert g->dbt every iteration
      * because a sibling thread may have pointed it at its own DBT
      * while this thread slept in a blocking syscall. */
+    uint64_t seen_epoch;
     sparc64_threads_boot(ops, 1, ctx);
     sparc64_thread_big_lock();
     /* Same clean-cache rule as the interp loop (shared winfile). */
     sparc64_win_invalidate_all();
     g->dbt = dbt;
+    /* S64-R3-1: snapshot the shared code generation. A peer's mapping
+     * change while this thread slept (futex wait, blocking syscall)
+     * bumps it at commit; the check below flushes this thread's own
+     * blocks and chaining entries before any cached execution. */
+    seen_epoch = vm64_code_epoch_get();
     rc = 1;
     for (;;) {
         sparc64_step_result_t step;
         g->dbt = dbt;
+        if (vm64_code_epoch_get() != seen_epoch) {
+            sparc64_dbt_invalidate(dbt, 0U, SPARC64_TASK_SIZE);
+            seen_epoch = vm64_code_epoch_get();
+        }
         step = sparc64_dbt_run(ctx, &guest_mem_ops, g, dbt);
         if (step.kind == SPARC64_STEP_SYSCALL) {
             unsigned trapno = engine_trapno(ops, step.pc);

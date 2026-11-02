@@ -215,6 +215,27 @@ void sparc64_sync_sig_reset_all(void)
     sync_ss_flags = (uint64_t)SPARC64_SS_DISABLE;
 }
 
+/* execve reset (cross-RT Round-3 class): caught dispositions return to
+ * SIG_DFL, but ignored dispositions (SIG_IGN), the blocked mask, and
+ * queued pending signals survive the image replacement, matching
+ * Linux. The alternate stack disables (it described the old image's
+ * address space). */
+void sparc64_sync_sig_exec_reset(void)
+{
+    unsigned i;
+    for (i = 0U; i <= SYNC_SIG_MAX; i++) {
+        if (sync_handler[i] != UINT64_C(1)) {
+            sync_handler[i] = UINT64_C(0);
+            sync_flags[i] = UINT64_C(0);
+            sync_restorer[i] = UINT64_C(0);
+            sync_sa_mask[i] = UINT64_C(0);
+        }
+    }
+    sync_ss_sp = UINT64_C(0);
+    sync_ss_size = UINT64_C(0);
+    sync_ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+}
+
 int sparc64_sync_sig_for_trap(sparc64_trap_cause_t cause, int *code_out)
 {
     int code = 0;

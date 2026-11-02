@@ -625,6 +625,30 @@ static vm64_txn_t a2_txn;
 static int a2_bound;
 static atomic_flag vm64_table_lock = ATOMIC_FLAG_INIT;
 
+/* Shared address-space code generation (S64-R3-1): every committed
+ * mapping change bumps this. Per-thread DBT instances snapshot it
+ * across blocking sleeps and full-flush (blocks + IBTC chaining) on
+ * mismatch, so a thread woken after a peer replaced, unmapped, or
+ * de-executed its code pages never resumes stale translations. The
+ * per-worker dbt_epoch bump in prepare still drives preemption; this
+ * counter is the reader those bumps were missing. */
+static _Atomic uint64_t vm64_code_epoch = 1u;
+
+uint64_t vm64_code_epoch_get(void)
+{
+    return atomic_load_explicit(&vm64_code_epoch, memory_order_acquire);
+}
+
+void vm64_code_epoch_bump(void)
+{
+    uint64_t next = atomic_fetch_add_explicit(&vm64_code_epoch,
+        (uint64_t)1, memory_order_seq_cst) + (uint64_t)1;
+    if (next == UINT64_C(0)) {
+        atomic_store_explicit(&vm64_code_epoch, (uint64_t)1,
+            memory_order_seq_cst);
+    }
+}
+
 /* Forward declarations of the section 4.5 core (defined below). */
 int vm64_txn_prepare(vm64_txn_t *txn);
 long vm64_txn_host_op(vm64_txn_t *txn, vm64_host_op_fn op, void *op_ctx);
@@ -704,12 +728,16 @@ void vm64_worker_register(void)
 
 /* Drop the calling thread's quiescence slot (worker-thread exit). The
  * cleared slot resumes as free: commit's PARKED->RUNNING CAS no-ops on
- * it and prepare skips it by its zero tid. Idempotent. */
+ * it and prepare skips it by its zero tid. Idempotent. S64-R3-5: also
+ * releases the backend worker-table slot (Darwin's fixed table leaked
+ * one entry per thread lifetime and eventually refused registration);
+ * the backend call is idempotent, so unregistering twice is safe. */
 void vm64_worker_unregister(void)
 {
     uint64_t tid = rt_host_register_self();
     size_t i;
     if (tid == UINT64_C(0)) {
+        rt_host_unregister_self();
         return;
     }
     vm64_table_lock_acq();
@@ -726,6 +754,7 @@ void vm64_worker_unregister(void)
         }
     }
     vm64_table_lock_rel();
+    rt_host_unregister_self();
 }
 
 /* Live-slot count for tests and diagnostics. */
@@ -832,6 +861,11 @@ int vm64_txn_commit(vm64_txn_t *txn, vm64_tlb_entry_t *tlb,
      * dependent paired TLB entries across worker contexts (here: the
      * shared table; per-thread tables repeat this loop). */
     vm64_tlb_invalidate_range(tlb, changed_base, changed_len);
+    /* S64-R3-1: publish the new code generation before resuming peers,
+     * so any thread that slept through this mutation flushes its
+     * per-thread DBT (blocks + IBTC/RAS chaining) before executing
+     * cached code again. */
+    vm64_code_epoch_bump();
     /* Step 6: resume. */
     atomic_store_explicit(&txn->mutating, 0u, memory_order_release);
     for (i = 0; i < txn->nworkers; ++i) {

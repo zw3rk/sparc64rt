@@ -671,10 +671,13 @@ int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
      * block cache and the process-global Soft-TLB still describe the
      * old image; without a flush the new image would execute stale
      * blocks and resolve stale host pages through the live fast
-     * path (which consults the Soft-TLB on every access). */
+     * path (which consults the Soft-TLB on every access). S64-R3-1:
+     * the generation bump covers every OTHER thread's private DBT,
+     * which this local invalidate cannot reach. */
     if (g->dbt != NULL) {
         sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
     }
+    vm64_code_epoch_bump();
     sparc64_tlb_init();
     sparc64_win_invalidate_all();
     sparc64_ctx_init(ctx, start_entry);

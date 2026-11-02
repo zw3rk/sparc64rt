@@ -512,10 +512,11 @@ long sparc64_proc_execve(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     if (erc != 0) {
         return (long)erc;
     }
-    /* Fresh image: new signals, new break, no tids (pid is kept: the
-     * host pid is unchanged). The blocked mask and robust/futex state
-     * persist until lanes L4a/L4b own them (coordinator call). */
-    sparc64_sync_sig_reset_all();
+    /* Fresh image: caught handlers return to SIG_DFL while ignored
+     * dispositions, the blocked mask, and pending signals survive the
+     * replacement (Linux execve semantics); brk/tids reset, the host
+     * pid is kept. Robust/futex state persists (lane L4b owns it). */
+    sparc64_sync_sig_exec_reset();
     return 0;
 }
 

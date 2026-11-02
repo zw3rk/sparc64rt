@@ -6,9 +6,11 @@
  *
  * Split from src/os/guest_run_sysmem.c (RC-U4) so neither TU exceeds
  * the 900-line limit: this file owns the file-backed range registry
- * (note/drop/resize/remap-update), the Provider-A populate fill, and
- * the per-8KiB-chunk COW/SHARED state recording. guest_run_sysmem.c
- * keeps the mmap/munmap/mprotect/mremap shells and calls in here.
+ * (note/drop/resize/remap-update) and the per-8KiB-chunk COW/SHARED
+ * state recording. The Provider-A populate fill and the mremap
+ * growth-tail fill live in src/os/sysmem_file_fill.c (S64-R3 split);
+ * guest_run_sysmem.c keeps the mmap/munmap/mprotect/mremap shells and
+ * calls in here.
  * Every mapping mutation runs under the caller's 6-step quiescence
  * legs; paired Soft-TLB invalidation stays with the callers that own
  * the live sparc64_dbt_tlb. Guest VA is 8 KiB-granular; this file
@@ -21,51 +23,96 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-#include "core/cpu.h"
-#include "os/guest_run_priv.h"
-#include "os/mem_space.h"
-#include "dbt/mem_sites.h"
-#include "vm/vm64.h"
-
-/* Provider-A populate helper (src/vm/vm_file.c); local extern, no
- * header exists for it, matching the syscalls_min.c precedent. Short
- * reads at EOF leave the tail zero-filled by the callee. */
-extern long vm_file_populate_segment(int host_fd, uint64_t file_offset,
-    uint64_t file_size, void *host_addr, size_t seg_len,
-    vm64_page_state_t *lower_state, vm64_page_state_t *upper_state,
-    uint64_t *bus_base_out, uint64_t *bus_len_out);
+#include "os/sysmem_file.h"
 
 /* ---- File-backed range registry --------------------------------------
  * Tracks live file-backed sysmem mappings so truncate/ftruncate can
  * convert stripped 8 KiB pages to BUS spans (and regrow them back to
  * zero pages) instead of leaving stale readable mappings behind.
  * Keyed by (dev, ino); updated (not dropped) across mremap so moved
- * mappings keep receiving truncate-driven updates. Ring of 64:
- * overflow evicts oldest, degrading to pre-registry behavior
- * (stale readable bytes) for the evicted range only. */
-#define SYSMEM_FILERANGE_SLOTS 64u
-/* Per-entry 8 KiB chunk states recorded by the populate fill:
- * VM64_PAGE_COW_CLEAN (MAP_PRIVATE) or VM64_PAGE_SHARED (MAP_SHARED)
- * per chunk, kinds uniform per mapping. Bounded: longer mappings keep
- * the first 64 chunks (512 KiB); the rest still fill correctly, they
- * only lose truncate-time chunk detail. */
-#define SYSMEM_FILERANGE_CHUNKS 64u
-typedef struct {
-    bool live;
-    uint64_t dev;
-    uint64_t ino;
-    uint64_t file_offset;
-    uint64_t base;
-    uint64_t len;
-    unsigned prot;
-    uint8_t kind;
-    uint8_t nchunk;
-    uint8_t cstate[SYSMEM_FILERANGE_CHUNKS];
-} sysmem_file_range_t;
-static sysmem_file_range_t sysmem_files[SYSMEM_FILERANGE_SLOTS];
-static unsigned sysmem_file_next;
+ * mappings keep receiving truncate-driven updates. S64-R3-3: the
+ * table is growable (64 slots initial, doubling on demand) and never
+ * evicts a live entry: a new mapping without a free slot grows the
+ * table, and mapping shells reserve their worst-case slots BEFORE
+ * mutating host mappings, so exhaustion reports -ENOMEM with zero
+ * mutation instead of silently discarding another mapping's
+ * correctness metadata. */
+#define SYSMEM_FILERANGE_INIT 64u
+/* Entry layout and table storage live in src/os/sysmem_file.h (shared
+ * with the fill TU src/os/sysmem_file_fill.c). */
+sysmem_file_range_t *sysmem_files;
+size_t sysmem_file_cap;
+
+/* Growable-table core (S64-R3-3): ensure room, claim, count. The
+ * engine serializes mapping syscalls on the big guest lock, so no
+ * locking is needed here. */
+static int sysmem_file_grow(void)
+{
+    size_t ncap = (sysmem_file_cap == 0u) ? (size_t)SYSMEM_FILERANGE_INIT :
+        sysmem_file_cap * 2u;
+    sysmem_file_range_t *ntab;
+    size_t i;
+    if (ncap < sysmem_file_cap) {
+        return -12;
+    }
+    ntab = (sysmem_file_range_t *)realloc(sysmem_files,
+        ncap * sizeof(*ntab));
+    if (ntab == NULL) {
+        return -12;
+    }
+    for (i = sysmem_file_cap; i < ncap; i++) {
+        (void)memset(&ntab[i], 0, sizeof(ntab[i]));
+        ntab[i].fd = -1;
+    }
+    sysmem_files = ntab;
+    sysmem_file_cap = ncap;
+    return 0;
+}
+
+/* Guarantee at least n free slots (S64-R3-3 reservation leg): mapping
+ * shells call this BEFORE the 6-step prepare so a later claim cannot
+ * fail mid-mutation. 0 on success, -ENOMEM when the table cannot
+ * grow (zero mutation in either case). */
+int sysmem_file_reserve(size_t n)
+{
+    size_t free = 0u;
+    size_t i;
+    if (sysmem_files == NULL || sysmem_file_cap == 0u) {
+        if (sysmem_file_grow() != 0) {
+            return -12;
+        }
+    }
+    for (i = 0u; i < sysmem_file_cap; i++) {
+        if (!sysmem_files[i].live) {
+            free++;
+        }
+    }
+    while (free < n) {
+        size_t had = sysmem_file_cap;
+        if (sysmem_file_grow() != 0) {
+            return -12;
+        }
+        free += sysmem_file_cap - had;
+    }
+    return 0;
+}
+
+/* Live-entry count (diagnostics and the R3 focused test). */
+unsigned sysmem_file_live_count(void)
+{
+    size_t i;
+    unsigned n = 0u;
+    for (i = 0u; i < sysmem_file_cap; i++) {
+        if (sysmem_files[i].live) {
+            n++;
+        }
+    }
+    return n;
+}
 
 static uint64_t sysmem_align_up_8k(uint64_t v)
 {
@@ -103,20 +150,38 @@ bool sysmem_file_bus_span(uint64_t file_offset, uint64_t len,
     return true;
 }
 
-void sysmem_file_note_map(void *context, uint64_t dev, uint64_t ino,
-    uint64_t file_offset, uint64_t base, uint64_t len, unsigned prot,
-    int is_private, const uint8_t *cstate, size_t nchunk)
+/* Record one live file-backed mapping (S64-R3-2/R3-3). Returns 0, or
+ * -ENOMEM when the table cannot grow: live entries are never evicted,
+ * so the caller must roll its mapping back (zero net mutation). The
+ * mapping's fd is duplicated here (S64-R3-2): mremap growth tails and
+ * truncate handling read through the retained description after the
+ * guest closed its own descriptor. A failed dup records fd -1 (the
+ * mapping still tracks for truncate BUS, but growth tails stay zero). */
+int sysmem_file_note_map(void *context, int fd, uint64_t dev,
+    uint64_t ino, uint64_t file_offset, uint64_t base, uint64_t len,
+    unsigned prot, int is_private, const uint8_t *cstate, size_t nchunk)
 {
     sysmem_file_range_t *slot;
     size_t n;
     size_t i;
     (void)context;
     if (len == 0u || file_offset > UINT64_C(0xffffffffffffffff) - len) {
-        return;
+        return -22;
     }
-    slot = &sysmem_files[sysmem_file_next % SYSMEM_FILERANGE_SLOTS];
-    sysmem_file_next++;
+    if (sysmem_file_reserve(1u) != 0) {
+        return -12;
+    }
+    for (i = 0u; i < sysmem_file_cap; i++) {
+        if (!sysmem_files[i].live) {
+            break;
+        }
+    }
+    if (i >= sysmem_file_cap) {
+        return -12;
+    }
+    slot = &sysmem_files[i];
     slot->live = true;
+    slot->fd = (fd >= 0) ? dup(fd) : -1;
     slot->dev = dev;
     slot->ino = ino;
     slot->file_offset = file_offset;
@@ -135,20 +200,45 @@ void sysmem_file_note_map(void *context, uint64_t dev, uint64_t ino,
     for (; i < (size_t)SYSMEM_FILERANGE_CHUNKS; i++) {
         slot->cstate[i] = slot->kind;
     }
+    return 0;
 }
 
-/* Claim a free registry slot for a split survivor; NULL when the
- * table is full (the caller then drops that survivor, degrading to
- * pre-registry behavior for its range only). */
+/* Claim a free registry slot for a split survivor; grows the table on
+ * demand (S64-R3-3) and returns NULL only when growth fails. Callers
+ * that reserved up front never see NULL; the munmap drop leg (which
+ * cannot fail the syscall) drops that survivor on OOM. */
 static sysmem_file_range_t *sysmem_file_claim_free(void)
 {
-    unsigned i;
-    for (i = 0; i < SYSMEM_FILERANGE_SLOTS; i++) {
+    size_t i;
+    if (sysmem_file_reserve(1u) != 0) {
+        return NULL;
+    }
+    for (i = 0u; i < sysmem_file_cap; i++) {
         if (!sysmem_files[i].live) {
             return &sysmem_files[i];
         }
     }
     return NULL;
+}
+
+/* Close one entry's retained description without touching the slot. */
+static void sysmem_file_close_fd(sysmem_file_range_t *slot)
+{
+    if (slot->fd >= 0) {
+        (void)close(slot->fd);
+        slot->fd = -1;
+    }
+}
+
+/* Duplicate an entry's retained description for a split survivor
+ * (S64-R3-2): each live entry owns its fd and closes it on drop. A
+ * failed dup records -1 (degraded growth fill, intact truncate BUS). */
+static int sysmem_file_clone_fd(const sysmem_file_range_t *slot)
+{
+    if (slot->fd < 0) {
+        return -1;
+    }
+    return dup(slot->fd);
 }
 
 /* Copy one coverage piece's per-chunk states: slices the materialized
@@ -176,7 +266,7 @@ static void sysmem_file_slice_states(sysmem_file_range_t *dst,
  * divide exactly. TLB invalidation stays with the callers. */
 void sysmem_file_drop_map(void *context, uint64_t base, uint64_t len)
 {
-    unsigned i;
+    size_t i;
     uint64_t end;
     (void)context;
     if (len == 0u) {
@@ -186,7 +276,7 @@ void sysmem_file_drop_map(void *context, uint64_t base, uint64_t len)
     if (end < base) {
         end = UINT64_C(0xffffffffffffffff);
     }
-    for (i = 0; i < SYSMEM_FILERANGE_SLOTS; i++) {
+    for (i = 0u; i < sysmem_file_cap; i++) {
         sysmem_file_range_t *slot = &sysmem_files[i];
         uint64_t s0;
         uint64_t s1;
@@ -199,6 +289,9 @@ void sysmem_file_drop_map(void *context, uint64_t base, uint64_t len)
             continue;
         }
         if (base <= s0 && s1 <= end) {
+            /* Fully covered: reclaim the slot and its retained fd
+             * (S64-R3-3/R3-5: unmap reclaims, never leaks). */
+            sysmem_file_close_fd(slot);
             slot->live = false;
             continue;
         }
@@ -222,6 +315,7 @@ void sysmem_file_drop_map(void *context, uint64_t base, uint64_t len)
                 continue;
             }
             tail->live = true;
+            tail->fd = sysmem_file_clone_fd(slot);
             tail->dev = slot->dev;
             tail->ino = slot->ino;
             tail->file_offset = slot->file_offset + (end - s0);
@@ -279,11 +373,12 @@ void sysmem_file_resize(void *context, uint64_t dev, uint64_t ino,
     uint64_t old_size, uint64_t new_size)
 {
     guest_state_t *g = (guest_state_t *)context;
-    unsigned i;
+    size_t i;
+    int changed = 0;
     if (g == NULL || old_size == new_size) {
         return;
     }
-    for (i = 0; i < SYSMEM_FILERANGE_SLOTS; i++) {
+    for (i = 0u; i < sysmem_file_cap; i++) {
         sysmem_file_range_t *slot = &sysmem_files[i];
         uint64_t ob = 0u;
         uint64_t ob_len = 0u;
@@ -341,6 +436,12 @@ void sysmem_file_resize(void *context, uint64_t dev, uint64_t ino,
                     (uint8_t)VM64_PAGE_COW_CLEAN) {
                     slot->cstate[cj] = (uint8_t)VM64_PAGE_COW_DIRTY;
                 }
+                /* S64-R3-1: zeroed code bytes invalidate the live
+                 * block cache alongside the TLB leg below. */
+                if (g->dbt != NULL) {
+                    sparc64_dbt_invalidate(g->dbt, gva, left);
+                }
+                changed = 1;
             }
         }
         /* BUS spans always run to the mapping end, so the delta is a
@@ -360,6 +461,13 @@ void sysmem_file_resize(void *context, uint64_t dev, uint64_t ino,
             (void)sparc64_space_map_bus(&g->space, lo, hi - lo,
                 slot->prot, true);
             sparc64_tlb_invalidate_gva(lo, hi - lo);
+            /* S64-R3-1: stripped code pages leave the block cache
+             * alongside the TLB (the generation bump below covers
+             * sleeping threads' private DBTs). */
+            if (g->dbt != NULL) {
+                sparc64_dbt_invalidate(g->dbt, lo, hi - lo);
+            }
+            changed = 1;
         } else if (had_bus && (!has_bus || ob < nb)) {
             /* Re-admitted pages (growth): zero heap pages + invalidate.
              * The guard mirrors the strip leg: run when the old span
@@ -376,6 +484,10 @@ void sysmem_file_resize(void *context, uint64_t dev, uint64_t ino,
             (void)sparc64_space_replace(&g->space, lo, hi - lo,
                 slot->prot);
             sparc64_tlb_invalidate_gva(lo, hi - lo);
+            if (g->dbt != NULL) {
+                sparc64_dbt_invalidate(g->dbt, lo, hi - lo);
+            }
+            changed = 1;
             /* RC-U4 #5: re-admitted pages are fresh zero pages, so
              * their materialized chunks reset to the mapping default
              * (a later guest write promotes via note_write). */
@@ -386,6 +498,12 @@ void sysmem_file_resize(void *context, uint64_t dev, uint64_t ino,
                 slot->cstate[j] = slot->kind;
             }
         }
+    }
+    /* S64-R3-1: a truncate that changed bytes or BUS coverage commits
+     * a new code generation (this path runs outside the 6-step legs),
+     * so threads that slept through it flush before cached execution. */
+    if (changed != 0) {
+        vm64_code_epoch_bump();
     }
 }
 
@@ -402,7 +520,7 @@ void sysmem_file_resize(void *context, uint64_t dev, uint64_t ino,
 void sysmem_file_remap_update(void *context, uint64_t old_base,
     uint64_t old_len, uint64_t dest, uint64_t new_len)
 {
-    unsigned i;
+    size_t i;
     uint64_t old_end;
     (void)context;
     if (old_len == 0u || new_len == 0u) {
@@ -417,7 +535,7 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
     if (dest != old_base) {
         sysmem_file_drop_map(context, dest, new_len);
     }
-    for (i = 0; i < SYSMEM_FILERANGE_SLOTS; i++) {
+    for (i = 0u; i < sysmem_file_cap; i++) {
         sysmem_file_range_t *slot = &sysmem_files[i];
         uint64_t s0;
         uint64_t s1;
@@ -439,6 +557,8 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
             uint64_t keep = slot->len;
             uint64_t k;
             if (off >= new_len) {
+                /* Shrunken away entirely: reclaim slot + fd. */
+                sysmem_file_close_fd(slot);
                 slot->live = false;
                 continue;
             }
@@ -504,6 +624,11 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
                 }
                 if (mid != NULL) {
                     mid->live = true;
+                    /* S64-R3-2: the survivor reusing this slot keeps
+                     * the retained fd; a fresh slot clones it (its
+                     * own close on drop). */
+                    mid->fd = (mid == slot) ? slot->fd :
+                        sysmem_file_clone_fd(slot);
                     mid->dev = dev;
                     mid->ino = ino;
                     mid->file_offset = ofo + (m0 - s0);
@@ -523,6 +648,7 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
                 tail = sysmem_file_claim_free();
                 if (tail != NULL) {
                     tail->live = true;
+                    tail->fd = sysmem_file_clone_fd(slot);
                     tail->dev = dev;
                     tail->ino = ino;
                     tail->file_offset = ofo + (m1 - s0);
@@ -555,23 +681,13 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
                 /* No head and no moved survivor: this slot's whole
                  * span is consumed (any tail lives in its own slot,
                  * and a fully covered entry simply drops). */
+                sysmem_file_close_fd(slot);
                 slot->live = false;
             }
         }
     }
 }
 
-/* Populate len bytes from fd@file_offset into guest space at base via
- * the Provider-A helper (RC-U4 #5): each 8 KiB chunk goes through
- * vm_file_populate_segment into a bounded 8 KiB stack staging buffer
- * (fresh-size aware, so the [st_size, 8 KiB) tail and the upper-half
- * materialization span read zero), then into the guest pages. Short
- * reads at EOF keep the mapping with a zero tail and report LOAD_IO,
- * exactly like the old pread loop; LOAD_NOMEM rolls the span back.
- * Per-chunk post-populate state lands in cstate_out (up to
- * cstate_cap entries, count in nchunk_out) for the caller to file
- * with the range-tracking entry: COW_DIRTY for a materialized private
- * copy, SHARED for shared, CLEAN when the chunk served no file bytes. */
 /* Promote every tracked COW_CLEAN chunk overlapping [base, base+len)
  * to COW_DIRTY (RC-U4 #5): the runtime guest-write paths call this
  * after a successful write so the per-chunk registry states mirror the
@@ -580,7 +696,7 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
  * 64-chunk materialized bound keep their implicit kind default. */
 void sysmem_file_note_write(void *context, uint64_t base, uint64_t len)
 {
-    unsigned i;
+    size_t i;
     uint64_t end;
     (void)context;
     if (len == 0u) {
@@ -590,7 +706,7 @@ void sysmem_file_note_write(void *context, uint64_t base, uint64_t len)
     if (end < base) {
         end = UINT64_C(0xffffffffffffffff);
     }
-    for (i = 0; i < SYSMEM_FILERANGE_SLOTS; i++) {
+    for (i = 0u; i < sysmem_file_cap; i++) {
         sysmem_file_range_t *slot = &sysmem_files[i];
         uint64_t s1;
         uint64_t o0;
@@ -618,70 +734,4 @@ void sysmem_file_note_write(void *context, uint64_t base, uint64_t len)
             }
         }
     }
-}
-
-int sysmem_file_fill(void *context, int fd, uint64_t file_offset,
-    uint64_t base, uint64_t len, uint64_t file_size, int is_private,
-    uint8_t *cstate_out, size_t cstate_cap, size_t *nchunk_out)
-{
-    guest_state_t *g = (guest_state_t *)context;
-    uint64_t done = 0u;
-    size_t ncs = 0u;
-    uint8_t kind;
-    uint8_t stage[GUEST_PAGE_SIZE];
-    if (g == NULL || len == 0u) {
-        return (len == 0u) ? LOAD_OK : -LOAD_NOMEM;
-    }
-    kind = (is_private != 0) ? (uint8_t)VM64_PAGE_COW_CLEAN :
-        (uint8_t)VM64_PAGE_SHARED;
-    while (done < len) {
-        uint64_t want = len - done;
-        long got;
-        /* Real per-chunk states (RC-U4 #5): the populate call promotes
-         * the pair in place for private mappings with file bytes, so
-         * the recorded state is the populate result (COW_DIRTY after
-         * materializing the private copy, SHARED untouched, CLEAN
-         * when the chunk served no file bytes). */
-        vm64_page_state_t lo = (vm64_page_state_t)kind;
-        vm64_page_state_t hi = (vm64_page_state_t)kind;
-        if (want > (uint64_t)sizeof(stage)) {
-            want = (uint64_t)sizeof(stage);
-        }
-        got = vm_file_populate_segment(fd, file_offset + done,
-            file_size, stage, (size_t)want, &lo, &hi, NULL, NULL);
-        if (got < 0L) {
-            if (nchunk_out != NULL) {
-                *nchunk_out = ncs;
-            }
-            /* Host error or a file that shrank under the caller: keep
-             * the mapping with a zero tail, like a short read. */
-            return -LOAD_IO;
-        }
-        if (ncs < cstate_cap && cstate_out != NULL) {
-            /* The populate result: lo and hi promote as one unit, so
-             * lo carries the chunk (DIRTY for a materialized private
-             * copy, SHARED for shared, CLEAN when no bytes served). */
-            cstate_out[ncs] = (uint8_t)lo;
-            ncs++;
-        }
-        if (!sparc64_space_write_initial(&g->space, base + done, stage,
-                (size_t)want)) {
-            if (nchunk_out != NULL) {
-                *nchunk_out = ncs;
-            }
-            return -LOAD_NOMEM;
-        }
-        /* Advance by served bytes (not the staged span): a short
-         * final chunk then reports LOAD_IO below, as documented. */
-        done += (uint64_t)got;
-        if ((uint64_t)got < want) {
-            /* Short (EOF): the tail is already zeroed by the populate
-             * above; keep the mapping. */
-            break;
-        }
-    }
-    if (nchunk_out != NULL) {
-        *nchunk_out = ncs;
-    }
-    return (done < len) ? -LOAD_IO : LOAD_OK;
 }

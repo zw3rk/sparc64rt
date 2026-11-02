@@ -275,10 +275,28 @@ long sparc64_sig_sigaltstack(sparc64_ctx_t *ctx,
 {
     uint8_t raw[24];
     uint8_t old[24];
-    uint64_t sp;
-    uint64_t flags;
-    uint64_t size;
+    uint64_t sp = UINT64_C(0);
+    uint64_t flags = UINT64_C(0);
+    uint64_t size = UINT64_C(0);
+    int have_new = 0;
     long rc;
+    /* Snapshot the new stack first: when uss and uoss alias (or
+     * overlap), writing the old state below must not destroy the
+     * input before it is read. No live state changes until both
+     * directions validate. */
+    if (uss_va != UINT64_C(0)) {
+        if (l2a_range_ok(uss_va, (uint64_t)sizeof(raw)) != 0) {
+            return -EFAULT;
+        }
+        if (!mem->read(mem->context, uss_va, raw,
+                (uint64_t)sizeof(raw))) {
+            return -EFAULT;
+        }
+        sp = l2a_get_be64(raw);
+        flags = (uint64_t)l2a_get_be32(raw + 8);
+        size = l2a_get_be64(raw + 16);
+        have_new = 1;
+    }
     if (uoss_va != UINT64_C(0)) {
         uint64_t osp;
         uint64_t oflags;
@@ -303,17 +321,7 @@ long sparc64_sig_sigaltstack(sparc64_ctx_t *ctx,
             return rc;
         }
     }
-    if (uss_va != UINT64_C(0)) {
-        if (l2a_range_ok(uss_va, (uint64_t)sizeof(raw)) != 0) {
-            return -EFAULT;
-        }
-        if (!mem->read(mem->context, uss_va, raw,
-                (uint64_t)sizeof(raw))) {
-            return -EFAULT;
-        }
-        sp = l2a_get_be64(raw);
-        flags = (uint64_t)l2a_get_be32(raw + 8);
-        size = l2a_get_be64(raw + 16);
+    if (have_new != 0) {
         return sparc64_sync_sig_altstack_set(sp, flags, size);
     }
     return 0L;

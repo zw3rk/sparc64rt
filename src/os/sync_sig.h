@@ -26,6 +26,10 @@ int sparc64_sync_sig_install(uint64_t sig, uint64_t handler_va,
 /* Forget all handlers (execve reset). */
 void sparc64_sync_sig_reset_all(void);
 
+/* execve reset: caught dispositions return to SIG_DFL while ignored
+ * dispositions, the blocked mask, and pending signals survive. */
+void sparc64_sync_sig_exec_reset(void);
+
 /* Map a step trap to (signo, si_code). Returns signo, or 0 when the trap
  * is not a synchronous signal (caller treats it as fatal). */
 int sparc64_sync_sig_for_trap(sparc64_trap_cause_t cause, int *code_out);

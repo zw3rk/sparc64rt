@@ -55,6 +55,15 @@ void vm64_worker_register(void);
 void vm64_worker_unregister(void);
 unsigned vm64_worker_live_count(void);
 
+/* Shared address-space code generation (S64-R3-1): bumped on every
+ * committed mapping change (mmap/munmap/mprotect/mremap, truncate
+ * resize, exec image replacement). Every DBT instance is per-thread,
+ * so a thread that slept through a peer's mutation must flush stale
+ * blocks before executing cached code again: engines snapshot this
+ * counter across blocking points and full-flush on mismatch. */
+uint64_t vm64_code_epoch_get(void);
+void vm64_code_epoch_bump(void);
+
 /* Live Soft-TLB window (section 4.5.2). */
 uint64_t vm64_seq_rewind(uint64_t pc, uint64_t seq_start,
     uint64_t host_insn);

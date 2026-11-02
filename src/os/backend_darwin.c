@@ -454,8 +454,15 @@ int64_t rt_host_getdents64(int fd, void *linux_dirent64_buf, size_t buf_size) {
         dir = fdopendir(dupfd);
         if (dir == NULL) { int e = errno; (void)close(dupfd); (void)pthread_mutex_unlock(&g_dir_mu); return -(int64_t)e; }
         if (free_idx < 0) {
-            free_idx = 0;
-            if (g_dirs[0].used && g_dirs[0].dir != NULL) { (void)closedir(g_dirs[0].dir); }
+            /* S64-R3-6: all 32 streams are live with unread entries
+             * (readdir buffers ahead of the shared descriptor offset),
+             * so evicting slot zero would silently skip directory
+             * entries. Reject the new allocation instead: the dup'd
+             * stream closes here and every existing stream keeps its
+             * pending entry and offset. */
+            (void)closedir(dir);
+            (void)pthread_mutex_unlock(&g_dir_mu);
+            return -12;
         }
         slot = &g_dirs[(unsigned)free_idx];
         slot->used = 1; slot->fd = fd; slot->dev = st.st_dev; slot->ino = st.st_ino;

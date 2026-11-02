@@ -46,7 +46,9 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
 #include "os/threads.h"
+#include "os/threads_darwin.h"
 #include "os/mem_space_split.h"
+#include "vm/vm64.h"
 
 /* Clone subset (linux/sched.h numbers, documented in threads.h). */
 #define THR_CLONE_MASK \
@@ -58,7 +60,9 @@
 /* Futex op bits (Linux UAPI). WAIT_BITSET (with an absolute timeout,
  * realtime when CLOCK_REALTIME is set) is what glibc condvars use; the
  * oracle serves it, so it is required here too. Anything else (REQUEUE
- * family, etc.) stays -ENOSYS per the lane contract. */
+ * family, etc.) stays -ENOSYS per the lane contract.
+ * Guest-visible futex results below use fixed Linux numbers (-11,
+ * -38, -110: Darwin BSD EAGAIN/ENOSYS/ETIMEDOUT are 35/78/60). */
 #define THR_FUTEX_WAIT 0U
 #define THR_FUTEX_WAKE 1U
 #define THR_FUTEX_WAIT_BITSET 9U
@@ -354,7 +358,9 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
      * on hosts where that path is compiled out. */
     (void)cmd;
     (void)flags;
+#if defined(__linux__) && defined(SYS_futex)
     uint32_t host_val = __builtin_bswap32(val);
+#endif
     uint32_t cur = 0U;
     int rc;
     (void)ctx;
@@ -363,7 +369,7 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
         return (long)rc;
     }
     if (cur != val) {
-        return -EAGAIN;
+        return -11; /* Linux EAGAIN (Darwin: 35). */
     }
     /* Lock handoff: spill every cached window image to its architectural
      * home and drop the cache before sleeping. The winfile is process-
@@ -391,28 +397,54 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
     for (;;) {
         void *hp;
         long hrc;
+        uint64_t epoch_before;
         if (sparc64_threads_group_exiting(NULL)) {
             return -EINTR;
+        }
+        if ((uaddr & UINT64_C(3)) != UINT64_C(0)) {
+            return -EINVAL;
         }
         hp = thr_resolve(mem->context, uaddr, 4U, SPARC64_MEM_READ);
         if (hp == NULL) {
             return -EFAULT;
         }
-        sparc64_thread_big_unlock();
+        /* S64-R3-1: snapshot the shared code generation across the
+         * sleep; a peer's mapping change commits a new generation
+         * while the lock is dropped. */
+        epoch_before = vm64_code_epoch_get();
 #if defined(__linux__) && defined(SYS_futex)
+        sparc64_thread_big_unlock();
         hrc = thr_host_futex(hp, cmd | flags, host_val, ts, NULL, bitset);
+        sparc64_thread_big_lock();
+#elif defined(__APPLE__) && defined(__aarch64__)
+        /* S64-R3-4: the Darwin callee pins the backing under the held
+         * lock, drops it across the backend wait, and re-acquires
+         * before returning; the lock is held on both sides here. */
+        hrc = thr_darwin_futex_wait(ctx, mem, uaddr, op, val, bitset,
+            ts);
 #else
         (void)hp;
-        (void)host_val;
         (void)bitset;
-        hrc = -ENOSYS;
-#endif
+        sparc64_thread_big_unlock();
+        hrc = -38; /* Linux ENOSYS (Darwin: 78). */
         sparc64_thread_big_lock();
+#endif
         /* Re-acquired after a drop: another thread may have cached its
          * own images since; refill from our own homes henceforth. */
         sparc64_win_invalidate_all();
-        if (hrc == -ENOSYS) {
-            return -ENOSYS;
+        /* S64-R3-1: a mapping change slept through above leaves every
+         * per-thread DBT stale (only g->dbt is invalidated at the
+         * mutation site). Flush the live instance before executing
+         * cached code again; the engine loop's own generation check
+         * repeats this for the resuming thread's private DBT. */
+        if (vm64_code_epoch_get() != epoch_before) {
+            guest_state_t *g = (guest_state_t *)mem->context;
+            if (g != NULL && g->dbt != NULL) {
+                sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
+            }
+        }
+        if (hrc == -38) {
+            return -38;
         }
         if (hrc == 0L) {
             rc = thr_read_u32(mem, uaddr, &cur);
@@ -430,12 +462,12 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
                 return (long)rc;
             }
             if (cur != val) {
-                return -EAGAIN;
+                return -11;
             }
-        } else if (hrc != -ETIMEDOUT) {
+        } else if (hrc != -110) { /* Linux ETIMEDOUT. */
             return hrc;
         } else {
-            return -ETIMEDOUT;
+            return -110;
         }
     }
 }
@@ -453,12 +485,12 @@ long sparc64_thread_futex(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     }
     if ((op & ~((uint64_t)THR_FUTEX_CMD_MASK | THR_FUTEX_FLAG_MASK)) !=
         UINT64_C(0)) {
-        return -ENOSYS;
+        return -38;
     }
     if (cmd != (uint64_t)THR_FUTEX_WAIT &&
         cmd != (uint64_t)THR_FUTEX_WAKE &&
         cmd != (uint64_t)THR_FUTEX_WAIT_BITSET) {
-        return -ENOSYS;
+        return -38;
     }
     if (l2a_range_ok(uaddr, 4U) != 0) {
         return -EFAULT;
@@ -469,6 +501,9 @@ long sparc64_thread_futex(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         long hrc;
 #endif
         (void)ctx;
+        if ((uaddr & UINT64_C(3)) != UINT64_C(0)) {
+            return -EINVAL;
+        }
         hp = thr_resolve(mem->context, uaddr, 4U, SPARC64_MEM_READ);
         if (hp == NULL) {
             return -EFAULT;
@@ -477,8 +512,13 @@ long sparc64_thread_futex(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         hrc = thr_host_futex(hp, cmd | (op & THR_FUTEX_FLAG_MASK),
             (uint32_t)val, NULL, NULL, 0U);
         return hrc;
+#elif defined(__APPLE__) && defined(__aarch64__)
+        /* S64-R3-4: route guest WAKE through the Darwin keyed backend
+         * (validated key, all-bits match); the big lock is held here,
+         * so the resolve above cannot race a remap. */
+        return thr_darwin_futex_wake(mem, uaddr, val);
 #else
-        return -ENOSYS;
+        return -38;
 #endif
     }
     if (cmd == (uint64_t)THR_FUTEX_WAIT_BITSET && bitset == UINT64_C(0)) {
@@ -726,6 +766,8 @@ void sparc64_thread_entry_done(sparc64_thread_t *slot, long status)
 #if defined(__linux__) && defined(SYS_futex)
             (void)thr_host_futex(hp, (uint64_t)THR_FUTEX_WAKE, 1U, NULL,
                 NULL, 0U);
+#elif defined(__APPLE__) && defined(__aarch64__)
+            (void)thr_darwin_futex_wake(ops, slot->ctid_va, UINT64_C(1));
 #endif
         }
     }
@@ -735,6 +777,11 @@ void sparc64_thread_entry_done(sparc64_thread_t *slot, long status)
      * exit_group arms it via sparc64_threads_note_group_exit instead. */
     (void)pthread_mutex_unlock(&thr_table_lock);
     sparc64_thread_big_unlock();
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* S64-R3-5: this host thread exits here; release its Darwin worker
+     * sync + table slot (the main thread never reaches this path). */
+    thr_darwin_ws_teardown();
+#endif
 }
 
 /* ---- host-atomic fast path ---------------------------------------------- */

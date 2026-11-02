@@ -76,8 +76,15 @@ int   rt_host_preempt_worker(uint64_t host_tid);
 /* Registers the calling thread in the backend worker table (Darwin) and
  * returns its platform worker id: numeric tid on Linux (tgkill target),
  * pthread_threadid_np value on Darwin (worker-table key). Used to fill
- * the vm64 quiescence worker table for the live thread. */
+ * the vm64 quiescence worker table for the live thread. Returns 0 when
+ * the backend table is exhausted (S64-R3-5: callers treat 0 as
+ * unregistered instead of silently running without preemption). */
 uint64_t rt_host_register_self(void);
+/* Releases the calling thread's backend worker-table slot (S64-R3-5).
+ * Idempotent; safe to call for a thread that never registered. Must be
+ * called on every worker-thread exit, otherwise the fixed Darwin table
+ * leaks one entry per thread lifetime. No-op on Linux (no table). */
+void rt_host_unregister_self(void);
 
 /* 5. Filesystem & descriptor operations (all potentially blocking calls take ws + expected_seq) */
 int64_t rt_host_openat(int dirfd, const char *path, int linux_flags, uint32_t mode,

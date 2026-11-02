@@ -96,6 +96,10 @@ uint64_t rt_host_register_self(void)
     return UINT64_C(1);
 }
 
+void rt_host_unregister_self(void)
+{
+}
+
 static int fails = 0;
 
 static void check(const char *name, int passed)

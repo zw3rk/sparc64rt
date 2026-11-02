@@ -217,6 +217,9 @@ uint64_t rt_host_register_self(void) {
     /* Numeric tid doubles as the tgkill target; no table needed. */
     return (uint64_t)(int64_t)gettid();
 }
+void rt_host_unregister_self(void) {
+    /* No backend worker table on Linux: nothing to release. */
+}
 
 /* 5. filesystem */
 int64_t rt_host_openat(int dirfd, const char *path, int linux_flags,

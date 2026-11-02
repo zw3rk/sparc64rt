@@ -82,6 +82,38 @@ void *sparc64_thread_entry(void *arg)
     return arg;
 }
 
+/* The epoch-sync leg in thr_futex_wait() drops block-cache coverage
+ * through this hook (never reached here: no mapping commits run, so
+ * the generation never advances past its initial value). */
+void sparc64_dbt_invalidate(sparc64_dbt_t *dbt, uint64_t va, uint64_t len)
+{
+    (void)dbt;
+    (void)va;
+    (void)len;
+    stub_reached = 1;
+}
+
+#if !defined(__APPLE__) || !defined(__aarch64__)
+/* Non-Darwin hosts compile the Darwin backend TUs to empty shells, so
+ * the vm64 quiescence legs linked in for the epoch check close over
+ * these stubs (no preemption or worker table exists there). */
+int rt_host_preempt_worker(uint64_t host_tid)
+{
+    (void)host_tid;
+    stub_reached = 1;
+    return 0;
+}
+
+uint64_t rt_host_register_self(void)
+{
+    return UINT64_C(1);
+}
+
+void rt_host_unregister_self(void)
+{
+}
+#endif
+
 static bool test_mem_read(void *ctx, uint64_t va, void *dst, size_t n,
     sparc64_access_t acc, sparc64_mem_fault_t *fault)
 {

@@ -195,21 +195,10 @@ static ssize_t sysmem_pread_all(int fd, uint64_t offset, uint8_t *dst,
 
 /* File-backed range registry, truncate/resize handling, mremap
  * coverage updates, and the Provider-A populate fill live in
- * src/os/guest_run_sysmem_file.c (RC-U4 split); the shells below call
- * in through these local externs. */
-extern void sysmem_file_note_map(void *context, uint64_t dev,
-    uint64_t ino, uint64_t file_offset, uint64_t base, uint64_t len,
-    unsigned prot, int is_private, const uint8_t *cstate,
-    size_t nchunk);
-extern void sysmem_file_drop_map(void *context, uint64_t base,
-    uint64_t len);
-extern void sysmem_file_remap_update(void *context, uint64_t old_base,
-    uint64_t old_len, uint64_t dest, uint64_t new_len);
-extern int sysmem_file_fill(void *context, int fd, uint64_t file_offset,
-    uint64_t base, uint64_t len, uint64_t file_size, int is_private,
-    uint8_t *cstate_out, size_t cstate_cap, size_t *nchunk_out);
-extern bool sysmem_file_bus_span(uint64_t file_offset, uint64_t len,
-    uint64_t file_size, uint64_t *bus_out, uint64_t *bus_len_out);
+ * src/os/guest_run_sysmem_file.c + src/os/sysmem_file_fill.c (RC-U4
+ * split, S64-R3 growth); the shells below call in through the shared
+ * header so the compiler checks signatures. */
+#include "os/sysmem_file.h"
 
 long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
     unsigned prot, unsigned flags, int fd, uint64_t offset)
@@ -257,6 +246,14 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
         long rc = sysmem_resolve_base(g, addr, size, flags, &base);
         if (rc != 0) {
             return rc;
+        }
+    }
+    /* S64-R3-3: reserve the registry slot BEFORE the 6-step legs so
+     * a full table reports -ENOMEM with zero mutation instead of
+     * evicting a live mapping's truncate metadata. */
+    if ((flags & SYSMEM_MAP_ANONYMOUS) == 0U) {
+        if (sysmem_file_reserve(1u) != 0) {
+            return -ENOMEM;
         }
     }
     /* 6-step legs: the space publish is the host op (transactional:
@@ -358,8 +355,17 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
                     prot & 7u, true);
                 sparc64_tlb_invalidate_gva(gbus, bus_len);
             }
-            sysmem_file_note_map(g, fdev, fino, offset, base, size,
-                prot & 7u, is_private, cstate, nchunk);
+            /* S64-R3-2/R3-3: retain the fd for later growth fills;
+             * a failed note rolls the span back (zero net mutation),
+             * never evicting another mapping's metadata. */
+            if (sysmem_file_note_map(g, fd, fdev, fino, offset, base,
+                    size, prot & 7u, is_private, cstate,
+                    nchunk) != 0) {
+                (void)sparc64_space_unmap(&g->space, base, size);
+                sparc64_tlb_invalidate_gva(base, size);
+                vm64_stxn_abort();
+                return -ENOMEM;
+            }
         }
     }
     (void)vm64_stxn_commit(base, size);
@@ -610,6 +616,13 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
         }
         dest = old_addr;
     }
+    /* S64-R3-3: reserve the worst-case registry slots BEFORE the
+     * 6-step legs (straddler splits + destination excision), so the
+     * coverage update below cannot fail mid-mutation. */
+    if (sysmem_file_reserve(sysmem_file_span_extra(old_addr, old_len,
+            dest, new_len)) != 0) {
+        return -ENOMEM;
+    }
     if (vm64_stxn_prepare() != 0) {
         return -EFAULT;
     }
@@ -648,6 +661,35 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
      * (unmoved head/tail stay, the middle moves); replaced destination
      * spans excise the same split-aware way. */
     sysmem_file_remap_update(g, old_addr, old_len, dest, new_len);
+    /* S64-R3-2: grow the tail through the file-population/EOF path
+     * (MAP_SHARED and MAP_PRIVATE alike, with beyond-EOF BUS
+     * classification) before committing, so an 8 KiB mapping of a
+     * larger file grown past its end serves file bytes, not zeros. */
+    if (new_len > old_len) {
+        long frc = (long)sysmem_file_fill_growth(g, dest, old_len,
+            new_len);
+        if (frc == -12L && dest == old_addr) {
+            /* In-place extension rejected: drop the fresh tail for
+             * zero net mutation and report resource exhaustion. */
+            sysmem_span_op_t tail;
+            tail.g = g;
+            tail.base = dest + old_len;
+            tail.size = new_len - old_len;
+            tail.prot = 0U;
+            tail.kind = SYSOP_UNMAP;
+            tail.dest = UINT64_C(0);
+            tail.new_size = UINT64_C(0);
+            (void)sysmem_space_op(&tail);
+            sysmem_file_drop_map(g, dest + old_len,
+                new_len - old_len);
+            sparc64_tlb_invalidate_gva(dest, new_len);
+            if (g->dbt != NULL) {
+                sparc64_dbt_invalidate(g->dbt, dest, new_len);
+            }
+            vm64_stxn_abort();
+            return -ENOMEM;
+        }
+    }
     if (old_addr != dest && old_addr >= g->brk_base &&
         old_addr < g->brk_cur && old_addr + old_len >= g->brk_cur) {
         g->brk_cur = dest + (g->brk_cur - old_addr);
