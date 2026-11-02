@@ -26,7 +26,8 @@ LDFLAGS_STATIC_PIE := -static-pie
 # builds for the Linux static-PIE target except the Darwin backend TU
 # (src/os/backend_darwin.c, built by build-darwin instead).
 EXCLUDED_SRCS := \
-	src/os/backend_darwin.c
+	src/os/backend_darwin.c \
+	src/os/backend_darwin_sync.c
 
 ALL_C_SRCS := $(shell find src -name '*.c')
 LINUX_C_SRCS := $(filter-out $(EXCLUDED_SRCS),$(ALL_C_SRCS))
@@ -60,8 +61,8 @@ $(BUILD_DIR):
 
 check: build check-line-limits check-abi-invariants check-thr-granule check-rc-u2 ## Build plus all Phase 0 gates
 
-check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
-	@dirs="src"; test -d include && dirs="src include"; \
+check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
+	@dirs="src"; test -d include && dirs="$$dirs include"; test -d tests && dirs="$$dirs tests"; \
 	over=$$(wc -l $$(find $$dirs -name '*.c' -o -name '*.h' -o -name '*.S') | \
 		awk '$$2 != "total" && $$1 > 900 {print $$2}'); \
 	if [ -n "$$over" ]; then \
@@ -69,7 +70,7 @@ check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
 		wc -l $$over; \
 		exit 1; \
 	fi; \
-	echo "line limits ok (all src/include .c/.h/.S <= 900 lines)"
+	echo "line limits ok (all src/include/tests .c/.h/.S <= 900 lines)"
 
 check-abi-invariants: ## Build and run tests/check_abi_invariants.c when present (Lane L0b)
 	@if [ -f tests/check_abi_invariants.c ]; then \

@@ -37,6 +37,7 @@
 #include "dbt/mem_sites.h"
 #include "os/syscalls_min.h"
 #include "os/mem_space.h"
+#include "vm/vm64.h"
 
 /* ---- Guest ABI constants (SPARC Linux, arch/sparc) --------------------- */
 /* Canonical source is src/os/guest_run_priv.h (GUEST_ABI_PAGE_SIZE); the
@@ -53,17 +54,6 @@
 #define SYSMEM_MREMAP_FIXED 2u
 /* Soft-TLB indexing granule for the permission-span scan. */
 #define SYSMEM_SUB_PAGE UINT64_C(4096)
-
-/* ---- Single-participant quiescence legs (src/vm/vm64.c) ---------------- */
-/* The big-lock engine has no live peer table, so these take the
- * epoch-bump leg: prepare parks self + announces, host_op runs the
- * fallible step first (failure releases with zero mutation), commit
- * clears + resumes. Declared locally: the txn types stay private to
- * src/vm/vm64.c by design. */
-extern int vm64_stxn_prepare(void);
-extern long vm64_stxn_host_op(long (*op)(void *), void *op_ctx);
-extern int vm64_stxn_commit(uint64_t changed_base, uint64_t changed_len);
-extern void vm64_stxn_abort(void);
 
 static uint64_t sysmem_align_up(uint64_t v, uint64_t a)
 {
@@ -166,7 +156,7 @@ static long sysmem_resolve_base(guest_state_t *g, uint64_t addr,
         *base = addr;
         return 0;
     }
-    *base = (addr == 0U) ? SYSMEM_MMAP_BASE :
+    *base = (addr == 0U || addr >= SPARC64_TASK_SIZE) ? SYSMEM_MMAP_BASE :
         sysmem_align_up(addr, GUEST_PAGE_SIZE);
     if (*base == 0U || *base >= SPARC64_TASK_SIZE ||
         size > SPARC64_TASK_SIZE - *base) {
@@ -232,7 +222,9 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
     if (g == NULL) {
         return -EFAULT;
     }
-    if (len == 0U || len > SPARC64_TASK_SIZE) {
+    if (vm64_check_mmap_args(addr, len,
+            ((flags & SYSMEM_MAP_ANONYMOUS) != 0U) ? UINT64_C(0) : offset,
+            flags & SYSMEM_MAP_FIXED) != 0) {
         return -EINVAL;
     }
     size = sysmem_align_up(len, GUEST_PAGE_SIZE);
@@ -256,11 +248,7 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
     if ((flags & SYSMEM_MAP_ANONYMOUS) == 0U) {
         /* File-backed: pread probe validates fd readability. */
         uint8_t probe;
-        ssize_t got;
-        if ((offset & SYSMEM_PAGE_MASK) != 0U) {
-            return -EINVAL;
-        }
-        got = sysmem_pread_all(fd, offset, &probe, sizeof(probe));
+        ssize_t got = sysmem_pread_all(fd, offset, &probe, sizeof(probe));
         if (len != 0U && got < 0) {
             return -(long)errno;
         }
@@ -388,17 +376,7 @@ long sparc64_sysmem_munmap(void *context, uint64_t addr, uint64_t len)
     if (g == NULL) {
         return -EFAULT;
     }
-    if (len == 0U) {
-        return -EINVAL;
-    }
-    /* Wave U2: 8 KiB architectural granule — a non-8K-aligned address
-     * fails with -EINVAL like Linux (mprotect below matches). */
-    if ((addr & SYSMEM_PAGE_MASK) != 0U) {
-        return -EINVAL;
-    }
-    base = addr;
-    size = sysmem_align_up(len, GUEST_PAGE_SIZE);
-    if (base < GUEST_PAGE_SIZE || size > SPARC64_TASK_SIZE - base) {
+    if (vm64_check_munmap_args(addr, len, &base, &size) != 0) {
         return -EINVAL;
     }
     /* 6-step legs: unmap tolerates holes (no failure leg); commit then
@@ -442,15 +420,14 @@ long sparc64_sysmem_mprotect(void *context, uint64_t addr, uint64_t len,
     if (g == NULL) {
         return -EFAULT;
     }
-    if (len == 0U || (prot & ~7U) != 0U) {
+    if ((prot & ~7U) != 0U) {
         return -EINVAL;
     }
-    if ((addr & SYSMEM_PAGE_MASK) != 0U) {
-        return -EINVAL;
-    }
-    size = sysmem_align_up(len, GUEST_PAGE_SIZE);
-    if (addr < GUEST_PAGE_SIZE || size > SPARC64_TASK_SIZE - addr) {
-        return -ENOMEM;
+    {
+        int chk = vm64_check_mprotect_args(addr, len, &size);
+        if (chk != 0) {
+            return (long)chk;
+        }
     }
     /* 6-step legs: protect mutates nothing unless every page is mapped
      * (zero-mutation abort otherwise); commit invalidates the span. */
@@ -556,37 +533,18 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     if (g == NULL) {
         return -EFAULT;
     }
-    if (old_size == 0U || old_size > SPARC64_TASK_SIZE ||
-        new_size == 0U || new_size > SPARC64_TASK_SIZE) {
-        return -EINVAL;
-    }
-    if ((old_addr & SYSMEM_PAGE_MASK) != 0U) {
-        return -EINVAL;
-    }
-    if ((flags & ~(SYSMEM_MREMAP_MAYMOVE | SYSMEM_MREMAP_FIXED)) != 0U) {
-        return -EINVAL;
-    }
-    if (((flags & SYSMEM_MREMAP_FIXED) != 0U) &&
-        ((flags & SYSMEM_MREMAP_MAYMOVE) == 0U)) {
+    if (vm64_check_mremap_args(old_addr, old_size, new_size, flags,
+            new_addr) != 0) {
         return -EINVAL;
     }
     old_len = sysmem_align_up(old_size, GUEST_PAGE_SIZE);
     new_len = sysmem_align_up(new_size, GUEST_PAGE_SIZE);
-    if (old_addr < GUEST_PAGE_SIZE ||
-        old_len > SPARC64_TASK_SIZE - old_addr) {
-        return -EINVAL;
-    }
     if (new_len == old_len && (flags & SYSMEM_MREMAP_FIXED) == 0U) {
         return (long)old_addr;
     }
     if ((flags & SYSMEM_MREMAP_FIXED) != 0U) {
         /* FIXED relocates; same-address same-size FIXED is -EINVAL on
          * Linux, and overlapping ranges are -EINVAL too. */
-        if ((new_addr & SYSMEM_PAGE_MASK) != 0U || new_addr == 0U ||
-            new_addr >= SPARC64_TASK_SIZE ||
-            new_len > SPARC64_TASK_SIZE - new_addr) {
-            return -EINVAL;
-        }
         if (new_addr == old_addr && new_len == old_len) {
             return -EINVAL;
         }

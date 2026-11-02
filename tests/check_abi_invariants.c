@@ -119,6 +119,16 @@ static void check_ctx(void)
     CHECK_CONST("SPARC64_TASK_SIZE", SPARC64_TASK_SIZE, 0x800000000000ULL);
     CHECK_CONST("sizeof(r)", sizeof(((sparc64_ctx_t *)0)->r), 256);
     CHECK_CONST("sizeof(fp)", sizeof(((sparc64_ctx_t *)0)->fp), 256);
+    {
+        sparc64_ctx_t ctx;
+        for (unsigned i = 0; i < 32; ++i) {
+            ctx.fp.d[i] = UINT64_C(0xdeadbeefcafebabe);
+        }
+        sparc64_ctx_init(&ctx, UINT64_C(0x1000));
+        for (unsigned i = 0; i < 32; ++i) {
+            CHECK_CONST("ctx_init_fp_d", ctx.fp.d[i], 0);
+        }
+    }
 }
 
 static void check_sigframe(void)

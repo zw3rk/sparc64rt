@@ -178,9 +178,13 @@ static bool e_delay_plain(sparc64_emit_ctx_t *ec)
     return ec->delay != NULL && sparc64_delay_is_plain(ec->delay);
 }
 
-/* Integer MOVcc. */
+/* Integer MOVcc (%icc/%xcc and %fcc0..%fcc3). */
 bool sparc64_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
+    static const uint32_t fcond_mask[16] = {
+        0x0U, 0xEU, 0x6U, 0xAU, 0x2U, 0xCU, 0x4U, 0x8U,
+        0xFU, 0x1U, 0x9U, 0x5U, 0xDU, 0x3U, 0xBU, 0x7U
+    };
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_skip;
     unsigned acond;
@@ -190,10 +194,40 @@ bool sparc64_emit_movcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     if (d->cond == 8U) {
         e_src2(b, ES0, d);
         e_st64(b, d->rd, ES0);
+        b->gpr_cache_valid &=
+            (uint8_t)(~(1U << ((((unsigned)d->rd) & 31U) & 7U)));
         return !b->overflow;
     }
     if (d->cond == 0U) {
         return true;
+    }
+    if ((d->cc & 4U) != 0U) {
+        unsigned idx = d->cc & 3U;
+        unsigned sh = (idx == 0U) ? 10U : (30U + 2U * idx);
+        size_t p_have;
+        sb_ldst_imm(b, true, false, ES0, ECTX, 0x240U + idx * 4U);
+        sb_ldst_imm(b, true, true, ES2, ECTX, SPARC64_CTX_FSR_OFFSET);
+        sb_ubfm(b, true, ES2, ES2, sh, sh + 1U);
+        p_have = sb_cbz_placeholder(b, false, true, ES0);
+        if (p_have == SPARC64_DBT_NOPOS) {
+            return false;
+        }
+        sb_orr_reg(b, false, ES0, 31U, ES2);
+        sb_patch_cb(b, p_have, b->count);
+        sb_ubfm(b, false, ES0, ES0, 0U, 1U);
+        sb_mov_imm32(b, ES2, fcond_mask[d->cond & 15U]);
+        sb_lsrv(b, false, ES2, ES2, ES0);
+        sb_ubfm(b, false, ES2, ES2, 0U, 0U);
+        e_src2(b, ES1, d);
+        p_skip = sb_cbz_placeholder(b, false, false, ES2);
+        if (p_skip == SPARC64_DBT_NOPOS) {
+            return false;
+        }
+        e_st64(b, d->rd, ES1);
+        sb_patch_cb(b, p_skip, b->count);
+        b->gpr_cache_valid &=
+            (uint8_t)(~(1U << ((((unsigned)d->rd) & 31U) & 7U)));
+        return !b->overflow;
     }
     if (nzcv_fast_cond(b, d->cond, d->cc == 2U, &acond)) {
         e_src2(b, ES1, d);

@@ -603,6 +603,10 @@ long sparc64_sync_sig_return(sparc64_ctx_t *ctx,
             ctx->fp.d[i] = get_u64be(&tail[8U * (uint64_t)i]);
         }
         ctx->fsr = get_u64be(&tail[8U * 32U]);
+        ctx->fcc[0] = (uint8_t)((ctx->fsr >> 10) & UINT64_C(3));
+        ctx->fcc[1] = (uint8_t)((ctx->fsr >> 32) & UINT64_C(3));
+        ctx->fcc[2] = (uint8_t)((ctx->fsr >> 34) & UINT64_C(3));
+        ctx->fcc[3] = (uint8_t)((ctx->fsr >> 36) & UINT64_C(3));
         ctx->gsr = get_u64be(&tail[8U * 33U]);
         ctx->fprs = get_u64be(&tail[8U * 34U]);
     }

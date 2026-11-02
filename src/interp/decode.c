@@ -1,86 +1,188 @@
 /*
- * src/interp/decode.c — SPARC V9 base integer instruction decoder
+ * src/interp/decode.c — SPARC V9 unified instruction decoder
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 1 lane L1a (SPEC section 2, experiments/E01..E06). Big-endian
- * fetch plus op/op2/op3 dispatch into sparc64_decoded_t. Execution
- * semantics belong to lane L1b; FPU execution belongs to Phase 3.
- *
- * Every multi-bit layout below is verified against sparc64-linux-gnu
- * GAS + objdump ground truth from the qemu-sparc64 oracle image; the
- * trickier derivations are recorded here so L1b/L2 never re-derive them:
- * - BPcc: a(29) cond(28:25) op2=001 cc(21:20: 0=icc, 2=xcc) p(19)
- *   disp19(18:0). BPr: a(29) rcond(27:25) op2=011 p(19) d16hi(21:20)
- *   rs1(18:14) d16lo(13:0); bit 28 reserved-0, rcond 0/4 reserved.
- * - MOVcc: op3 0x2c, bit 18 fixed-1, cond(17:14), cc = bit 12
- *   (0=icc, 1=xcc). MOVr: op3 0x2f, rs1(18:14), rcond(12:10, same
- *   numbering as BPr), simm10(9:0, sign-extended per E03).
- * - Tcc: cond(28:25), cc(12:11: 0=icc, 2=xcc, 1/3 reserved).
- * - CASA/CASXA address is always [rs1] (no offset); the i bit selects
- *   the ASI source (0 = imm bits 12:5, 1 = %asi register, E03).
- *   Alternate loads/stores carry imm ASI in 12:5, so i == 1 is
- *   unencodable there (illegal); CASA/CASXA are exempt (no simm).
- * - Privileged aliases: MEMBAR is op3 0x28/rs1 15; SIR is op3 0x30/
- *   rd 15; SAVED/RESTORED are op3 0x31 with rd 0/1; DONE/RETRY are
- *   op3 0x3e with rd 0/1 (all PRIV). RDHPR is 0x29, RDPR is 0x2a,
- *   WRPR is 0x32, WRHPR is 0x33 (all PRIV; binutils-verified).
- * - LDX 0x0b vs STX 0x0e asymmetry; LDXA 0x1b/STXA 0x1e; twin-word
- *   LDD/STD/LDDA/STDA ("TW/TWA") need an even rd; tagged op3 order is
- *   0x20 TADDcc, 0x21 TSUBcc, 0x22 TADDccTV, 0x23 TSUBccTV.
+ * Single source of truth for SPARC V9 instruction classification and
+ * field extraction across the interpreter, DBT, and lockstep harness.
+ * sparc64_classify_word populates sparc64_dec_t; sparc64_decode_word
+ * adapts the same decode into sparc64_decoded_t so no duplicate opcode
+ * tables can drift.
  */
 
 #include "interp/decode.h"
+#include "interp/interp.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "core/cpu.h"
 
-/* Sign-extend the low n bits of v (1 <= n <= 31). Branchless and fully
- * defined: the old ((v << shift) >> shift) form shifted right as UNSIGNED
- * (logical shift), discarding the sign it had just shifted into bit 31. */
-static int32_t sign_extend(uint32_t v, uint32_t n)
-{
-    uint32_t m = 1U << (n - 1U);
-    uint32_t x = v & ((1U << n) - 1U);
+static void sparc64_decode_op2(sparc64_dec_t *d, uint32_t word, unsigned op3,
+    unsigned rd, unsigned rs1, unsigned i);
+static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
+    unsigned rd, unsigned rs1, unsigned i);
 
-    return (int32_t)((x ^ m) - m);
+/* Bit-field and sign-extension helpers (inclusive hi..lo). */
+static unsigned fld(uint32_t w, unsigned hi, unsigned lo)
+{
+    return (unsigned)((w >> lo) &
+        (uint32_t)(((UINT64_C(1) << (hi - lo + 1U)) - UINT64_C(1))));
 }
 
-/* op == 2 ALU membership (integer operate incl. tagged, MULX/SDIVX/
- * UDIVX/POPC, MULScc). 0x19/0x1d are reserved (illegal). */
-static int is_alu_op3(uint32_t op3)
+static int64_t sx(uint64_t v, unsigned n)
 {
+    uint64_t m = UINT64_C(1) << (n - 1U);
+    return (int64_t)((v ^ m) - m);
+}
+
+static bool rcond_valid(unsigned rcond)
+{
+    return rcond == 1U || rcond == 2U || rcond == 3U || rcond == 5U ||
+        rcond == 6U || rcond == 7U;
+}
+
+/* Pure word classifier: fills *d for any raw word. Illegal words yield
+ * SPARC64_ICLS_ILLEGAL; execution traps them in step. */
+void sparc64_classify_word(uint32_t word, sparc64_dec_t *d)
+{
+    unsigned op;
+    d->raw = word;
+    d->cls = SPARC64_ICLS_ILLEGAL;
+    d->op = 0U;
+    d->op3 = 0U;
+    d->rd = 0U;
+    d->rs1 = 0U;
+    d->rs2 = 0U;
+    d->cond = 0U;
+    d->cc = 0U;
+    d->asi = 0U;
+    d->regasi = 0U;
+    d->annul = 0U;
+    d->pred = 0U;
+    d->is_imm = 0U;
+    d->xbit = 0U;
+    d->imm = 0;
+    d->disp = 0;
+    d->opf = 0U;
+    d->uimm = 0U;
+    op = fld(word, 31U, 30U);
+    d->op = (uint8_t)op;
+    if (op == 1U) {
+        d->cls = SPARC64_ICLS_CALL;
+        d->disp = sx(word & UINT32_C(0x3FFFFFFF), 30U) * INT64_C(4);
+        return;
+    }
+    if (op == 0U) {
+        unsigned op2 = fld(word, 24U, 22U);
+        if (op2 == 1U) {
+            unsigned cc = fld(word, 21U, 20U);
+            if (cc != 0U && cc != 2U) {
+                return;
+            }
+            d->cls = SPARC64_ICLS_BPCC;
+            d->annul = (uint8_t)fld(word, 29U, 29U);
+            d->cond = (uint8_t)fld(word, 28U, 25U);
+            d->cc = (uint8_t)cc;
+            d->pred = (uint8_t)fld(word, 19U, 19U);
+            d->disp = sx(fld(word, 18U, 0U), 19U) * INT64_C(4);
+            return;
+        }
+        if (op2 == 2U) {
+            d->cls = SPARC64_ICLS_BICC;
+            d->annul = (uint8_t)fld(word, 29U, 29U);
+            d->cond = (uint8_t)fld(word, 28U, 25U);
+            d->disp = sx(fld(word, 21U, 0U), 22U) * INT64_C(4);
+            return;
+        }
+        if (op2 == 3U) {
+            unsigned rcond = fld(word, 28U, 25U);
+            uint32_t d16;
+            if (!rcond_valid(rcond)) {
+                return;
+            }
+            d->cls = SPARC64_ICLS_BPR;
+            d->annul = (uint8_t)fld(word, 29U, 29U);
+            d->cond = (uint8_t)rcond;
+            d->pred = (uint8_t)fld(word, 19U, 19U);
+            d->rs1 = (uint8_t)fld(word, 18U, 14U);
+            d16 = (fld(word, 21U, 20U) << 14) | fld(word, 13U, 0U);
+            d->disp = sx(d16, 16U) * INT64_C(4);
+            return;
+        }
+        if (op2 == 4U) {
+            d->cls = SPARC64_ICLS_SETHI;
+            d->rd = (uint8_t)fld(word, 29U, 25U);
+            d->uimm = fld(word, 21U, 0U);
+            return;
+        }
+        if (op2 == 5U) {
+            /* FBfcc: a(29) cond(28:25) fcc(21:20); bit 19 is the static
+             * prediction hint (ignored, like BPcc pred); disp19 is
+             * bits 18:0 (oracle-probed). op2 == 6 stays ILLEGAL:
+             * qemu-sparc64 kills it, so it never decodes as a branch. */
+            d->cls = SPARC64_ICLS_FBR;
+            d->annul = (uint8_t)fld(word, 29U, 29U);
+            d->cond = (uint8_t)fld(word, 28U, 25U);
+            d->cc = (uint8_t)fld(word, 21U, 20U);
+            d->pred = (uint8_t)fld(word, 19U, 19U);
+            d->disp = sx(fld(word, 18U, 0U), 19U) * INT64_C(4);
+            return;
+        }
+        d->uimm = word & 0x3FFFFFU;
+        return;
+    }
+    if (op == 2U || op == 3U) {
+        unsigned op3 = fld(word, 24U, 19U);
+        unsigned rd = fld(word, 29U, 25U);
+        unsigned rs1 = fld(word, 18U, 14U);
+        unsigned i = fld(word, 13U, 13U);
+        d->op3 = (uint8_t)op3;
+        d->rd = (uint8_t)rd;
+        d->rs1 = (uint8_t)rs1;
+        d->is_imm = (uint8_t)i;
+        if (op == 2U) {
+            sparc64_decode_op2(d, word, op3, rd, rs1, i);
+            return;
+        }
+        sparc64_decode_op3(d, word, op3, rd, rs1, i);
+        return;
+    }
+}
+
+/* Format-3 ALU/misc classifier (op == 2). */
+static void sparc64_decode_op2(sparc64_dec_t *d, uint32_t word, unsigned op3,
+    unsigned rd, unsigned rs1, unsigned i)
+{
+    /* Integer ALU (dual-width cc), MULX/DIVX/POPC, TADD/TSUB, MULScc. */
     switch (op3) {
-    case 0x00U:
-    case 0x01U:
-    case 0x02U:
-    case 0x03U:
-    case 0x04U:
-    case 0x05U:
-    case 0x06U:
-    case 0x07U:
-    case 0x08U:
+    case SPARC64_OP3_ADD:
+    case SPARC64_OP3_AND:
+    case SPARC64_OP3_OR:
+    case SPARC64_OP3_XOR:
+    case SPARC64_OP3_SUB:
+    case SPARC64_OP3_ANDN:
+    case SPARC64_OP3_ORN:
+    case SPARC64_OP3_XORN:
+    case SPARC64_OP3_ADDX:
     case SPARC64_OP3_MULX:
     case SPARC64_OP3_UMUL:
     case SPARC64_OP3_SMUL:
     case SPARC64_OP3_SUBX:
     case SPARC64_OP3_UDIVX:
-    case SPARC64_OP3_SDIVX:
-    case SPARC64_OP3_POPC:
     case SPARC64_OP3_UDIV:
     case SPARC64_OP3_SDIV:
-    case 0x10U:
-    case 0x11U:
-    case 0x12U:
-    case 0x13U:
-    case 0x14U:
-    case 0x15U:
-    case 0x16U:
-    case 0x17U:
-    case 0x18U:
+    case SPARC64_OP3_ADDCC:
+    case SPARC64_OP3_ANDCC:
+    case SPARC64_OP3_ORCC:
+    case SPARC64_OP3_XORCC:
+    case SPARC64_OP3_SUBCC:
+    case SPARC64_OP3_ANDNCC:
+    case SPARC64_OP3_ORNCC:
+    case SPARC64_OP3_XORNCC:
+    case SPARC64_OP3_ADDXCC:
     case SPARC64_OP3_UMULCC:
     case SPARC64_OP3_SMULCC:
     case SPARC64_OP3_SUBXCC:
@@ -88,24 +190,300 @@ static int is_alu_op3(uint32_t op3)
     case SPARC64_OP3_SDIVCC:
     case SPARC64_OP3_TADDCC:
     case SPARC64_OP3_TSUBCC:
-    case SPARC64_OP3_TADDCCTV:
-    case SPARC64_OP3_TSUBCCTV:
+    case SPARC64_OP3_TADDCTV:
+    case SPARC64_OP3_TSUBCTV:
     case SPARC64_OP3_MULSCC:
-        return 1;
+    case SPARC64_OP3_SDIVX:
+    case SPARC64_OP3_POPC:
+        if (op3 == SPARC64_OP3_TADDCC && rd == 31U && rs1 == 0U &&
+            i == 1U) {
+            /* SIR (software-initiated reset) shares the TADDcc opcode. */
+            d->cls = SPARC64_ICLS_PRIV;
+            return;
+        }
+        d->cls = SPARC64_ICLS_ALU;
+        if (i != 0U) {
+            d->imm = sx(fld(word, 12U, 0U), 13U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    case SPARC64_OP3_SLL:
+    case SPARC64_OP3_SRL:
+    case SPARC64_OP3_SRA:
+        d->cls = SPARC64_ICLS_SHIFT;
+        d->xbit = (uint8_t)fld(word, 12U, 12U);
+        if (i != 0U) {
+            d->imm = (int64_t)fld(word, 11U, 0U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    case SPARC64_OP3_MOVCC: {
+        unsigned cc2 = fld(word, 18U, 18U);
+        unsigned cc = fld(word, 12U, 11U);
+        /* cc2 == 1 selects integer %icc (cc=0) / %xcc (cc=2);
+         * cc2 == 0 selects FP %fcc0..%fcc3 (encoded as 4 | cc). */
+        if (cc2 != 0U && cc != 0U && cc != 2U) {
+            return;
+        }
+        d->cls = SPARC64_ICLS_MOVCC;
+        d->cond = (uint8_t)fld(word, 17U, 14U);
+        d->cc = (uint8_t)((cc2 != 0U) ? cc : (4U | cc));
+        if (i != 0U) {
+            d->imm = sx(fld(word, 10U, 0U), 11U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    }
+    case SPARC64_OP3_MOVR: {
+        unsigned rcond = fld(word, 12U, 10U);
+        if (!rcond_valid(rcond)) {
+            return;
+        }
+        d->cls = SPARC64_ICLS_MOVR;
+        d->cond = (uint8_t)rcond;
+        if (i != 0U) {
+            d->imm = sx(fld(word, 9U, 0U), 10U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    }
+    case SPARC64_OP3_RDASR:
+        if (rs1 == 15U) {
+            /* MEMBAR shares the RDASR opcode (ordering hint: nop). */
+            d->cls = SPARC64_ICLS_MEMBAR;
+            return;
+        }
+        if (rs1 == SPARC64_ASR_Y || rs1 == SPARC64_ASR_CCR ||
+            rs1 == SPARC64_ASR_ASI || rs1 == SPARC64_ASR_PC ||
+            rs1 == SPARC64_ASR_FPRS || rs1 == SPARC64_ASR_GSR ||
+            rs1 == SPARC64_ASR_TICK) {
+            d->cls = SPARC64_ICLS_RDASR;
+            return;
+        }
+        if (rs1 >= 20U && rs1 <= 25U) {
+            d->cls = SPARC64_ICLS_PRIV;
+            return;
+        }
+        return;
+    case SPARC64_OP3_WRASR:
+        if (rd == 15U) {
+            d->cls = SPARC64_ICLS_PRIV;
+            return;
+        }
+        if (rd == SPARC64_ASR_Y || rd == SPARC64_ASR_CCR ||
+            rd == SPARC64_ASR_ASI || rd == SPARC64_ASR_FPRS ||
+            rd == SPARC64_ASR_GSR) {
+            d->cls = SPARC64_ICLS_WRASR;
+            if (i != 0U) {
+                d->imm = sx(fld(word, 12U, 0U), 13U);
+            } else {
+                d->rs2 = (uint8_t)fld(word, 4U, 0U);
+            }
+            return;
+        }
+        if (rd == SPARC64_ASR_TICK || rd == SPARC64_ASR_PC ||
+            (rd >= 20U && rd <= 25U)) {
+            d->cls = SPARC64_ICLS_PRIV;
+            return;
+        }
+        return;
+    case SPARC64_OP3_RDPR:
+    case SPARC64_OP3_RDHPR:
+    case SPARC64_OP3_FLUSHW:
+    case SPARC64_OP3_SAVED:
+    case SPARC64_OP3_WRPR:
+    case SPARC64_OP3_WRHPR:
+    case SPARC64_OP3_DONE:
+    case SPARC64_OP3_RETRY:
+        if ((op3 == SPARC64_OP3_SAVED || op3 == SPARC64_OP3_DONE ||
+                op3 == SPARC64_OP3_RETRY) &&
+            rd != 0U && rd != 1U) {
+            return;
+        }
+        d->cls = SPARC64_ICLS_PRIV;
+        return;
+    case SPARC64_OP3_FPOP1:
+    case SPARC64_OP3_FPOP2:
+        d->cls = SPARC64_ICLS_FPU;
+        d->opf = fld(word, 13U, 5U);
+        d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        return;
+    case SPARC64_OP3_VIS: {
+        uint32_t opf = fld(word, 13U, 5U);
+        d->opf = opf;
+        if (opf == SPARC64_OPF_ALIGNADDR ||
+            opf == SPARC64_OPF_ALIGNADDRL) {
+            d->cls = SPARC64_ICLS_ALIGN;
+            if (i != 0U) {
+                d->imm = sx(fld(word, 12U, 0U), 13U);
+            } else {
+                d->rs2 = (uint8_t)fld(word, 4U, 0U);
+            }
+            return;
+        }
+        d->cls = SPARC64_ICLS_FPU;
+        d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        return;
+    }
+    case SPARC64_OP3_JMPL:
+        d->cls = SPARC64_ICLS_JMPL;
+        if (i != 0U) {
+            d->imm = sx(fld(word, 12U, 0U), 13U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    case SPARC64_OP3_RETURN:
+        d->cls = SPARC64_ICLS_RETURN;
+        if (i != 0U) {
+            d->imm = sx(fld(word, 12U, 0U), 13U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    case SPARC64_OP3_TCC: {
+        unsigned cc = fld(word, 12U, 11U);
+        if (cc != 0U && cc != 2U) {
+            return;
+        }
+        d->cls = SPARC64_ICLS_TCC;
+        d->cond = d->rd;
+        d->cc = (uint8_t)cc;
+        if (i != 0U) {
+            if (fld(word, 10U, 7U) != 0U) {
+                d->cls = SPARC64_ICLS_ILLEGAL;
+                return;
+            }
+            d->imm = (int64_t)fld(word, 6U, 0U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    }
+    case SPARC64_OP3_FLUSH:
+        d->cls = SPARC64_ICLS_FLUSH;
+        if (i != 0U) {
+            d->imm = sx(fld(word, 12U, 0U), 13U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    case SPARC64_OP3_SAVE:
+        d->cls = SPARC64_ICLS_SAVE;
+        if (i != 0U) {
+            d->imm = sx(fld(word, 12U, 0U), 13U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
+    case SPARC64_OP3_RESTORE:
+        d->cls = SPARC64_ICLS_RESTORE;
+        if (i != 0U) {
+            d->imm = sx(fld(word, 12U, 0U), 13U);
+        } else {
+            d->rs2 = (uint8_t)fld(word, 4U, 0U);
+        }
+        return;
     default:
-        return 0;
+        return;
     }
 }
 
-/* Doubleword/twin-word memory ops need an even rd. */
-static int is_double_mem_op3(uint32_t op3)
+/* Format-3 memory classifier (op == 3). */
+static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
+    unsigned rd, unsigned rs1, unsigned i)
 {
-    return op3 == SPARC64_OP3_LDD || op3 == SPARC64_OP3_STD ||
-        op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA;
-}
-
-static int is_load_op3(uint32_t op3)
-{
+    bool alt;
+    (void)rd;
+    (void)rs1;
+    switch (op3) {
+    case SPARC64_OP3_LDUW:
+    case SPARC64_OP3_LDUB:
+    case SPARC64_OP3_LDUH:
+    case SPARC64_OP3_LDD:
+    case SPARC64_OP3_STW:
+    case SPARC64_OP3_STB:
+    case SPARC64_OP3_STH:
+    case SPARC64_OP3_STD:
+    case SPARC64_OP3_LDSW:
+    case SPARC64_OP3_LDSB:
+    case SPARC64_OP3_LDSH:
+    case SPARC64_OP3_LDX:
+    case SPARC64_OP3_STX:
+    case SPARC64_OP3_LDSTUB:
+    case SPARC64_OP3_SWAP:
+    case SPARC64_OP3_LDA:
+    case SPARC64_OP3_LDUBA:
+    case SPARC64_OP3_LDUHA:
+    case SPARC64_OP3_LDDA:
+    case SPARC64_OP3_STA:
+    case SPARC64_OP3_STBA:
+    case SPARC64_OP3_STHA:
+    case SPARC64_OP3_STDA:
+    case SPARC64_OP3_LDSWA:
+    case SPARC64_OP3_LDSBA:
+    case SPARC64_OP3_LDSHA:
+    case SPARC64_OP3_LDXA:
+    case SPARC64_OP3_STXA:
+    case SPARC64_OP3_LDSTUBA:
+    case SPARC64_OP3_SWAPA:
+    case SPARC64_OP3_CASA:
+    case SPARC64_OP3_CASXA:
+    case SPARC64_OP3_LDFSR:
+    case SPARC64_OP3_STFSR:
+    case SPARC64_OP3_LDFA:
+    case SPARC64_OP3_LDDFA:
+    case SPARC64_OP3_STFA:
+    case SPARC64_OP3_STDFA:
+        break;
+    case SPARC64_OP3_PREFETCH:
+        d->cls = SPARC64_ICLS_FLUSH;
+        return;
+    default:
+        if (op3 == SPARC64_OP3_LDF || op3 == SPARC64_OP3_LDTW ||
+            op3 == SPARC64_OP3_LDDF || op3 == SPARC64_OP3_STF ||
+            op3 == SPARC64_OP3_STTW || op3 == SPARC64_OP3_STDF) {
+            d->cls = SPARC64_ICLS_FPU;
+            if (i != 0U) {
+                d->imm = sx(fld(word, 12U, 0U), 13U);
+            } else {
+                d->rs2 = (uint8_t)fld(word, 4U, 0U);
+            }
+        }
+        return;
+    }
+    alt = (op3 >= SPARC64_OP3_LDA && op3 <= SPARC64_OP3_SWAPA) ||
+        op3 == SPARC64_OP3_CASA || op3 == SPARC64_OP3_CASXA ||
+        (op3 >= SPARC64_OP3_LDFA && op3 <= SPARC64_OP3_STDFA);
+    if ((op3 == SPARC64_OP3_LDD || op3 == SPARC64_OP3_STD ||
+            op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA) &&
+        (d->rd & 1U) != 0U) {
+        d->cls = SPARC64_ICLS_ILLEGAL;
+        return;
+    }
+    if (alt) {
+        if (i == 0U) {
+            d->asi = (uint8_t)fld(word, 12U, 5U);
+        } else {
+            d->asi = 0xFFU;
+            d->regasi = 1U;
+        }
+    }
+    if (i != 0U) {
+        d->imm = sx(fld(word, 12U, 0U), 13U);
+    } else {
+        d->rs2 = (uint8_t)fld(word, 4U, 0U);
+    }
+    if (op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA ||
+        op3 == SPARC64_OP3_LDFA || op3 == SPARC64_OP3_LDDFA ||
+        op3 == SPARC64_OP3_STFA || op3 == SPARC64_OP3_STDFA) {
+        d->cls = SPARC64_ICLS_FPU;
+        return;
+    }
     switch (op3) {
     case SPARC64_OP3_LDUW:
     case SPARC64_OP3_LDUB:
@@ -115,7 +493,6 @@ static int is_load_op3(uint32_t op3)
     case SPARC64_OP3_LDSB:
     case SPARC64_OP3_LDSH:
     case SPARC64_OP3_LDX:
-    case SPARC64_OP3_LDSTUB:
     case SPARC64_OP3_LDA:
     case SPARC64_OP3_LDUBA:
     case SPARC64_OP3_LDUHA:
@@ -124,16 +501,9 @@ static int is_load_op3(uint32_t op3)
     case SPARC64_OP3_LDSBA:
     case SPARC64_OP3_LDSHA:
     case SPARC64_OP3_LDXA:
-    case SPARC64_OP3_LDSTUBA:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static int is_store_op3(uint32_t op3)
-{
-    switch (op3) {
+    case SPARC64_OP3_LDFSR:
+        d->cls = SPARC64_ICLS_LOAD;
+        return;
     case SPARC64_OP3_STW:
     case SPARC64_OP3_STB:
     case SPARC64_OP3_STH:
@@ -144,436 +514,117 @@ static int is_store_op3(uint32_t op3)
     case SPARC64_OP3_STHA:
     case SPARC64_OP3_STDA:
     case SPARC64_OP3_STXA:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static int is_fp_mem_op3(uint32_t op3)
-{
-    return op3 >= SPARC64_OP3_LDF && op3 <= SPARC64_OP3_STDF;
-}
-
-/* FP alternate-space group (V9 0x30-0x37, imm ASI or %asi form). Only
- * the architecturally assigned LDFA/LDDFA/STFA/STDFA members classify;
- * 0x31/0x32/0x35/0x36 stay illegal. Matches the DBT classifier in
- * src/interp/interp.c (sparc64_decode_op3) and the Phase 3 executor. */
-static int is_fp_alt_op3(uint32_t op3)
-{
-    return op3 == SPARC64_OP3_LDFA || op3 == SPARC64_OP3_LDDFA ||
-        op3 == SPARC64_OP3_STFA || op3 == SPARC64_OP3_STDFA;
-}
-
-/* Alternate-space memory ops (imm ASI in bits 12:5). */
-static int is_alternate_op3(uint32_t op3)
-{
-    return op3 >= SPARC64_OP3_LDA && op3 <= SPARC64_OP3_SWAPA;
-}
-
-/* RDASR user register numbers (GAS-verified; other values illegal here). */
-static int is_user_asr(uint32_t asr)
-{
-    return asr == SPARC64_ASR_Y || asr == SPARC64_ASR_CCR ||
-        asr == SPARC64_ASR_ASI || asr == SPARC64_ASR_TICK ||
-        asr == SPARC64_ASR_PC || asr == SPARC64_ASR_FPRS ||
-        asr == SPARC64_ASR_GSR;
-}
-
-/* WRASR user register numbers: %tick (GAS-rejected) and %pc (read-only)
- * are not writable, so they stay illegal here. */
-static int is_wrasr_asr(uint32_t asr)
-{
-    return asr == SPARC64_ASR_Y || asr == SPARC64_ASR_CCR ||
-        asr == SPARC64_ASR_ASI || asr == SPARC64_ASR_FPRS ||
-        asr == SPARC64_ASR_GSR;
-}
-
-/* Assigned BPr/MOVr register-test conditions (0 and 4 reserved). */
-static int is_rcond(uint32_t rcond)
-{
-    return rcond == SPARC64_RCOND_Z || rcond == SPARC64_RCOND_LEZ ||
-        rcond == SPARC64_RCOND_LZ || rcond == SPARC64_RCOND_NZ ||
-        rcond == SPARC64_RCOND_GZ || rcond == SPARC64_RCOND_GEZ;
-}
-
-static void decode_op0(uint32_t word, sparc64_decoded_t *out)
-{
-    uint32_t op2 = (word >> 22) & 0x7U;
-
-    out->op2 = op2;
-    if (op2 == 0x4U) {
-        out->cls = SPARC64_OP_SETHI;
-        out->rd = (word >> 25) & 0x1FU;
-        out->uimm = word & 0x3FFFFFU;
+    case SPARC64_OP3_STFSR:
+        d->cls = SPARC64_ICLS_STORE;
         return;
-    }
-    if (op2 == 0x2U) {
-        out->cls = SPARC64_OP_BRANCH;
-        out->annul = (word >> 29) & 0x1U;
-        out->cond = (word >> 25) & 0x0FU;
-        out->disp = sign_extend(word & 0x3FFFFFU, 22U) << 2;
+    case SPARC64_OP3_LDSTUB:
+    case SPARC64_OP3_LDSTUBA:
+        d->cls = SPARC64_ICLS_LDSTUB;
         return;
-    }
-    if (op2 == 0x1U) {
-        uint32_t cc = (word >> 20) & 0x3U;
-
-        if (cc != SPARC64_CC_ICC && cc != SPARC64_CC_XCC) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_BPBRANCH;
-        out->annul = (word >> 29) & 0x1U;
-        out->cond = (word >> 25) & 0x0FU;
-        out->cc_sel = cc;
-        out->pred = (word >> 19) & 0x1U;
-        out->disp = sign_extend(word & 0x7FFFFU, 19U) << 2;
-        return;
-    }
-    if (op2 == 0x3U) {
-        uint32_t hi = (word >> 20) & 0x3U;
-        uint32_t lo = word & 0x3FFFU;
-        uint32_t rcond = (word >> 25) & 0x7U;
-
-        if (!is_rcond(rcond)) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_BPR;
-        out->annul = (word >> 29) & 0x1U;
-        out->rcond = rcond;
-        out->pred = (word >> 19) & 0x1U;
-        out->rs1 = (word >> 14) & 0x1FU;
-        out->disp = sign_extend((hi << 14) | lo, 16U) << 2;
-        return;
-    }
-    if (op2 == 0x5U || op2 == 0x6U) {
-        out->cls = SPARC64_OP_FBRANCH;
-        out->annul = (word >> 29) & 0x1U;
-        out->cond = (word >> 25) & 0x0FU;
-        out->cc_sel = (word >> 20) & 0x3U;
-        out->pred = (word >> 19) & 0x1U;
-        out->disp = sign_extend(word & 0x7FFFFU, 19U) << 2;
-        return;
-    }
-    /* op2 == 0 is ILLTRAP (const22 trap operand); 1/3/5/7 handled
-     * above, so 7 (and any gap) is illegal on this V9 target. */
-    out->uimm = word & 0x3FFFFFU;
-    out->cls = SPARC64_OP_ILLEGAL;
-}
-
-static void decode_op2(uint32_t word, sparc64_decoded_t *out)
-{
-    uint32_t op3 = (word >> 19) & 0x3FU;
-    uint32_t rd = (word >> 25) & 0x1FU;
-    uint32_t rs1 = (word >> 14) & 0x1FU;
-    uint32_t i = (word >> 13) & 0x1U;
-
-    out->op3 = op3;
-    out->rd = rd;
-    out->rs1 = rs1;
-    out->is_imm = i;
-    if (i != 0U) {
-        out->simm = sign_extend(word & 0x1FFFU, 13U);
-    } else {
-        out->asi = (word >> 5) & 0xFFU;
-        out->rs2 = word & 0x1FU;
-    }
-
-    if (is_alu_op3(op3)) {
-        out->cls = SPARC64_OP_ALU;
-        /* Only 0x10..0x24 update icc + xcc; MULX/UDIVX/SDIVX/POPC and
-         * the plain 0x00..0x0f row do not. */
-        out->cc = (op3 >= 0x10U && op3 <= 0x24U) ? 1U : 0U;
-        return;
-    }
-
-    switch (op3) {
-    case SPARC64_OP3_SLL:
-    case SPARC64_OP3_SRL:
-    case SPARC64_OP3_SRA:
-        out->cls = SPARC64_OP_SHIFT;
-        out->xbit = (word >> 12) & 0x1U;
-        return;
-    case SPARC64_OP3_RDASR:
-        if (rs1 == 0xFU) {
-            /* MEMBAR shares the RDASR opcode (objdump-verified). */
-            out->cls = SPARC64_OP_MEMBAR;
-            return;
-        }
-        if (!is_user_asr(rs1)) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_RDASR;
-        out->asr = rs1;
-        return;
-    case SPARC64_OP3_RDHPR:
-    case SPARC64_OP3_RDPR:
-    case SPARC64_OP3_FLUSHW:
-        out->cls = SPARC64_OP_PRIV;
-        return;
-    case SPARC64_OP3_MOVCC: {
-        uint32_t cc = (word >> 12) & 0x1U;
-
-        if (((word >> 18) & 0x1U) == 0U) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_MOVCC;
-        out->cond = (word >> 14) & 0x0FU;
-        out->cc_sel = cc;
-        out->rs1 = 0U;
-        return;
-    }
-    case SPARC64_OP3_MOVR: {
-        uint32_t rcond = (word >> 10) & 0x7U;
-
-        if (!is_rcond(rcond)) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_MOVR;
-        out->rcond = rcond;
-        if (i != 0U) {
-            out->simm = sign_extend(word & 0x3FFU, 10U);
-        }
-        return;
-    }
-    case SPARC64_OP3_WRASR:
-        if (rd == 0xFU) {
-            /* SIR shares the WRASR opcode (software-initiated reset). */
-            out->cls = SPARC64_OP_PRIV;
-            return;
-        }
-        if (!is_wrasr_asr(rd)) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_WRASR;
-        out->asr = rd;
-        return;
-    case SPARC64_OP3_SAVED:
-        /* SAVED (rd 0) / RESTORED (rd 1); other rd values unassigned. */
-        if (rd != 0U && rd != 1U) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_PRIV;
-        return;
-    case SPARC64_OP3_WRPR:
-    case SPARC64_OP3_WRHPR:
-        out->cls = SPARC64_OP_PRIV;
-        return;
-    case SPARC64_OP3_FPOP1:
-    case SPARC64_OP3_FPOP2:
-    case 0x37U: /* IMPDEP2 (VIS BSHUFFLE space): Phase 3 marker. */
-        out->cls = SPARC64_OP_FPU;
-        out->is_imm = 0U;
-        out->simm = 0;
-        out->asi = 0U;
-        out->opf = (word >> 5) & 0x1FFU;
-        out->rs2 = word & 0x1FU;
-        return;
-    case SPARC64_OP3_ALIGN:
-        out->cls = SPARC64_OP_ALIGN;
-        return;
-    case SPARC64_OP3_JMPL:
-        out->cls = SPARC64_OP_JMPL;
-        return;
-    case SPARC64_OP3_RETURN:
-        out->cls = SPARC64_OP_RETURN;
-        return;
-    case SPARC64_OP3_TCC: {
-        uint32_t cc = (word >> 11) & 0x3U;
-
-        if (cc != SPARC64_CC_ICC && cc != SPARC64_CC_XCC) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_TRAP;
-        out->cond = (word >> 25) & 0x0FU;
-        out->cc_sel = cc;
-        return;
-    }
-    case SPARC64_OP3_FLUSH:
-        out->cls = SPARC64_OP_FLUSH;
-        return;
-    case SPARC64_OP3_SAVE:
-        out->cls = SPARC64_OP_SAVE;
-        return;
-    case SPARC64_OP3_RESTORE:
-        out->cls = SPARC64_OP_RESTORE;
-        return;
-    case SPARC64_OP3_DONE:
-        /* DONE (rd 0) / RETRY (rd 1); other rd values unassigned. */
-        if (rd != 0U && rd != 1U) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_PRIV;
+    case SPARC64_OP3_SWAP:
+    case SPARC64_OP3_SWAPA:
+        d->cls = SPARC64_ICLS_SWAP;
         return;
     default:
-        /* Reserved ALU (0x19/0x1d), RDHPR-slot 0x2a, 0x32: illegal. */
-        out->cls = SPARC64_OP_ILLEGAL;
+        d->cls = SPARC64_ICLS_ATOMIC;
         return;
     }
-}
-
-static void decode_casa(uint32_t word, sparc64_decoded_t *out, uint32_t cls)
-{
-    uint32_t i = (word >> 13) & 0x1U;
-    uint32_t asi = (word >> 5) & 0xFFU;
-
-    /* The CASA address is always [rs1] with no offset; the i bit selects
-     * the ASI source (E03): 0 takes the imm ASI from bits 12:5, 1 takes
-     * the %asi register. There is no simm form. */
-    out->is_imm = 0U;
-    out->simm = 0;
-    out->asi = asi;
-    out->rs2 = word & 0x1FU;
-    out->atomic = 1U;
-    if (i == 0U) {
-        out->regasi = 0U;
-        if (asi < SPARC64_ASI_PRIMARY) {
-            /* V9 ASIs below 0x80 trap privileged_action (E03 0x37). */
-            out->cls = SPARC64_OP_PRIV;
-            return;
-        }
-        out->cls = cls;
-        return;
-    }
-    out->regasi = 1U;
-    out->cls = cls;
-}
-
-static void decode_op3(uint32_t word, sparc64_decoded_t *out)
-{
-    uint32_t op3 = (word >> 19) & 0x3FU;
-    uint32_t rd = (word >> 25) & 0x1FU;
-    uint32_t rs1 = (word >> 14) & 0x1FU;
-    uint32_t i = (word >> 13) & 0x1U;
-
-    out->op3 = op3;
-    out->rd = rd;
-    out->rs1 = rs1;
-    out->is_imm = i;
-    if (i != 0U) {
-        out->simm = sign_extend(word & 0x1FFFU, 13U);
-    } else {
-        out->asi = (word >> 5) & 0xFFU;
-        out->rs2 = word & 0x1FU;
-    }
-
-    if (op3 == SPARC64_OP3_CASA) {
-        decode_casa(word, out, SPARC64_OP_CASA);
-        return;
-    }
-    if (op3 == SPARC64_OP3_CASXA) {
-        decode_casa(word, out, SPARC64_OP_CASXA);
-        return;
-    }
-    if (op3 == SPARC64_OP3_PREFETCH) {
-        out->cls = SPARC64_OP_PREFETCH;
-        return;
-    }
-    if (op3 == SPARC64_OP3_SWAP || op3 == SPARC64_OP3_SWAPA) {
-        out->atomic = 1U;
-        out->cls = SPARC64_OP_SWAP;
-        return;
-    }
-    if (is_load_op3(op3)) {
-        if (op3 == SPARC64_OP3_LDSTUB || op3 == SPARC64_OP3_LDSTUBA) {
-            out->atomic = 1U;
-        }
-        if (is_double_mem_op3(op3) && ((rd & 0x1U) != 0U)) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        if (is_alternate_op3(op3) && i != 0U) {
-            /* Imm ASI (bits 12:5) overlaps simm13: unencodable. */
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_LOAD;
-        return;
-    }
-    if (is_store_op3(op3)) {
-        if (is_double_mem_op3(op3) && ((rd & 0x1U) != 0U)) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        if (is_alternate_op3(op3) && i != 0U) {
-            out->cls = SPARC64_OP_ILLEGAL;
-            return;
-        }
-        out->cls = SPARC64_OP_STORE;
-        return;
-    }
-    if (is_fp_mem_op3(op3) || is_fp_alt_op3(op3)) {
-        if (is_fp_alt_op3(op3) && i != 0U) {
-            /* %asi-register form (glibc VIS block memcpy): the simm13
-             * still forms [rs1 + imm]; the ASI is read from %asi at
-             * execution. Odd rd is legal here (the executor banks the
-             * pair, oracle-verified); no even-rd check. */
-            out->regasi = 1U;
-        }
-        out->cls = SPARC64_OP_FPMEM;
-        return;
-    }
-    /* LDXA/STXA gaps (0x0c/0x1c), FP gaps, and the remaining tail. */
-    out->cls = SPARC64_OP_ILLEGAL;
 }
 
 void sparc64_decode_word(uint32_t word, sparc64_decoded_t *out)
 {
-    uint32_t op;
-
+    sparc64_dec_t d;
     if (out == NULL) {
         return;
     }
+    sparc64_classify_word(word, &d);
     out->raw = word;
-    out->cls = SPARC64_OP_ILLEGAL;
-    out->op = (word >> 30) & 0x3U;
-    out->op2 = 0U;
-    out->op3 = 0U;
-    out->rd = 0U;
-    out->rs1 = 0U;
-    out->rs2 = 0U;
-    out->is_imm = 0U;
-    out->simm = 0;
-    out->asi = 0U;
-    out->regasi = 0U;
-    out->cond = 0U;
-    out->rcond = 0U;
-    out->cc_sel = 0U;
-    out->annul = 0U;
-    out->pred = 0U;
-    out->disp = 0;
-    out->uimm = 0U;
-    out->opf = 0U;
-    out->asr = 0U;
-    out->atomic = 0U;
-    out->cc = 0U;
-    out->xbit = 0U;
+    out->op = d.op;
+    out->op2 = (d.op == 0U) ? ((word >> 22) & 0x7U) : 0U;
+    out->op3 = d.op3;
+    out->rd = d.rd;
+    out->rs1 = d.rs1;
+    out->rs2 = d.rs2;
+    out->is_imm = d.is_imm;
+    out->simm = (int32_t)d.imm;
+    out->asi = (d.op >= 2U && d.is_imm == 0U && d.asi == 0U) ?
+        ((word >> 5) & 0xFFU) : d.asi;
+    out->regasi = d.regasi;
+    out->cond = d.cond;
+    out->rcond = (d.cls == SPARC64_ICLS_BPR || d.cls == SPARC64_ICLS_MOVR) ?
+        d.cond : 0U;
+    out->cc_sel = d.cc;
+    out->annul = d.annul;
+    out->pred = d.pred;
+    out->disp = (int32_t)d.disp;
+    out->uimm = d.uimm;
+    out->opf = d.opf;
+    out->asr = (d.cls == SPARC64_ICLS_RDASR) ? d.rs1 :
+        ((d.cls == SPARC64_ICLS_WRASR) ? d.rd : 0U);
+    out->atomic = (d.cls == SPARC64_ICLS_LDSTUB ||
+        d.cls == SPARC64_ICLS_SWAP || d.cls == SPARC64_ICLS_ATOMIC) ? 1U : 0U;
+    out->cc = (d.cls == SPARC64_ICLS_ALU && d.op3 >= 0x10U &&
+        d.op3 <= 0x24U) ? 1U : 0U;
+    out->xbit = d.xbit;
 
-    op = out->op;
-    if (op == 0x1U) {
-        /* Format 1 CALL: 30-bit word displacement, delay slot executes. */
-        out->cls = SPARC64_OP_CALL;
-        out->disp = sign_extend(word & 0x3FFFFFFFU, 30U) << 2;
-        return;
+    switch (d.cls) {
+    case SPARC64_ICLS_SETHI: out->cls = SPARC64_OP_SETHI; break;
+    case SPARC64_ICLS_BICC: out->cls = SPARC64_OP_BRANCH; break;
+    case SPARC64_ICLS_BPCC: out->cls = SPARC64_OP_BPBRANCH; break;
+    case SPARC64_ICLS_BPR: out->cls = SPARC64_OP_BPR; break;
+    case SPARC64_ICLS_FBR: out->cls = SPARC64_OP_FBRANCH; break;
+    case SPARC64_ICLS_CALL: out->cls = SPARC64_OP_CALL; break;
+    case SPARC64_ICLS_ALU: out->cls = SPARC64_OP_ALU; break;
+    case SPARC64_ICLS_SHIFT: out->cls = SPARC64_OP_SHIFT; break;
+    case SPARC64_ICLS_SAVE: out->cls = SPARC64_OP_SAVE; break;
+    case SPARC64_ICLS_RESTORE: out->cls = SPARC64_OP_RESTORE; break;
+    case SPARC64_ICLS_JMPL: out->cls = SPARC64_OP_JMPL; break;
+    case SPARC64_ICLS_RETURN: out->cls = SPARC64_OP_RETURN; break;
+    case SPARC64_ICLS_MOVCC:
+        out->cls = SPARC64_OP_MOVCC;
+        out->cc_sel = ((d.cc & 4U) != 0U) ? (d.cc & 3U) : (d.cc >> 1U);
+        out->rs1 = 0U;
+        break;
+    case SPARC64_ICLS_MOVR: out->cls = SPARC64_OP_MOVR; break;
+    case SPARC64_ICLS_TCC: out->cls = SPARC64_OP_TRAP; break;
+    case SPARC64_ICLS_RDASR: out->cls = SPARC64_OP_RDASR; break;
+    case SPARC64_ICLS_WRASR: out->cls = SPARC64_OP_WRASR; break;
+    case SPARC64_ICLS_MEMBAR: out->cls = SPARC64_OP_MEMBAR; break;
+    case SPARC64_ICLS_FLUSH:
+        out->cls = (d.op == 3U && d.op3 == SPARC64_OP3_PREFETCH) ?
+            SPARC64_OP_PREFETCH : SPARC64_OP_FLUSH;
+        break;
+    case SPARC64_ICLS_LOAD:
+    case SPARC64_ICLS_LDSTUB:
+        out->cls = (d.op == 3U && d.is_imm != 0U &&
+            d.op3 >= SPARC64_OP3_LDA && d.op3 <= SPARC64_OP3_SWAPA) ?
+            SPARC64_OP_ILLEGAL : SPARC64_OP_LOAD;
+        break;
+    case SPARC64_ICLS_STORE:
+        out->cls = (d.op == 3U && d.is_imm != 0U &&
+            d.op3 >= SPARC64_OP3_LDA && d.op3 <= SPARC64_OP3_SWAPA) ?
+            SPARC64_OP_ILLEGAL : SPARC64_OP_STORE;
+        break;
+    case SPARC64_ICLS_SWAP: out->cls = SPARC64_OP_SWAP; break;
+    case SPARC64_ICLS_ATOMIC:
+        out->is_imm = 0U;
+        out->simm = 0;
+        out->asi = (word >> 5) & 0xFFU;
+        out->rs2 = word & 0x1FU;
+        if (d.is_imm == 0U && out->asi < SPARC64_ASI_PRIMARY) {
+            out->cls = SPARC64_OP_PRIV;
+        } else {
+            out->cls = (d.op3 == SPARC64_OP3_CASA) ?
+                SPARC64_OP_CASA : SPARC64_OP_CASXA;
+        }
+        break;
+    case SPARC64_ICLS_ALIGN: out->cls = SPARC64_OP_ALIGN; break;
+    case SPARC64_ICLS_FPU:
+        out->cls = (d.op == 3U) ? SPARC64_OP_FPMEM : SPARC64_OP_FPU;
+        break;
+    case SPARC64_ICLS_PRIV: out->cls = SPARC64_OP_PRIV; break;
+    default: out->cls = SPARC64_OP_ILLEGAL; break;
     }
-    if (op == 0x0U) {
-        decode_op0(word, out);
-        return;
-    }
-    if (op == 0x2U) {
-        decode_op2(word, out);
-        return;
-    }
-    /* op == 0x3U: Format 3 memory incl. CASA/CASXA. */
-    decode_op3(word, out);
 }
 
 int sparc64_fetch_decode(sparc64_cpu_t *cpu,
@@ -611,7 +662,6 @@ int sparc64_fetch_decode(sparc64_cpu_t *cpu,
         }
         return -1;
     }
-    /* Big-endian assembly keeps this unit host-endian clean. */
     word = ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
         ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
     sparc64_decode_word(word, out);

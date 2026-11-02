@@ -2,13 +2,13 @@
  * src/os/backend_darwin.c -- Standalone macOS arm64 host backend (Lane M3)
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
+ *
  * Backend 2 (UNIFICATION-PLAN Rev 4 section 6): native macOS Mach-O, no
- * Hypervisor.framework. MAP_JIT + pthread_jit_write_protect_np for W^X;
- * kevent on {target_fd, wake_pipe_rd} before non-blocking I/O;
- * __ulock_wait / ULF_WAKE_ALL futexes; pthread_kill SIGUSR2 preemption
- * via an id->pthread_t table. All linux_* inputs are Linux UAPI values,
- * translated below (open flags, AF_/SOL_/SO_, signals, AT_*). No Darwin
- * equivalent -> fail closed with -38 (-ENOSYS).
+ * Hypervisor.framework. Owns identity, host memory mapping, JIT W^X,
+ * filesystem, networking (with Linux <-> Darwin sockaddr translation),
+ * and I/O multiplexing (ppoll/epoll). Worker sync, keyed futexes,
+ * clocks/random, threads, processes, and signals live in
+ * src/os/backend_darwin_sync.c.
  */
 #if defined(__APPLE__) && defined(__aarch64__)
 #include "os/backend.h"
@@ -26,24 +26,20 @@
 #include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/random.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-/* Absent from the macOS SDK; stable libSystem ABI (link+run probed). */
-extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
-extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+
 extern void pthread_jit_write_protect_np(int enabled);
-#define RT_UL_COMPARE_AND_WAIT 1u
-#define RT_ULF_WAKE_ALL 0x100u
+int rt_darwin_signo(int linux_sig);
+
 static int64_t neg_errno(void) { return -(int64_t)errno; }
 static int64_t libret(long r) { return r < 0L ? neg_errno() : (int64_t)r; }
+
 /* ---- Linux UAPI -> Darwin translation (values verified on host) ---- */
 #define RT_LINUX_AT_FDCWD (-100)
 #define RT_LINUX_AT_SYMLINK_NOFOLLOW 0x100
@@ -52,10 +48,9 @@ static int darwin_atflag(int f) {
     if ((f & ~RT_LINUX_AT_SYMLINK_NOFOLLOW) != 0) { return -1; }
     return (f & RT_LINUX_AT_SYMLINK_NOFOLLOW) != 0 ? AT_SYMLINK_NOFOLLOW : 0;
 }
-/* Linux open(2) bits (octal, aarch64 UAPI) -> Darwin. Unknown bits fail
- * closed; dropped bits (DSYNC/DIRECT/LARGEFILE/NOCTTY) are APFS no-ops. */
 static int darwin_open_flags(int lf, int *out) {
-    static const int known = 03 | 0100 | 0200 | 0400 | 01000 | 02000 | 04000 | 0100000 | 04010000 | 00040000 | 00100000 | 00200000 | 00400000 | 02000000;
+    static const int known = 03 | 0100 | 0200 | 0400 | 01000 | 02000 | 04000 |
+        0100000 | 04010000 | 00040000 | 00100000 | 00200000 | 00400000 | 02000000;
     int df;
     if ((lf & ~known) != 0) { return -22; }
     df = lf & 03;
@@ -73,7 +68,7 @@ static int darwin_open_flags(int lf, int *out) {
 static int darwin_domain(int d) {
     switch (d) { case 1: return AF_UNIX; case 2: return AF_INET; case 10: return AF_INET6; default: return -1; }
 }
-static int darwin_socktype(int t, int *cloexec, int *nonblock) { /* strip SOCK_CLOEXEC/SOCK_NONBLOCK */
+static int darwin_socktype(int t, int *cloexec, int *nonblock) {
     int s = t & ~(02000000 | 04000);
     *cloexec = (t & 02000000) != 0 ? 1 : 0; *nonblock = (t & 04000) != 0 ? 1 : 0;
     return (s == 1 || s == 2 || s == 3) ? s : -1;
@@ -92,21 +87,52 @@ static int darwin_sockopt(int l, int o) {
     for (i = 0u; i < 10u; i++) { if (lin[i] == o) { return dar[i]; } }
     return o;
 }
-/* Signal numbers diverge (7=BUS vs 10, 10=USR1 vs 30, 12=USR2 vs 31, 17=CHLD vs 20, 18/19/20 vs 19/17/18, 23 vs 16, 29 vs 23, 31 vs 12). */
-static int darwin_signo(int linux_sig) {
-    static const int lin[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31 };
-    static const int dar[] = { 1, 2, 3, 4, 5, 6, 10, 8, 9, 30, 11, 31, 13, 14, 15, 7, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27, 28, 23, 12 };
-    unsigned i;
-    for (i = 0u; i < 30u; i++) { if (lin[i] == linux_sig) { return dar[i]; } }
-    return -22;
+
+/* S64-4: Linux sockaddr (uint16_t sa_family at offset 0, AF_INET6=10)
+ * <-> Darwin sockaddr (uint8_t sa_len, uint8_t sa_family, AF_INET6=30). */
+static int darwin_sockaddr_from_linux(const void *lin, uint32_t lin_len,
+    struct sockaddr_storage *dar_out, socklen_t *dar_len_out) {
+    uint16_t lfam = 0u; uint8_t dfam; uint32_t copy_len;
+    if (lin == NULL || dar_out == NULL || dar_len_out == NULL ||
+        lin_len < 2u || lin_len > (uint32_t)sizeof(*dar_out)) { return -22; }
+    (void)memcpy(&lfam, lin, sizeof(lfam));
+    switch (lfam) {
+    case 1u: dfam = (uint8_t)AF_UNIX; copy_len = lin_len; break;
+    case 2u: if (lin_len < 16u) { return -22; } dfam = (uint8_t)AF_INET; copy_len = 16u; break;
+    case 10u: if (lin_len < 28u) { return -22; } dfam = (uint8_t)AF_INET6; copy_len = 28u; break;
+    default: return -97;
+    }
+    (void)memset(dar_out, 0, sizeof(*dar_out));
+    (void)memcpy(dar_out, lin, copy_len);
+    ((uint8_t *)dar_out)[0] = (uint8_t)(copy_len > 255u ? 255u : copy_len);
+    ((uint8_t *)dar_out)[1] = dfam;
+    *dar_len_out = (socklen_t)copy_len;
+    return 0;
 }
-static int linux_signo(int dar_sig) {
-    static const int dar[] = { 1, 2, 3, 4, 5, 6, 10, 8, 9, 30, 11, 31, 13, 14, 15, 7, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27, 28, 23, 12 };
-    static const int lin[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31 };
-    unsigned i;
-    for (i = 0u; i < 30u; i++) { if (dar[i] == dar_sig) { return lin[i]; } }
-    return dar_sig;
+static void darwin_sockaddr_to_linux(const struct sockaddr_storage *dar,
+    socklen_t dar_len, void *lin_out, uint32_t *lin_len_inout) {
+    struct sockaddr_storage tmp; uint16_t lfam; uint8_t dfam;
+    uint32_t full_len, avail, copy_len;
+    if (lin_out == NULL || lin_len_inout == NULL) { return; }
+    if (dar == NULL || dar_len < 2u) { *lin_len_inout = 0u; return; }
+    dfam = ((const uint8_t *)dar)[1];
+    switch (dfam) {
+    case AF_UNIX: lfam = 1u; full_len = (uint32_t)dar_len; break;
+    case AF_INET: lfam = 2u; full_len = 16u; break;
+    case AF_INET6: lfam = 10u; full_len = 28u; break;
+    default: lfam = (uint16_t)dfam; full_len = (uint32_t)dar_len; break;
+    }
+    (void)memset(&tmp, 0, sizeof(tmp));
+    copy_len = (uint32_t)dar_len < (uint32_t)sizeof(tmp) ? (uint32_t)dar_len : (uint32_t)sizeof(tmp);
+    (void)memcpy(&tmp, dar, copy_len);
+    (void)memcpy(&tmp, &lfam, sizeof(lfam));
+    avail = *lin_len_inout;
+    copy_len = avail < full_len ? avail : full_len;
+    if (copy_len > (uint32_t)sizeof(tmp)) { copy_len = (uint32_t)sizeof(tmp); }
+    (void)memcpy(lin_out, &tmp, copy_len);
+    *lin_len_inout = full_len;
 }
+
 /* ---- kevent readiness (plan section 6.4a) ---- */
 static int darwin_wait_fd(int fd, int want_write, rt_worker_sync_t *ws, uint32_t expected_seq) {
     struct kevent changes[2], events[2];
@@ -131,7 +157,7 @@ static int darwin_wait_fd(int fd, int want_write, rt_worker_sync_t *ws, uint32_t
         if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { (void)close(kq); return -4; }
     }
 }
-struct darwin_fdop { int fd, flags, kind; void *buf; size_t len; const void *addr; uint32_t addrlen; uint32_t *addrlenp; };
+struct darwin_fdop { int fd, flags, kind; void *buf; size_t len; const void *addr; socklen_t addrlen; socklen_t *addrlenp; };
 #define RT_FDOP_READ 0
 #define RT_FDOP_WRITE 1
 #define RT_FDOP_READV 2
@@ -152,44 +178,27 @@ static int64_t darwin_do_fdop(void *p) {
     case RT_FDOP_READV: return libret(readv(a->fd, (struct iovec *)a->buf, (int)a->len));
     case RT_FDOP_WRITEV: return libret(writev(a->fd, a->addr, (int)a->len));
     case RT_FDOP_CONNECT: {
-        int r;
-        darwin_nonblock(a->fd);
-        r = connect(a->fd, (const struct sockaddr *)a->addr, (socklen_t)a->addrlen);
+        int r; darwin_nonblock(a->fd);
+        r = connect(a->fd, (const struct sockaddr *)a->addr, a->addrlen);
         if (r == 0 || errno == EISCONN) { return 0; }
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS || errno == EALREADY) { return -35; }
         return neg_errno();
     }
     case RT_FDOP_ACCEPT: {
-        int f = accept(a->fd, (struct sockaddr *)a->addr, (socklen_t *)a->addrlenp);
+        int f = accept(a->fd, (struct sockaddr *)a->buf, a->addrlenp);
         if (f < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) { return -35; } return neg_errno(); }
         darwin_nonblock(a->fd); return (int64_t)f;
     }
     case RT_FDOP_SENDTO:
-        return libret(sendto(a->fd, a->buf, a->len, a->flags, (const struct sockaddr *)a->addr, (socklen_t)a->addrlen));
+        return libret(sendto(a->fd, a->buf, a->len, a->flags, (const struct sockaddr *)a->addr, a->addrlen));
     default:
-        return libret(recvfrom(a->fd, a->buf, a->len, a->flags, (struct sockaddr *)a->addr, (socklen_t *)a->addrlenp));
+        return libret(recvfrom(a->fd, a->buf, a->len, a->flags, (struct sockaddr *)a->addr, a->addrlenp));
     }
 }
 static int64_t darwin_spin_fd(int fd, int want_write, rt_worker_sync_t *ws, uint32_t expected_seq, struct darwin_fdop *a) {
     for (;;) { int64_t r = darwin_do_fdop(a); int w; if (r != -35) { return r; } w = darwin_wait_fd(fd, want_write, ws, expected_seq); if (w != 0) { return (int64_t)w; } }
 }
-/* ---- worker table (preempt without tid signals) ---- */
-#define RT_DARWIN_WORKERS 256u
-static struct { pthread_mutex_t mu; int init; uint64_t ids[RT_DARWIN_WORKERS]; pthread_t ths[RT_DARWIN_WORKERS]; } g_workers;
-static void workers_lock(void) {
-    if (!g_workers.init) { (void)pthread_mutex_init(&g_workers.mu, NULL); g_workers.init = 1; }
-    (void)pthread_mutex_lock(&g_workers.mu);
-}
-static void darwin_worker_register(uint64_t id, pthread_t th) {
-    unsigned i; workers_lock();
-    for (i = 0u; i < RT_DARWIN_WORKERS; i++) { if (g_workers.ids[i] == 0u) { g_workers.ids[i] = id; g_workers.ths[i] = th; break; } }
-    (void)pthread_mutex_unlock(&g_workers.mu);
-}
-static int darwin_worker_find(uint64_t id, pthread_t *out) {
-    unsigned i; int found = 0; workers_lock();
-    for (i = 0u; i < RT_DARWIN_WORKERS; i++) { if (g_workers.ids[i] == id) { *out = g_workers.ths[i]; found = 1; break; } }
-    (void)pthread_mutex_unlock(&g_workers.mu); return found;
-}
+
 /* 1. identity */
 rt_backend_kind_t rt_host_backend_kind(void) { return RT_BACKEND_DARWIN; }
 int rt_host_is_hyper_linux(void) { return 0; }
@@ -198,16 +207,30 @@ size_t rt_host_page_size(void) {
     if (cached != 0L) { return (size_t)cached; }
     v = sysconf(_SC_PAGESIZE); cached = v <= 0L ? 16384L : v; return (size_t)cached;
 }
-/* 2. memory */
+
+/* 2. memory (S64-6: check noreplace before fixed under lock) */
+static pthread_mutex_t g_map_noreplace_mu = PTHREAD_MUTEX_INITIALIZER;
 int rt_host_map_anon(void *hint_addr, size_t len, int linux_prot, int fixed, int noreplace, void **out_host_addr) {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS; void *p;
     if (len == 0U || out_host_addr == NULL) { return -22; }
-    if (fixed) { flags |= MAP_FIXED; }
-    if (noreplace && !fixed) { /* No MAP_FIXED_NOREPLACE: best-effort mincore probe (racy). */
+    if (noreplace) {
         size_t off, ps = rt_host_page_size();
-        for (off = 0u; off < len; off += ps) { char vec = 0; if (mincore((char *)hint_addr + off, ps, &vec) == 0) { return -17; } }
-        flags |= MAP_FIXED;
+        if (hint_addr == NULL) { return -22; }
+        (void)pthread_mutex_lock(&g_map_noreplace_mu);
+        for (off = 0u; off < len; off += ps) {
+            char vec = 0;
+            if (mincore((char *)hint_addr + off, ps, &vec) == 0) {
+                (void)pthread_mutex_unlock(&g_map_noreplace_mu);
+                return -17;
+            }
+        }
+        p = mmap(hint_addr, len, linux_prot, flags, -1, 0);
+        if (p == MAP_FAILED) { int e = errno; (void)pthread_mutex_unlock(&g_map_noreplace_mu); return -e; }
+        if (p != hint_addr) { (void)munmap(p, len); (void)pthread_mutex_unlock(&g_map_noreplace_mu); return -17; }
+        (void)pthread_mutex_unlock(&g_map_noreplace_mu);
+        *out_host_addr = p; return 0;
     }
+    if (fixed) { flags |= MAP_FIXED; }
     p = mmap(hint_addr, len, linux_prot, flags, -1, 0);
     if (p == MAP_FAILED) { return -(int)errno; }
     *out_host_addr = p; return 0;
@@ -221,7 +244,7 @@ int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared, in
     *out_host_addr = p; return 0;
 }
 int rt_host_create_shared_mem(const char *name, size_t size, int *out_host_fd) {
-    char shm_name[64]; size_t i = 0u, o = 0u; int fd; /* shm_open names share one flat namespace; prefix ours. */
+    char shm_name[64]; size_t i = 0u, o = 0u; int fd;
     static const char prefix[] = "/rt.";
     if (name == NULL || out_host_fd == NULL) { return -22; }
     for (i = 0u; prefix[i] != '\0' && o + 1u < sizeof(shm_name); i++) { shm_name[o++] = prefix[i]; }
@@ -237,6 +260,7 @@ int rt_host_protect(void *host_addr, size_t len, int linux_prot) { return mprote
 int rt_host_unmap(void *host_addr, size_t len) { return munmap(host_addr, len) != 0 ? -(int)errno : 0; }
 int rt_host_msync(void *host_addr, size_t len, int linux_flags) { return msync(host_addr, len, linux_flags) != 0 ? -(int)errno : 0; }
 int rt_host_madvise(void *host_addr, size_t len, int linux_advice) { return madvise(host_addr, len, linux_advice) != 0 ? -(int)errno : 0; }
+
 /* 3. JIT W^X */
 void *rt_host_jit_alloc(size_t size) {
     void *p;
@@ -254,58 +278,13 @@ int rt_host_jit_seal_rx(void *buf, size_t size) {
     return mprotect(buf, size, PROT_READ | PROT_EXEC) != 0 ? -(int)errno : 0;
 }
 void rt_host_jit_free(void *buf, size_t size) { if (buf == NULL || size == 0U) { return; } (void)munmap(buf, size); }
-/* 4. worker sync + preemption */
-int rt_host_worker_sync_init(rt_worker_sync_t *ws) {
-    int fds[2]; uint64_t tid = 0u;
-    if (ws == NULL) { return -22; }
-    atomic_init(&ws->sig_seq, 0u); atomic_init(&ws->in_commit_window, 0u); atomic_init(&ws->ulock_wait_addr, (uintptr_t)0);
-    ws->kqueue_fd = kqueue(); ws->wake_pipe_rd = -1; ws->wake_pipe_wr = -1;
-    (void)pthread_threadid_np(NULL, &tid); ws->host_tid = tid;
-    if (pipe(fds) != 0) { if (ws->kqueue_fd >= 0) { (void)close(ws->kqueue_fd); ws->kqueue_fd = -1; } return -(int)errno; }
-    (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC); (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    (void)fcntl(fds[0], F_SETFL, O_NONBLOCK); (void)fcntl(fds[1], F_SETFL, O_NONBLOCK);
-    ws->wake_pipe_rd = fds[0]; ws->wake_pipe_wr = fds[1]; return 0;
-}
-void rt_host_worker_sync_destroy(rt_worker_sync_t *ws) {
-    if (ws == NULL) { return; }
-    if (ws->kqueue_fd >= 0) { (void)close(ws->kqueue_fd); }
-    if (ws->wake_pipe_rd >= 0) { (void)close(ws->wake_pipe_rd); }
-    if (ws->wake_pipe_wr >= 0) { (void)close(ws->wake_pipe_wr); }
-    ws->kqueue_fd = -1; ws->wake_pipe_rd = -1; ws->wake_pipe_wr = -1;
-}
-void rt_host_worker_notify_signal(rt_worker_sync_t *ws) {
-    static const char one = 'x';
-    if (ws == NULL || ws->wake_pipe_wr < 0) { return; }
-    atomic_fetch_add_explicit(&ws->sig_seq, 1u, memory_order_release);
-    (void)write(ws->wake_pipe_wr, &one, 1u);
-}
-int rt_host_preempt_worker(uint64_t host_tid) {
-    pthread_t th;
-    int r;
-    if (!darwin_worker_find(host_tid, &th)) { return -3; }
-    r = pthread_kill(th, SIGUSR2);
-    if (r == 0) { return 0; }
-    /* ETIMEDOUT means the (detached) thread already exited: parking is
-     * vacuous, report success. Observed on macOS for dead threads. */
-    if (r == ETIMEDOUT) { return 0; }
-    return -r;
-}
-uint64_t rt_host_register_self(void) {
-    /* pthread_threadid_np value doubles as the worker-table key;
-     * register self so preemption can find this thread. */
-    uint64_t tid = 0u;
-    (void)pthread_threadid_np(NULL, &tid);
-    if (tid != 0u) {
-        darwin_worker_register(tid, pthread_self());
-    }
-    return tid;
-}
+
 /* 5. filesystem */
 int64_t rt_host_openat(int dirfd, const char *path, int linux_flags, uint32_t mode, rt_worker_sync_t *ws, uint32_t expected_seq) {
     struct stat st; int df, was_nonblock, f; int64_t r;
     if (path == NULL) { return -22; }
     if (darwin_open_flags(linux_flags, &df) != 0) { return -22; }
-    was_nonblock = (df & O_NONBLOCK) != 0 ? 1 : 0; df |= O_NONBLOCK; /* FIFOs without a peer park on kevent below. */
+    was_nonblock = (df & O_NONBLOCK) != 0 ? 1 : 0; df |= O_NONBLOCK;
     r = libret(openat(darwin_dirfd(dirfd), path, df, (mode_t)mode));
     if (r < 0) { return r; }
     if (!was_nonblock) {
@@ -334,7 +313,6 @@ int64_t rt_host_writev(int fd, const struct iovec *iov, int iovcnt, rt_worker_sy
     return darwin_spin_fd(fd, 1, ws, expected_seq, &a);
 }
 int64_t rt_host_lseek(int fd, int64_t offset, int linux_whence) { return libret(lseek(fd, (off_t)offset, linux_whence)); }
-/* Linux struct statx stable prefix: 128 bytes through stx_dev_minor; the 256-byte caller buffer tail is zeroed. */
 struct rt_linux_statx {
     uint32_t stx_mask, stx_blksize; uint64_t stx_attributes; uint32_t stx_nlink, stx_uid, stx_gid;
     uint16_t stx_mode, pad0; uint64_t stx_ino, stx_size, stx_blocks, stx_attributes_mask;
@@ -364,54 +342,51 @@ int64_t rt_host_fstatat(int dirfd, const char *path, void *linux_statx_out, int 
 int64_t rt_host_ftruncate(int fd, int64_t length) { return libret(ftruncate(fd, (off_t)length)); }
 int64_t rt_host_fallocate(int fd, int mode, int64_t offset, int64_t len) {
     fstore_t store;
-    if (mode != 0) { return -38; } /* PUNCH_HOLE has no APFS equivalent. */
+    if (mode != 0) { return -38; }
     store.fst_flags = (u_int32_t)0; store.fst_posmode = F_PEOFPOSMODE; store.fst_offset = 0;
     store.fst_length = (off_t)(offset + len); store.fst_bytesalloc = 0;
     (void)fcntl(fd, F_PREALLOCATE, &store);
     return libret(ftruncate(fd, (off_t)(offset + len)));
 }
-static int64_t darwin_copy_loop(int fd_in, int64_t *inout_in, int fd_out, int64_t out_base, int is_sendfile, size_t len) {
+/* S64-7: advance *inout_in, *inout_out, and done after each write/pwrite. */
+static int64_t darwin_copy_loop(int fd_in, int64_t *inout_in, int fd_out, int64_t *inout_out, int is_sendfile, size_t len) {
     static const size_t chunk = 65536u; char *buf = (char *)malloc(chunk);
-    size_t left = len; int64_t in_off, done = 0;
+    size_t left = len; int64_t done = 0;
     if (buf == NULL) { return -12; }
     if (inout_in == NULL) { free(buf); return -22; }
-    in_off = *inout_in;
     while (left != 0u) {
-        size_t want = left < chunk ? left : chunk, woff = 0u; ssize_t r = pread(fd_in, buf, want, (off_t)in_off);
-        if (r < 0) { int e = errno; free(buf); *inout_in = in_off; return done != 0 ? done : -(int64_t)e; }
+        size_t want = left < chunk ? left : chunk, woff = 0u;
+        ssize_t r = pread(fd_in, buf, want, (off_t)(*inout_in));
+        if (r < 0) { if (errno == EINTR) { continue; } { int e = errno; free(buf); return done != 0 ? done : -(int64_t)e; } }
         if (r == 0) { break; }
         while (woff < (size_t)r) {
-            ssize_t w = is_sendfile ? write(fd_out, buf + woff, (size_t)r - woff) : pwrite(fd_out, buf + woff, (size_t)r - woff, (off_t)(out_base + done + (int64_t)woff));
-            if (w < 0) { int e = errno; free(buf); *inout_in = in_off; return done != 0 ? done : -(int64_t)e; }
-            woff += (size_t)w;
+            ssize_t w = is_sendfile ? write(fd_out, buf + woff, (size_t)r - woff)
+                                    : pwrite(fd_out, buf + woff, (size_t)r - woff, (off_t)(*inout_out));
+            if (w < 0) { if (errno == EINTR) { continue; } { int e = errno; free(buf); return done != 0 ? done : -(int64_t)e; } }
+            if (w == 0) { free(buf); return done; }
+            woff += (size_t)w; *inout_in += (int64_t)w;
+            if (!is_sendfile && inout_out != NULL) { *inout_out += (int64_t)w; }
+            done += (int64_t)w;
         }
-        in_off += r; done += r; left -= (size_t)r;
+        left -= (size_t)r;
     }
-    free(buf); *inout_in = in_off; return done;
+    free(buf); return done;
 }
 int64_t rt_host_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count) {
-    if (offset == NULL) { return -22; } /* Darwin sendfile is socket-only; copy loop. */
-    return darwin_copy_loop(in_fd, offset, out_fd, 0, 1, count);
+    if (offset == NULL) { return -22; }
+    return darwin_copy_loop(in_fd, offset, out_fd, NULL, 1, count);
 }
 int64_t rt_host_copy_file_range(int fd_in, int64_t *off_in, int fd_out, int64_t *off_out, size_t len, unsigned int flags) {
-    int64_t save_out, r;
     if (off_in == NULL || off_out == NULL || flags != 0u) { return -22; }
-    save_out = *off_out; r = darwin_copy_loop(fd_in, off_in, fd_out, save_out, 0, len);
-    if (r >= 0) { *off_out = save_out + r; return r; }
-    return r;
+    return darwin_copy_loop(fd_in, off_in, fd_out, off_out, 0, len);
 }
-int64_t rt_host_fsync(int fd, int datasync_only) {
-    (void)datasync_only;
-    return fcntl(fd, F_FULLFSYNC) != 0 ? libret(fsync(fd)) : 0;
-}
-struct rt_linux_dirent64 { uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type; char d_name[]; }; /* packed, 8B-aligned records */
+int64_t rt_host_fsync(int fd, int datasync_only) { (void)datasync_only; return fcntl(fd, F_FULLFSYNC) != 0 ? libret(fsync(fd)) : 0; }
+struct rt_linux_dirent64 { uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type; char d_name[]; };
 int64_t rt_host_getdents64(int fd, void *linux_dirent64_buf, size_t buf_size) {
     char *out = (char *)linux_dirent64_buf; size_t used = 0u; int dupfd; DIR *dir; struct dirent *de;
     if (out == NULL || buf_size == 0U) { return -22; }
-    dupfd = dup(fd); /* shares the file offset, like getdents64 */
-    if (dupfd < 0) { return neg_errno(); }
-    dir = fdopendir(dupfd);
-    if (dir == NULL) { int e = errno; (void)close(dupfd); return -(int64_t)e; }
+    dupfd = dup(fd); if (dupfd < 0) { return neg_errno(); }
+    dir = fdopendir(dupfd); if (dir == NULL) { int e = errno; (void)close(dupfd); return -(int64_t)e; }
     while ((de = readdir(dir)) != NULL) {
         struct rt_linux_dirent64 *rec; size_t namlen = 0u, reclen, i;
         while (de->d_name[namlen] != '\0') { namlen++; }
@@ -428,7 +403,7 @@ int64_t rt_host_getdents64(int fd, void *linux_dirent64_buf, size_t buf_size) {
     return used == 0u ? 0 : (int64_t)used;
 }
 int64_t rt_host_fcntl(int fd, int linux_cmd, uint64_t arg) {
-    if (linux_cmd == 1030) { /* F_DUPFD_CLOEXEC (Darwin value is 67, contract is Linux). */
+    if (linux_cmd == 1030) {
         long r = fcntl(fd, F_DUPFD, (int)arg);
         if (r < 0) { return neg_errno(); }
         (void)fcntl((int)r, F_SETFD, FD_CLOEXEC); return r;
@@ -468,7 +443,7 @@ int64_t rt_host_mkdirat(int dirfd, const char *path, uint32_t mode) {
 }
 int64_t rt_host_renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags) {
     if (oldpath == NULL || newpath == NULL) { return -22; }
-    if (flags != 0u) { return -38; } /* No RENAME_* equivalent. */
+    if (flags != 0u) { return -38; }
     return libret(renameat(darwin_dirfd(olddirfd), oldpath, darwin_dirfd(newdirfd), newpath));
 }
 int64_t rt_host_symlinkat(const char *target, int newdirfd, const char *linkpath) {
@@ -498,7 +473,7 @@ int64_t rt_host_fchownat(int dirfd, const char *path, uint32_t uid, uint32_t gid
 int64_t rt_host_utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
     struct timeval tv[2];
     if (path == NULL) { return -22; }
-    if (dirfd != RT_LINUX_AT_FDCWD || flags != 0) { return -38; } /* No utimensat on macOS. */
+    if (dirfd != RT_LINUX_AT_FDCWD || flags != 0) { return -38; }
     if (times == NULL) { return libret(utimes(path, NULL)); }
     tv[0].tv_sec = times[0].tv_sec; tv[0].tv_usec = (int)(times[0].tv_nsec / 1000L);
     tv[1].tv_sec = times[1].tv_sec; tv[1].tv_usec = (int)(times[1].tv_nsec / 1000L);
@@ -510,7 +485,8 @@ int64_t rt_host_getcwd(char *buf, size_t size) {
 }
 int64_t rt_host_chdir(const char *path) { if (path == NULL) { return -22; } return libret(chdir(path)); }
 int64_t rt_host_fchdir(int fd) { return libret(fchdir(fd)); }
-/* 6. networking */
+
+/* 6. networking (S64-4: sockaddr conversions) */
 int64_t rt_host_socket(int linux_domain, int linux_type, int protocol) {
     int dom, type, cloexec, nonblock, fd;
     dom = darwin_domain(linux_domain); type = darwin_socktype(linux_type, &cloexec, &nonblock);
@@ -527,44 +503,66 @@ int64_t rt_host_socketpair(int linux_domain, int linux_type, int protocol, int s
     darwin_flag_fd(sv[0], cloexec, nonblock); darwin_flag_fd(sv[1], cloexec, nonblock); return 0;
 }
 int64_t rt_host_bind(int fd, const void *linux_addr, uint32_t addrlen) {
-    if (linux_addr == NULL) { return -22; }
-    return libret(bind(fd, (const struct sockaddr *)linux_addr, (socklen_t)addrlen));
+    struct sockaddr_storage dar; socklen_t dlen = 0u;
+    int rc = darwin_sockaddr_from_linux(linux_addr, addrlen, &dar, &dlen);
+    return rc != 0 ? rc : libret(bind(fd, (const struct sockaddr *)&dar, dlen));
 }
 int64_t rt_host_connect(int fd, const void *linux_addr, uint32_t addrlen, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    struct darwin_fdop a = { fd, 0, RT_FDOP_CONNECT, NULL, 0u, linux_addr, addrlen, NULL };
-    int64_t r; int err = 0; socklen_t errlen = (socklen_t)sizeof(err);
-    if (linux_addr == NULL) { return -22; }
+    struct sockaddr_storage dar; socklen_t dlen = 0u;
+    struct darwin_fdop a; int64_t r; int err = 0; socklen_t errlen = (socklen_t)sizeof(err);
+    int rc = darwin_sockaddr_from_linux(linux_addr, addrlen, &dar, &dlen);
+    if (rc != 0) { return rc; }
+    a.fd = fd; a.flags = 0; a.kind = RT_FDOP_CONNECT;
+    a.buf = NULL; a.len = 0u; a.addr = &dar; a.addrlen = dlen; a.addrlenp = NULL;
     r = darwin_spin_fd(fd, 1, ws, expected_seq, &a);
     if (r != 0) { return r; }
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err != 0) { return -(int64_t)err; } /* writable != connected */
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err != 0) { return -(int64_t)err; }
     return 0;
 }
 int64_t rt_host_listen(int fd, int backlog) { return libret(listen(fd, backlog)); }
 int64_t rt_host_accept4(int fd, void *linux_addr_out, uint32_t *addrlen_inout, int linux_flags, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    struct darwin_fdop a = { fd, 0, RT_FDOP_ACCEPT, NULL, 0u, linux_addr_out, 0u, addrlen_inout };
+    struct sockaddr_storage dar; socklen_t dlen = (socklen_t)sizeof(dar);
+    struct darwin_fdop a = { fd, 0, RT_FDOP_ACCEPT, linux_addr_out != NULL ? &dar : NULL, 0u, NULL, 0u, linux_addr_out != NULL ? &dlen : NULL };
     int64_t r; int cloexec, nonblock;
     if ((linux_flags & ~(02000000 | 04000)) != 0) { return -22; }
     if (darwin_socktype(linux_flags | 1, &cloexec, &nonblock) < 0) { return -22; }
     darwin_nonblock(fd);
     r = darwin_spin_fd(fd, 0, ws, expected_seq, &a);
-    if (r >= 0) { darwin_flag_fd((int)r, cloexec, nonblock); }
+    if (r >= 0) {
+        darwin_flag_fd((int)r, cloexec, nonblock);
+        if (linux_addr_out != NULL && addrlen_inout != NULL) { darwin_sockaddr_to_linux(&dar, dlen, linux_addr_out, addrlen_inout); }
+    }
     return r;
 }
 int64_t rt_host_sendto(int fd, const void *buf, size_t len, int linux_flags, const void *linux_dest_addr, uint32_t addrlen, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    struct darwin_fdop a = { fd, linux_flags, RT_FDOP_SENDTO, (void *)buf, len, linux_dest_addr, addrlen, NULL };
+    struct sockaddr_storage dar; socklen_t dlen = 0u; const void *dptr = NULL; struct darwin_fdop a;
+    if (linux_dest_addr != NULL) {
+        int rc = darwin_sockaddr_from_linux(linux_dest_addr, addrlen, &dar, &dlen);
+        if (rc != 0) { return rc; }
+        dptr = &dar;
+    }
+    a.fd = fd; a.flags = linux_flags; a.kind = RT_FDOP_SENDTO;
+    a.buf = (void *)buf; a.len = len; a.addr = dptr; a.addrlen = dlen; a.addrlenp = NULL;
     return darwin_spin_fd(fd, 1, ws, expected_seq, &a);
 }
 int64_t rt_host_recvfrom(int fd, void *buf, size_t len, int linux_flags, void *linux_src_addr_out, uint32_t *addrlen_inout, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    struct darwin_fdop a = { fd, linux_flags, RT_FDOP_RECVFROM, buf, len, linux_src_addr_out, 0u, addrlen_inout };
-    return darwin_spin_fd(fd, 0, ws, expected_seq, &a);
+    struct sockaddr_storage dar; socklen_t dlen = (socklen_t)sizeof(dar);
+    struct darwin_fdop a = { fd, linux_flags, RT_FDOP_RECVFROM, buf, len, linux_src_addr_out != NULL ? &dar : NULL, 0u, linux_src_addr_out != NULL ? &dlen : NULL };
+    int64_t r = darwin_spin_fd(fd, 0, ws, expected_seq, &a);
+    if (r >= 0 && linux_src_addr_out != NULL && addrlen_inout != NULL) { darwin_sockaddr_to_linux(&dar, dlen, linux_src_addr_out, addrlen_inout); }
+    return r;
 }
 int64_t rt_host_getsockname(int fd, void *linux_addr_out, uint32_t *addrlen_inout) {
+    struct sockaddr_storage dar; socklen_t dlen = (socklen_t)sizeof(dar);
     if (linux_addr_out == NULL || addrlen_inout == NULL) { return -22; }
-    return libret(getsockname(fd, (struct sockaddr *)linux_addr_out, (socklen_t *)addrlen_inout));
+    if (getsockname(fd, (struct sockaddr *)&dar, &dlen) != 0) { return neg_errno(); }
+    darwin_sockaddr_to_linux(&dar, dlen, linux_addr_out, addrlen_inout); return 0;
 }
 int64_t rt_host_getpeername(int fd, void *linux_addr_out, uint32_t *addrlen_inout) {
+    struct sockaddr_storage dar; socklen_t dlen = (socklen_t)sizeof(dar);
     if (linux_addr_out == NULL || addrlen_inout == NULL) { return -22; }
-    return libret(getpeername(fd, (struct sockaddr *)linux_addr_out, (socklen_t *)addrlen_inout));
+    if (getpeername(fd, (struct sockaddr *)&dar, &dlen) != 0) { return neg_errno(); }
+    darwin_sockaddr_to_linux(&dar, dlen, linux_addr_out, addrlen_inout); return 0;
 }
 int64_t rt_host_setsockopt(int fd, int linux_level, int linux_optname, const void *optval, uint32_t optlen) {
     if (optval == NULL) { return -22; }
@@ -575,24 +573,48 @@ int64_t rt_host_getsockopt(int fd, int linux_level, int linux_optname, void *opt
     return libret(getsockopt(fd, darwin_socklevel(linux_level), darwin_sockopt(linux_level, linux_optname), optval, (socklen_t *)optlen_inout));
 }
 int64_t rt_host_shutdown(int fd, int how) { return libret(shutdown(fd, how)); }
+
+/* S64-8: honor timeout when nfds==0 and apply/restore linux_sigmask. */
+static void darwin_sigmask_enter(const uint64_t *linux_sigmask, sigset_t *saved_out, int *have_saved_out) {
+    sigset_t set; unsigned sig;
+    *have_saved_out = 0;
+    if (linux_sigmask == NULL) { return; }
+    (void)sigemptyset(&set);
+    for (sig = 1u; sig <= 64u; sig++) {
+        if ((*linux_sigmask & (UINT64_C(1) << (sig - 1u))) != 0u) {
+            int dsig = rt_darwin_signo((int)sig);
+            if (dsig > 0) { (void)sigaddset(&set, dsig); }
+        }
+    }
+    if (pthread_sigmask(SIG_SETMASK, &set, saved_out) == 0) { *have_saved_out = 1; }
+}
+static void darwin_sigmask_leave(const sigset_t *saved, int have_saved) {
+    if (have_saved) { (void)pthread_sigmask(SIG_SETMASK, saved, NULL); }
+}
 int64_t rt_host_ppoll(void *linux_pollfds, size_t nfds, const struct timespec *rel_timeout, const uint64_t *linux_sigmask, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    struct pollfd *fds; int timeout_ms = -1, r, has_wake = 0; size_t i, total = nfds;
-    (void)linux_sigmask;
+    struct pollfd *fds = NULL; sigset_t saved_mask; int have_saved = 0, timeout_ms = -1, r, has_wake = 0; size_t i, total = nfds;
     if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { return -4; }
     if (ws != NULL && ws->wake_pipe_rd >= 0) { total++; has_wake = 1; }
-    if (total == 0u) { return 0; }
-    fds = (struct pollfd *)malloc(total * sizeof(*fds));
-    if (fds == NULL) { return -12; }
-    for (i = 0u; i < nfds; i++) { (void)memcpy(&fds[i], (const char *)linux_pollfds + i * sizeof(*fds), sizeof(*fds)); }
-    if (has_wake) { fds[nfds].fd = ws->wake_pipe_rd; fds[nfds].events = POLLIN; fds[nfds].revents = 0; }
-    if (rel_timeout != NULL) { int64_t ms = (int64_t)rel_timeout->tv_sec * 1000L + (int64_t)rel_timeout->tv_nsec / 1000000L; timeout_ms = ms > 2147483647L ? 2147483647 : (int)ms; }
+    if (rel_timeout != NULL) {
+        int64_t ms = (int64_t)rel_timeout->tv_sec * 1000L + (int64_t)rel_timeout->tv_nsec / 1000000L;
+        if (ms == 0 && rel_timeout->tv_nsec > 0) { ms = 1; }
+        timeout_ms = ms > 2147483647L ? 2147483647 : (ms < 0 ? 0 : (int)ms);
+    }
+    if (total > 0u) {
+        fds = (struct pollfd *)malloc(total * sizeof(*fds));
+        if (fds == NULL) { return -12; }
+        for (i = 0u; i < nfds; i++) { (void)memcpy(&fds[i], (const char *)linux_pollfds + i * sizeof(*fds), sizeof(*fds)); }
+        if (has_wake) { fds[nfds].fd = ws->wake_pipe_rd; fds[nfds].events = POLLIN; fds[nfds].revents = 0; }
+    }
+    darwin_sigmask_enter(linux_sigmask, &saved_mask, &have_saved);
     r = poll(fds, (nfds_t)total, timeout_ms);
+    darwin_sigmask_leave(&saved_mask, have_saved);
     if (r < 0) { int e = errno; free(fds); return -(int64_t)e; }
     if (has_wake && (fds[nfds].revents & POLLIN) != 0) { char tmp[32]; (void)read(ws->wake_pipe_rd, tmp, sizeof(tmp)); free(fds); return -4; }
-    if (r > 0) { for (i = 0u; i < nfds; i++) { (void)memcpy((char *)linux_pollfds + i * sizeof(*fds), &fds[i], sizeof(*fds)); } }
+    if (r > 0 && nfds > 0u) { for (i = 0u; i < nfds; i++) { (void)memcpy((char *)linux_pollfds + i * sizeof(*fds), &fds[i], sizeof(*fds)); } }
     free(fds); return (int64_t)r;
 }
-/* Minimal epoll-over-kqueue emulation (level-triggered; EPOLLET -> EV_CLEAR for edge-ish delivery). */
+/* Minimal epoll-over-kqueue emulation */
 #define RT_EPOLL_SLOTS 64u
 #define RT_EPOLL_INTERESTS 128u
 #define RT_EPOLL_CTL_ADD 1
@@ -621,7 +643,6 @@ int64_t rt_host_epoll_create1(int linux_flags) {
     (void)close(kq); return -23;
 }
 int64_t rt_host_epoll_ctl(int epfd, int op, int fd, const void *linux_epoll_event) {
-    /* Packed Linux struct epoll_event: u32 events @0, u64 data @4. */
     const unsigned char *ev = (const unsigned char *)linux_epoll_event;
     struct rt_epoll_slot *slot = epoll_lookup(epfd);
     struct kevent changes[2]; uint32_t events = 0u, flags, e32; uint64_t data = 0u, d64;
@@ -658,15 +679,16 @@ int64_t rt_host_epoll_ctl(int epfd, int op, int fd, const void *linux_epoll_even
 }
 int64_t rt_host_epoll_pwait(int epfd, void *linux_epoll_events_out, int maxevents, int timeout_ms, const uint64_t *linux_sigmask, rt_worker_sync_t *ws, uint32_t expected_seq) {
     struct rt_epoll_slot *slot = epoll_lookup(epfd);
-    struct kevent *evlist; struct timespec ts, *tsp = NULL; int n, got = 0; unsigned i, j;
-    (void)linux_sigmask;
+    struct kevent *evlist; struct timespec ts, *tsp = NULL; sigset_t saved_mask; int have_saved = 0, n, got = 0; unsigned i, j;
     if (slot == NULL || linux_epoll_events_out == NULL || maxevents <= 0) { return -22; }
     if (maxevents > 1024) { maxevents = 1024; }
     if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { return -4; }
     evlist = (struct kevent *)malloc((size_t)maxevents * sizeof(*evlist));
     if (evlist == NULL) { return -12; }
     if (timeout_ms >= 0) { ts.tv_sec = timeout_ms / 1000; ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L; tsp = &ts; }
+    darwin_sigmask_enter(linux_sigmask, &saved_mask, &have_saved);
     n = kevent(slot->kq, NULL, 0, evlist, maxevents, tsp);
+    darwin_sigmask_leave(&saved_mask, have_saved);
     if (n < 0) { int e = errno; free(evlist); return -(int64_t)e; }
     for (i = 0u; i < (unsigned)n; i++) {
         unsigned char *dst = (unsigned char *)linux_epoll_events_out + (size_t)got * 12u;
@@ -679,194 +701,6 @@ int64_t rt_host_epoll_pwait(int epfd, void *linux_epoll_events_out, int maxevent
     free(evlist);
     if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { return -4; }
     return (int64_t)got;
-}
-/* 7. futex + clocks */
-int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr, const rt_futex_key_t *key, uint32_t host_endian_val, const struct timespec *timeout, int is_abs_timeout, int clock_realtime, uint32_t bitset, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    uint32_t timeout_us = 0u; int r;
-    (void)key; (void)bitset;
-    if (pinned_host_uaddr == NULL) { return -22; }
-    if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { return -4; }
-    if (timeout != NULL) {
-        struct timespec now; int64_t delta_ns; uint64_t us; int clk = clock_realtime ? CLOCK_REALTIME : CLOCK_MONOTONIC;
-        if (clock_gettime((clockid_t)clk, &now) != 0) { return neg_errno(); }
-        if (is_abs_timeout) { delta_ns = ((int64_t)timeout->tv_sec - (int64_t)now.tv_sec) * 1000000000L + ((int64_t)timeout->tv_nsec - (int64_t)now.tv_nsec); }
-        else { delta_ns = (int64_t)timeout->tv_sec * 1000000000L + (int64_t)timeout->tv_nsec; }
-        if (delta_ns <= 0) { return -110; }
-        us = (uint64_t)delta_ns / 1000ULL; timeout_us = us > 0xffffffffULL ? 0xffffffffu : (uint32_t)us;
-    }
-    if (ws != NULL) { atomic_store_explicit(&ws->ulock_wait_addr, (uintptr_t)pinned_host_uaddr, memory_order_release); }
-    r = __ulock_wait(RT_UL_COMPARE_AND_WAIT, (void *)pinned_host_uaddr, (uint64_t)host_endian_val, timeout_us);
-    if (ws != NULL) { atomic_store_explicit(&ws->ulock_wait_addr, (uintptr_t)0, memory_order_release); }
-    if (r == 0) { return 0; }
-    if (r == -1) { /* Timeout surfaces as -1/ETIMEDOUT (observed). */
-        int e = errno;
-        return e == ETIMEDOUT ? -110 : -(int64_t)e;
-    }
-    if (r == 60 || r == 35) { return -110; } /* timeout tokens */
-    return -(int64_t)r;
-}
-int64_t rt_host_futex_wake_bitset(_Atomic uint32_t *pinned_host_uaddr, const rt_futex_key_t *key, int count, uint32_t bitset) {
-    int r; (void)key; (void)bitset; (void)count;
-    if (pinned_host_uaddr == NULL) { return -22; }
-    r = __ulock_wake(RT_UL_COMPARE_AND_WAIT | RT_ULF_WAKE_ALL, (void *)pinned_host_uaddr, 0u); /* plan 6.4b */
-    return r < 0 ? neg_errno() : (int64_t)r;
-}
-int64_t rt_host_futex_requeue(_Atomic uint32_t *pinned_host_uaddr1, const rt_futex_key_t *key1, int wake_count, const rt_futex_key_t *key2, int requeue_count, const uint32_t *host_endian_cmp_val) {
-    (void)key2; (void)requeue_count; (void)host_endian_cmp_val; /* No requeue primitive on Darwin. */
-    return rt_host_futex_wake_bitset(pinned_host_uaddr1, key1, wake_count, 0u);
-}
-int64_t rt_host_clock_gettime(int linux_clk_id, struct timespec *tp) {
-    if (tp == NULL) { return -22; }
-    return libret(clock_gettime((clockid_t)linux_clk_id, tp));
-}
-int64_t rt_host_clock_getres(int linux_clk_id, struct timespec *res) {
-    if (res == NULL) { return -22; }
-    return libret(clock_getres((clockid_t)linux_clk_id, res));
-}
-int64_t rt_host_clock_nanosleep(int linux_clk_id, int linux_flags, const struct timespec *req, struct timespec *rem, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    struct timespec rel; (void)ws; (void)expected_seq;
-    if (req == NULL) { return -22; }
-    if ((linux_flags & 1) != 0) { /* TIMER_ABSTIME: sleep the delta to the absolute target. */
-        struct timespec now;
-        if (clock_gettime((clockid_t)linux_clk_id, &now) != 0) { return neg_errno(); }
-        rel.tv_sec = req->tv_sec - now.tv_sec; rel.tv_nsec = req->tv_nsec - now.tv_nsec;
-        if (rel.tv_nsec < 0) { rel.tv_sec -= 1; rel.tv_nsec += 1000000000L; }
-        if (rel.tv_sec < 0) { return 0; }
-        req = &rel;
-    }
-    return nanosleep(req, rem) != 0 ? neg_errno() : 0;
-}
-int64_t rt_host_getrandom(void *buf, size_t buflen, unsigned int linux_flags) {
-    size_t off = 0u; (void)linux_flags;
-    if (buf == NULL) { return -22; }
-    while (off < buflen) {
-        size_t want = buflen - off; if (want > 256u) { want = 256u; }
-        if (getentropy((char *)buf + off, want) != 0) { return off != 0u ? (int64_t)off : neg_errno(); }
-        off += want;
-    }
-    return (int64_t)buflen;
-}
-/* 8. processes, threads, signals */
-int rt_host_worker_altstack_init(void **out_stack_mem, size_t *out_stack_size) {
-    stack_t ss; void *mem;
-    if (out_stack_mem == NULL || out_stack_size == NULL) { return -22; }
-    mem = malloc(65536u); if (mem == NULL) { return -12; }
-    ss.ss_sp = mem; ss.ss_size = 65536u; ss.ss_flags = 0;
-    if (sigaltstack(&ss, NULL) != 0) { int e = errno; free(mem); return -e; }
-    *out_stack_mem = mem; *out_stack_size = 65536u; return 0;
-}
-void rt_host_worker_altstack_destroy(void *stack_mem, size_t stack_size) {
-    stack_t off; (void)stack_size;
-    off.ss_sp = NULL; off.ss_size = 0u; off.ss_flags = SS_DISABLE;
-    (void)sigaltstack(&off, NULL); free(stack_mem);
-}
-struct worker_start { void *(*fn)(void *); void *arg; pthread_mutex_t mu; pthread_cond_t cv; uint64_t tid; int ready; };
-static void *worker_tramp(void *p) {
-    struct worker_start *st = (struct worker_start *)p;
-    void *(*fn)(void *); void *arg; uint64_t tid = 0u;
-    (void)pthread_mutex_lock(&st->mu);
-    (void)pthread_threadid_np(NULL, &tid); st->tid = tid; st->ready = 1;
-    (void)pthread_cond_signal(&st->cv); (void)pthread_mutex_unlock(&st->mu);
-    darwin_worker_register(tid, pthread_self()); fn = st->fn; arg = st->arg;
-    return fn(arg);
-}
-int rt_host_spawn_worker(void *(*fn)(void *), void *arg, uint64_t *out_host_tid) {
-    struct worker_start st; pthread_t th;
-    if (fn == NULL || out_host_tid == NULL) { return -22; }
-    st.fn = fn; st.arg = arg; st.tid = 0u; st.ready = 0;
-    (void)pthread_mutex_init(&st.mu, NULL); (void)pthread_cond_init(&st.cv, NULL);
-    if (pthread_create(&th, NULL, worker_tramp, &st) != 0) {
-        int e = errno; (void)pthread_mutex_destroy(&st.mu); (void)pthread_cond_destroy(&st.cv); return -e;
-    }
-    (void)pthread_detach(th);
-    (void)pthread_mutex_lock(&st.mu);
-    while (!st.ready) { (void)pthread_cond_wait(&st.cv, &st.mu); }
-    *out_host_tid = st.tid;
-    (void)pthread_mutex_unlock(&st.mu); (void)pthread_mutex_destroy(&st.mu); (void)pthread_cond_destroy(&st.cv);
-    return 0;
-}
-int64_t rt_host_fork(void) { pid_t p = fork(); return p < 0 ? neg_errno() : (int64_t)p; }
-int64_t rt_host_execve(const char *path, char *const argv[], char *const envp[]) {
-    if (path == NULL) { return -22; }
-    execve(path, argv, envp); return neg_errno();
-}
-int64_t rt_host_wait4(int64_t pid, int *linux_status_out, int linux_options, void *rusage_out, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    (void)ws; (void)expected_seq;
-    for (;;) {
-        pid_t r = wait4((pid_t)pid, linux_status_out, linux_options, (struct rusage *)rusage_out);
-        if (r < 0 && errno == EINTR) {
-            if (ws != NULL && atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) { return -4; }
-            continue;
-        }
-        return r < 0 ? neg_errno() : (int64_t)r;
-    }
-}
-int64_t rt_host_waitid(int idtype, int64_t id, void *linux_siginfo_out, int linux_options, void *rusage_out, rt_worker_sync_t *ws, uint32_t expected_seq) {
-    (void)ws; (void)expected_seq;
-    if (rusage_out != NULL) { return -22; }
-    return waitid((idtype_t)idtype, (id_t)id, (siginfo_t *)linux_siginfo_out, linux_options) != 0 ? neg_errno() : 0;
-}
-int64_t rt_host_kill(int64_t pid, int linux_sig) {
-    int d = darwin_signo(linux_sig); if (d < 0) { return -22; }
-    return libret(kill((pid_t)pid, d));
-}
-int64_t rt_host_tgkill(int64_t tgid, int64_t tid, int linux_sig) {
-    int d = darwin_signo(linux_sig); pthread_t th; (void)tgid; /* no tid-targeted kill outside pthreads */
-    if (d < 0) { return -22; }
-    if (d == SIGUSR2) { return rt_host_preempt_worker((uint64_t)tid); }
-    if (!darwin_worker_find((uint64_t)tid, &th)) { return -3; }
-    return pthread_kill(th, d) != 0 ? -(int)errno : 0;
-}
-int rt_host_sigprocmask(int linux_how, const uint64_t *new_set, uint64_t *old_set) {
-    sigset_t in, out; sigset_t *inp = NULL, *outp = NULL;
-    if (new_set != NULL) {
-        uint32_t low = (uint32_t)(*new_set & 0xffffffffULL);
-        (void)memset(&in, 0, sizeof(in));
-        (void)memcpy(&in, &low, sizeof(low) < sizeof(in) ? sizeof(low) : sizeof(in)); inp = &in;
-    }
-    if (old_set != NULL) { outp = &out; }
-    if (pthread_sigmask(linux_how, inp, outp) != 0) { return -(int)errno; }
-    if (old_set != NULL) { uint64_t v = 0u; (void)memcpy(&v, &out, sizeof(out) < sizeof(v) ? sizeof(out) : sizeof(v)); *old_set = v; }
-    return 0;
-}
-void rt_host_exit_thread(int status) { pthread_exit((void *)(uintptr_t)(uint32_t)status); __builtin_unreachable(); }
-void rt_host_exit_group(int status) { _exit(status); __builtin_unreachable(); }
-static rt_host_sync_fault_fn g_on_sync = NULL;
-static rt_host_async_sig_fn g_on_async = NULL;
-static rt_host_preempt_fn g_on_preempt = NULL;
-static void backend_segv_handler(int sig, siginfo_t *info, void *uc) {
-    rt_host_sync_fault_t f; ucontext_t *ctx = (ucontext_t *)uc;
-    (void)memset(&f, 0, sizeof(f));
-    f.linux_si_signo = linux_signo(sig); f.linux_si_code = info != NULL ? info->si_code : 0;
-    f.fault_addr = info != NULL ? (uintptr_t)info->si_addr : (uintptr_t)0;
-    f.host_pc = (uintptr_t)ctx->uc_mcontext->__ss.__pc; f.host_ucontext = uc;
-    if (g_on_sync != NULL) { g_on_sync(&f); }
-}
-static void backend_preempt_handler(int sig, siginfo_t *info, void *uc) {
-    (void)sig; (void)info; if (g_on_preempt != NULL) { g_on_preempt(uc); }
-}
-static void backend_async_handler(int sig, siginfo_t *info, void *uc) {
-    rt_host_async_siginfo_t s; (void)uc; (void)memset(&s, 0, sizeof(s));
-    s.linux_si_signo = linux_signo(sig); s.linux_si_code = info != NULL ? info->si_code : 0;
-    s.sender_pid = info != NULL ? (int32_t)info->si_pid : 0;
-    s.sender_uid = info != NULL ? (uint32_t)info->si_uid : 0u;
-    if (g_on_async != NULL) { g_on_async(&s); }
-}
-int rt_host_install_signal_handlers(rt_host_sync_fault_fn on_sync_fault, rt_host_async_sig_fn on_async_sig, rt_host_preempt_fn on_preempt) {
-    struct sigaction sa;
-    g_on_sync = on_sync_fault; g_on_async = on_async_sig; g_on_preempt = on_preempt;
-    (void)memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = backend_segv_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; (void)sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSEGV, &sa, NULL) != 0) { return -(int)errno; }
-    if (sigaction(SIGBUS, &sa, NULL) != 0) { return -(int)errno; }
-    (void)memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = backend_preempt_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; (void)sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGUSR2, &sa, NULL) != 0) { return -(int)errno; }
-    (void)memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = backend_async_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; (void)sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGCHLD, &sa, NULL) != 0) { return -(int)errno; }
-    if (sigaction(SIGALRM, &sa, NULL) != 0) { return -(int)errno; }
-    return 0;
 }
 #else /* not macOS-arm64: no symbols, keeps -pedantic quiet */
 typedef int rt_host_darwin_unused_t;

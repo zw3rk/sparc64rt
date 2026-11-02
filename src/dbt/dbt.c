@@ -37,8 +37,9 @@ extern void sparc64_dbt_enter_step(sparc64_ctx_t *ctx, const void *entry,
 /* Staging per emitted block (worst case: 64 insns plus delay slot). */
 #define DBT_EMIT_STAGE_BYTES (4096U * 3U)
 #define DBT_EMIT_STAGE_WORDS (DBT_EMIT_STAGE_BYTES / 4U)
-/* Invalidate wider than this many pages courses to a full flush. */
-#define DBT_MAX_PRECISE_PAGES 4096U
+
+extern uint32_t sparc64_dbt_page_version(sparc64_dbt_t *dbt, uint64_t va);
+#define dbt_page_version sparc64_dbt_page_version
 
 /* Lane P5: live dispatcher for the Soft-TLB EXEC write-fill guard
  * (mem_sites.c page_has_code). The TLB is already process-global, so
@@ -61,26 +62,6 @@ struct dbt_chain_ctx {
 };
 
 static struct dbt_chain_ctx dbt_chain;
-
-/* Trampoline probe layout contract (trampoline_a64.S hardcodes these
- * field offsets; break the build loudly if dbt.h ever drifts). */
-_Static_assert(sizeof(sparc64_dbt_ibtc_t) == 24U, "ibtc stride");
-_Static_assert(offsetof(sparc64_dbt_ibtc_t, key) == 0U, "ibtc key");
-_Static_assert(offsetof(sparc64_dbt_ibtc_t, index) == 8U, "ibtc index");
-_Static_assert(offsetof(sparc64_dbt_ibtc_t, epoch) == 12U, "ibtc epoch");
-_Static_assert(offsetof(sparc64_dbt_ibtc_t, valid) == 16U, "ibtc valid");
-_Static_assert(sizeof(sparc64_dbt_block_t) == 48U, "block stride");
-_Static_assert(offsetof(sparc64_dbt_block_t, start_pc) == 0U, "blk start");
-_Static_assert(offsetof(sparc64_dbt_block_t, page_version) == 20U,
-    "blk pagever");
-_Static_assert(offsetof(sparc64_dbt_block_t, epoch) == 24U, "blk epoch");
-_Static_assert(offsetof(sparc64_dbt_block_t, valid) == 28U, "blk valid");
-_Static_assert(offsetof(sparc64_dbt_block_t, host_code) == 40U,
-    "blk code");
-_Static_assert(sizeof(sparc64_dbt_page_t) == 16U, "page stride");
-_Static_assert(offsetof(sparc64_dbt_page_t, vpn) == 0U, "page vpn");
-_Static_assert(offsetof(sparc64_dbt_page_t, version) == 8U, "page ver");
-_Static_assert(offsetof(sparc64_dbt_page_t, valid) == 12U, "page valid");
 
 static void dbt_publish_chain(sparc64_dbt_t *dbt)
 {
@@ -105,11 +86,6 @@ static uint32_t dbt_ibtc_index(uint64_t pc)
     return (uint32_t)((pc >> 2U) & (uint64_t)(SPARC64_IBTC_SIZE - 1U));
 }
 
-static uint32_t dbt_page_index(uint64_t vpn)
-{
-    return (uint32_t)(vpn & (uint64_t)(SPARC64_DBT_PAGE_TABLE_SIZE - 1U));
-}
-
 static sparc64_step_result_t dbt_internal(uint64_t pc)
 {
     sparc64_step_result_t r;
@@ -120,64 +96,6 @@ static sparc64_step_result_t dbt_internal(uint64_t pc)
     r.length = 4U;
     r.memory_reason = SPARC64_MEM_FAULT_INTERNAL;
     return r;
-}
-
-/* ---- Page versions (SMC/mprotect guards) ---- */
-
-static uint32_t dbt_page_version(sparc64_dbt_t *dbt, uint64_t va)
-{
-    uint64_t vpn = va >> SPARC64_DBT_PAGE_SHIFT;
-    sparc64_dbt_page_t *e = &dbt->pages[dbt_page_index(vpn)];
-    if (e->valid && e->vpn == vpn) {
-        return e->version;
-    }
-    return 0U;
-}
-
-static void dbt_flush_all(sparc64_dbt_t *dbt)
-{
-    uint32_t i;
-    size_t span;
-    for (i = 0U; i < SPARC64_DBT_CACHE_SIZE; i++) {
-        dbt->blocks[i].valid = false;
-        dbt->blocks[i].host_code = NULL;
-    }
-    for (i = 0U; i < SPARC64_IBTC_SIZE; i++) {
-        dbt->ibtc[i].valid = false;
-    }
-    dbt->cached_count = 0U;
-    dbt->epoch += 1U;
-    if (dbt->epoch == 0U) {
-        dbt->epoch = 1U;
-    }
-    if (dbt->arena_base != NULL) {
-        if (dbt->arena_published) {
-            span = a32h_page_span(dbt->arena_used);
-            (void)a32h_wx_reopen(dbt->arena_base, span);
-            dbt->arena_published = false;
-        }
-        dbt->arena_used = 0U;
-    }
-}
-
-static void dbt_page_bump(sparc64_dbt_t *dbt, uint64_t vpn)
-{
-    sparc64_dbt_page_t *e = &dbt->pages[dbt_page_index(vpn)];
-    if (!e->valid || e->vpn != vpn) {
-        e->vpn = vpn;
-        e->version = 1U;
-        e->valid = true;
-        return;
-    }
-    e->version += 1U;
-    if (e->version == 0U) {
-        /* Version wrap: fall back to a coarse flush so no stale
-         * block can compare equal again. */
-        dbt_flush_all(dbt);
-        e->vpn = vpn;
-        e->version = 1U;
-        e->valid = true;
-    }
 }
 
 /* ---- W^X code arena (anonymous host memory, outside guest space) ---- */
@@ -225,20 +143,23 @@ static void *dbt_stage(sparc64_dbt_t *dbt, size_t nbytes)
 }
 
 /* Flip newly staged code RX + I-cache clear (W^X stays sequential). */
-static void dbt_publish(sparc64_dbt_t *dbt)
+static bool dbt_publish(sparc64_dbt_t *dbt)
 {
     size_t span;
-    if (dbt->arena_base == NULL || dbt->arena_published ||
-        dbt->arena_used == (size_t)0) {
-        return;
+    if (dbt->arena_base == NULL || dbt->arena_used == (size_t)0) {
+        return false;
+    }
+    if (dbt->arena_published) {
+        return true;
     }
     span = a32h_page_span(dbt->arena_used);
     if (a32h_wx_publish(dbt->arena_base, span) != 0) {
-        return;
+        return false;
     }
     a32h_icache_clear(dbt->arena_base,
         (void *)((uint8_t *)dbt->arena_base + dbt->arena_used));
     dbt->arena_published = true;
+    return true;
 }
 
 /* ---- Decode helpers ---- */
@@ -676,8 +597,7 @@ sparc64_step_result_t sparc64_dbt_step_one(sparc64_dbt_t *dbt,
     }
     if (!dbt->arena_published) dbt->arena_used = 0U;
     code = dbt_emit_range(dbt, mem, mc, pc, pc + span);
-    if (code == NULL) return sparc64_step(ctx, mem, mc);
-    dbt_publish(dbt);
+    if (code == NULL || !dbt_publish(dbt)) return sparc64_step(ctx, mem, mc);
     return dbt_enter_block(ctx, mem, mc, dbt, code, false);
 }
 
@@ -770,32 +690,6 @@ static void dbt_note_transfer(sparc64_dbt_t *dbt, const sparc64_dec_t *d,
 
 /* ---- Frozen cross-lane interface ---- */
 
-int sparc64_dbt_init(sparc64_dbt_t *dbt)
-{
-    if (dbt == NULL) {
-        return -1;
-    }
-    (void)memset(dbt, 0, sizeof(*dbt));
-    /* The Soft-TLB table is BSS-zeroed (tag 0 would false-hit VPN 0 and
-     * dereference the raw guest VA on the host); poison every tag to
-     * ~0ULL before any translated code can run. */
-    sparc64_tlb_init();
-    dbt->epoch = 1U;
-    dbt->arena_base = NULL;
-    dbt->arena_used = 0U;
-    dbt->arena_published = false;
-    return 0;
-}
-
-void sparc64_dbt_fini(sparc64_dbt_t *dbt)
-{
-    if (dbt == NULL) {
-        return;
-    }
-    a32h_arena_unmap(dbt->arena_base, SPARC64_DBT_CODE_ARENA_SIZE);
-    (void)memset(dbt, 0, sizeof(*dbt));
-}
-
 sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
     const sparc64_mem_ops_t *mem, void *mc, sparc64_dbt_t *dbt)
 {
@@ -807,7 +701,7 @@ sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
         const sparc64_dbt_block_t *b;
         sparc64_step_result_t fail;
         uint32_t i;
-        dbt_publish(dbt);
+        (void)dbt_publish(dbt);
         b = dbt_ibtc_probe(dbt, ctx->pc);
         if (b == NULL) {
             b = dbt_lookup(mem, mc, dbt, ctx->pc, &fail);
@@ -817,9 +711,9 @@ sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
             dbt_ibtc_fill(dbt, ctx->pc, dbt_cache_index(ctx->pc));
         }
         ctx->blocks_executed += 1U;
-        if (!b->needs_interp && b->host_code != NULL) {
+        if (!b->needs_interp && b->host_code != NULL &&
+            dbt_publish(dbt)) {
             sparc64_step_result_t r;
-            dbt_publish(dbt);
             r = dbt_enter_block(ctx, mem, mc, dbt, b->host_code,
                 false);
             dbt_note_transfer(dbt, NULL, ctx->pc, 0U);
@@ -842,51 +736,6 @@ sparc64_step_result_t sparc64_dbt_run(sparc64_ctx_t *ctx,
             if (b->ends_cti) {
                 break; /* CTI consumed its delay slot; chain next. */
             }
-        }
-    }
-}
-
-void sparc64_dbt_invalidate(sparc64_dbt_t *dbt, uint64_t va, uint64_t len)
-{
-    uint64_t end;
-    uint64_t first_vpn;
-    uint64_t last_vpn;
-    uint64_t vpn;
-    uint32_t i;
-    if (dbt == NULL || len == UINT64_C(0)) {
-        return;
-    }
-    end = va + len;
-    if (end <= va) {
-        dbt_flush_all(dbt); /* Range wraps: coarse flush. */
-        return;
-    }
-    first_vpn = va >> SPARC64_DBT_PAGE_SHIFT;
-    last_vpn = (end - UINT64_C(1)) >> SPARC64_DBT_PAGE_SHIFT;
-    if (last_vpn - first_vpn >= (uint64_t)DBT_MAX_PRECISE_PAGES) {
-        dbt_flush_all(dbt);
-        return;
-    }
-    for (vpn = first_vpn; vpn <= last_vpn; vpn++) {
-        dbt_page_bump(dbt, vpn);
-        if (vpn == UINT64_MAX >> SPARC64_DBT_PAGE_SHIFT) {
-            break;
-        }
-    }
-    for (i = 0U; i < SPARC64_DBT_CACHE_SIZE; i++) {
-        sparc64_dbt_block_t *b = &dbt->blocks[i];
-        if (b->valid && !(b->end_pc <= va || b->start_pc >= end)) {
-            b->valid = false;
-            b->host_code = NULL;
-            if (dbt->cached_count != 0U) {
-                dbt->cached_count -= 1U;
-            }
-        }
-    }
-    for (i = 0U; i < SPARC64_IBTC_SIZE; i++) {
-        sparc64_dbt_ibtc_t *e = &dbt->ibtc[i];
-        if (e->valid && !(e->key < va || e->key >= end)) {
-            e->valid = false;
         }
     }
 }

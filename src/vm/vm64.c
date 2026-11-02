@@ -167,8 +167,12 @@ int vm64_check_mprotect_args(uint64_t addr, uint64_t len, uint64_t *size_out)
     if (!vm64_is_8k_aligned(addr)) {
         return -VM64_EINVAL;
     }
+    if (addr < VM64_ABI_PAGE || addr >= VM64_TASK_SIZE ||
+        len > VM64_TASK_SIZE) {
+        return -VM64_ENOMEM;
+    }
     size = vm64_align_up_8k(len);
-    if (addr < VM64_ABI_PAGE || size > VM64_TASK_SIZE - addr) {
+    if (size > VM64_TASK_SIZE - addr) {
         return -VM64_ENOMEM;
     }
     if (size_out != NULL) {
@@ -184,15 +188,16 @@ int vm64_check_munmap_args(uint64_t addr, uint64_t len, uint64_t *base_out,
 {
     uint64_t base;
     uint64_t size;
-    if (len == UINT64_C(0)) {
+    if (len == UINT64_C(0) || len > VM64_TASK_SIZE) {
         return -VM64_EINVAL;
     }
-    if (!vm64_is_8k_aligned(addr)) {
+    if (!vm64_is_8k_aligned(addr) || addr < VM64_ABI_PAGE ||
+        addr >= VM64_TASK_SIZE) {
         return -VM64_EINVAL;
     }
     base = vm64_align_down_8k(addr);
-    size = vm64_align_up_8k(addr + len) - base;
-    if (base < VM64_ABI_PAGE || size > VM64_TASK_SIZE - base) {
+    size = vm64_align_up_8k(len);
+    if (size > VM64_TASK_SIZE - base) {
         return -VM64_EINVAL;
     }
     if (base_out != NULL) {
@@ -212,16 +217,17 @@ int vm64_check_mremap_args(uint64_t old_addr, uint64_t old_size,
 {
     uint64_t base;
     uint64_t size;
-    if (old_size == UINT64_C(0) || new_size == UINT64_C(0) ||
-        new_size > VM64_TASK_SIZE) {
+    if (old_size == UINT64_C(0) || old_size > VM64_TASK_SIZE ||
+        new_size == UINT64_C(0) || new_size > VM64_TASK_SIZE) {
         return -VM64_EINVAL;
     }
-    if (!vm64_is_8k_aligned(old_addr)) {
+    if (!vm64_is_8k_aligned(old_addr) || old_addr < VM64_ABI_PAGE ||
+        old_addr >= VM64_TASK_SIZE) {
         return -VM64_EINVAL;
     }
     base = vm64_align_down_8k(old_addr);
-    size = vm64_align_up_8k(old_addr + old_size) - base;
-    if (base < VM64_ABI_PAGE || size > VM64_TASK_SIZE - base) {
+    size = vm64_align_up_8k(old_size);
+    if (size > VM64_TASK_SIZE - base) {
         return -VM64_EINVAL;
     }
     if ((flags & ~(VM64_MREMAP_MAYMOVE | VM64_MREMAP_FIXED)) != 0u) {
@@ -253,6 +259,10 @@ int vm64_round_elf_span(uint64_t p_vaddr, uint64_t p_memsz,
     uint64_t start;
     uint64_t end;
     if (p_memsz == UINT64_C(0) || p_memsz < p_filesz) {
+        return -VM64_EFAULT;
+    }
+    if (p_vaddr < VM64_ABI_PAGE || p_vaddr >= VM64_TASK_SIZE ||
+        p_memsz > VM64_TASK_SIZE - p_vaddr) {
         return -VM64_EFAULT;
     }
     start = vm64_align_down_8k(p_vaddr);

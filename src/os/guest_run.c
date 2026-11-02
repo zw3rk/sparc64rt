@@ -43,6 +43,8 @@
 #include "os/syscalls_min.h"
 #include "os/guest_interp_map.h"
 #include "os/mem_space.h"
+#include "interp/interp.h"
+#include "vm/vm64.h"
 
 /* ---- Guest ABI constants (SPARC Linux, arch/sparc) --------------------- */
 #define GUEST_PAGE_MASK (GUEST_PAGE_SIZE - UINT64_C(1))
@@ -77,11 +79,6 @@
 static uint64_t align_up(uint64_t v, uint64_t a)
 {
     return (v + (a - UINT64_C(1))) & ~(a - UINT64_C(1));
-}
-
-static uint64_t align_down(uint64_t v, uint64_t a)
-{
-    return v & ~(a - UINT64_C(1));
 }
 
 /* ---- Big-endian readers/writers (guest is BE, host may be LE) ---------- */
@@ -356,18 +353,13 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
             file_phoff < rd64be(phdr + 8) + p_filesz) {
             phdr_va = p_vaddr + (file_phoff - rd64be(phdr + 8));
         }
-        if (p_memsz == 0U || p_memsz < p_filesz) {
-            return -LOAD_BAD;
-        }
         perms = ((p_flags & GUEST_PF_R) != 0U ? SPARC64_MEM_READ : 0U) |
                 ((p_flags & GUEST_PF_W) != 0U ? SPARC64_MEM_WRITE : 0U) |
                 ((p_flags & GUEST_PF_X) != 0U ? SPARC64_MEM_EXEC : 0U);
-        /* Round to the 8K loader granule (see GUEST_MAP_GRANULE);
+        /* Round to the 8K loader granule via vm64_round_elf_span;
          * overlapping rounded spans union perms harmlessly. */
-        start = align_down(p_vaddr, GUEST_MAP_GRANULE);
-        end = align_up(p_vaddr + p_memsz, GUEST_MAP_GRANULE);
-        if (end <= start || end - start > SPARC64_TASK_SIZE ||
-            start < GUEST_PAGE_SIZE || end > SPARC64_TASK_SIZE) {
+        if (vm64_round_elf_span(p_vaddr, p_memsz, p_filesz, &start,
+                &end) != 0) {
             return -LOAD_BAD;
         }
         if (!sparc64_space_map(&g->space, start, end - start, perms, true)) {
@@ -684,6 +676,7 @@ int sparc64_guest_exec_image(guest_state_t *g, sparc64_ctx_t *ctx,
         sparc64_dbt_invalidate(g->dbt, 0U, SPARC64_TASK_SIZE);
     }
     sparc64_tlb_init();
+    sparc64_win_invalidate_all();
     sparc64_ctx_init(ctx, start_entry);
     ctx->r[SPARC64_SP] = sp;
     /* Fresh windows (E01): CWP 0, no invalid windows, so the first

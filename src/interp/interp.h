@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "core/cpu.h"
+#include "interp/decode.h"
 
 /* Decoded-instruction class: one per execution family. FPU forms decode so
  * the stepper can skip them to the Phase 3 illegal-trap marker. */
@@ -29,11 +30,11 @@ typedef enum {
     SPARC64_ICLS_FBR,   /* FBfcc: delay-shape like Bicc, Phase 3 owns fcc. */
     SPARC64_ICLS_ALU,   /* Integer ALU incl. MULX/DIVX/POPC/TAG/MULScc. */
     SPARC64_ICLS_SHIFT, /* SLL/SRL/SRA/SLLX/SRLX/SRAX. */
-    SPARC64_ICLS_MOVCC, /* Integer MOVcc (op3 0x2C, bit 18 set). */
+    SPARC64_ICLS_MOVCC, /* MOVcc (op3 0x2C, integer or FP condition codes). */
     SPARC64_ICLS_MOVR,  /* Integer MOVr (op3 0x2F). */
     SPARC64_ICLS_RDASR,
     SPARC64_ICLS_WRASR,
-    SPARC64_ICLS_MEMBAR, /* op3 0x2C with bit 18 clear: host-model nop. */
+    SPARC64_ICLS_MEMBAR, /* op3 0x28 with rs1 15: host-model nop. */
     SPARC64_ICLS_FLUSH,  /* Cache-flush hint: host-model nop. */
     SPARC64_ICLS_ALIGN,  /* ALIGNADDR / ALIGNADDRL (op3 0x36, opf 0x18/0x1A). */
     SPARC64_ICLS_JMPL,
@@ -53,124 +54,15 @@ typedef enum {
     SPARC64_ICLS_FPU     /* FPop1/FPop2, FP loads/stores, FALIGNDATA. */
 } sparc64_icls_t;
 
-/* op == 2 (Format 3 ALU/misc) op3 values (SPARC V9). */
-#define SPARC64_OP3_ADD 0x00U
-#define SPARC64_OP3_AND 0x01U
-#define SPARC64_OP3_OR 0x02U
-#define SPARC64_OP3_XOR 0x03U
-#define SPARC64_OP3_SUB 0x04U
-#define SPARC64_OP3_ANDN 0x05U
-#define SPARC64_OP3_ORN 0x06U
-#define SPARC64_OP3_XORN 0x07U
-#define SPARC64_OP3_ADDX 0x08U
-#define SPARC64_OP3_MULX 0x09U
-#define SPARC64_OP3_UMUL 0x0AU
-#define SPARC64_OP3_SMUL 0x0BU
-#define SPARC64_OP3_SUBX 0x0CU
-#define SPARC64_OP3_UDIVX 0x0DU
-#define SPARC64_OP3_UDIV 0x0EU
-#define SPARC64_OP3_SDIV 0x0FU
-#define SPARC64_OP3_ADDCC 0x10U
-#define SPARC64_OP3_ANDCC 0x11U
-#define SPARC64_OP3_ORCC 0x12U
-#define SPARC64_OP3_XORCC 0x13U
-#define SPARC64_OP3_SUBCC 0x14U
-#define SPARC64_OP3_ANDNCC 0x15U
-#define SPARC64_OP3_ORNCC 0x16U
-#define SPARC64_OP3_XORNCC 0x17U
-#define SPARC64_OP3_ADDXCC 0x18U
-#define SPARC64_OP3_UMULCC 0x1AU
-#define SPARC64_OP3_SMULCC 0x1BU
-#define SPARC64_OP3_SUBXCC 0x1CU
-#define SPARC64_OP3_UDIVCC 0x1EU
-#define SPARC64_OP3_SDIVCC 0x1FU
-#define SPARC64_OP3_TADDCC 0x20U
-#define SPARC64_OP3_TSUBCC 0x21U
-#define SPARC64_OP3_TADDCTV 0x22U
-#define SPARC64_OP3_TSUBCTV 0x23U
-#define SPARC64_OP3_MULSCC 0x24U
-#define SPARC64_OP3_SLL 0x25U
-#define SPARC64_OP3_SRL 0x26U
-#define SPARC64_OP3_SRA 0x27U
-#define SPARC64_OP3_RDASR 0x28U
-#define SPARC64_OP3_RDPR 0x2AU
-#define SPARC64_OP3_RDHPR 0x29U
-#define SPARC64_OP3_FLUSHW 0x2BU
-#define SPARC64_OP3_MOVCC 0x2CU
-#define SPARC64_OP3_SDIVX 0x2DU
-#define SPARC64_OP3_POPC 0x2EU
-#define SPARC64_OP3_MOVR 0x2FU
-#define SPARC64_OP3_WRASR 0x30U
-#define SPARC64_OP3_WRPR 0x32U
-#define SPARC64_OP3_WRHPR 0x31U
-#define SPARC64_OP3_FPOP1 0x34U
-#define SPARC64_OP3_FPOP2 0x35U
-#define SPARC64_OP3_VIS 0x36U
-#define SPARC64_OP3_JMPL 0x38U
-#define SPARC64_OP3_RETURN 0x39U
-#define SPARC64_OP3_TCC 0x3AU
-#define SPARC64_OP3_FLUSH 0x3BU
-#define SPARC64_OP3_SAVE 0x3CU
-#define SPARC64_OP3_RESTORE 0x3DU
-#define SPARC64_OP3_DONE 0x3EU
-#define SPARC64_OP3_RETRY 0x3FU
-
-/* op == 3 (Format 3 memory) op3 values (SPARC V9). */
-#define SPARC64_OP3_LDUW 0x00U
-#define SPARC64_OP3_LDUB 0x01U
-#define SPARC64_OP3_LDUH 0x02U
-#define SPARC64_OP3_LDD 0x03U
-#define SPARC64_OP3_STW 0x04U
-#define SPARC64_OP3_STB 0x05U
-#define SPARC64_OP3_STH 0x06U
-#define SPARC64_OP3_STD 0x07U
-#define SPARC64_OP3_LDSW 0x08U
-#define SPARC64_OP3_LDSB 0x09U
-#define SPARC64_OP3_LDSH 0x0AU
-#define SPARC64_OP3_LDX 0x0BU
-#define SPARC64_OP3_STX 0x0EU
-#define SPARC64_OP3_LDSTUB 0x0DU
-#define SPARC64_OP3_SWAP 0x0FU
-#define SPARC64_OP3_LDA 0x10U
-#define SPARC64_OP3_LDUBA 0x11U
-#define SPARC64_OP3_LDUHA 0x12U
-#define SPARC64_OP3_LDDA 0x13U
-#define SPARC64_OP3_STA 0x14U
-#define SPARC64_OP3_STBA 0x15U
-#define SPARC64_OP3_STHA 0x16U
-#define SPARC64_OP3_STDA 0x17U
-#define SPARC64_OP3_LDSWA 0x18U
-#define SPARC64_OP3_LDSBA 0x19U
-#define SPARC64_OP3_LDSHA 0x1AU
-#define SPARC64_OP3_LDXA 0x1BU
-#define SPARC64_OP3_STXA 0x1CU
-#define SPARC64_OP3_LDSTUBA 0x1DU
-#define SPARC64_OP3_SWAPA 0x1FU
-#define SPARC64_OP3_LDF 0x20U
-#define SPARC64_OP3_LDFSR 0x21U
-#define SPARC64_OP3_LDTW 0x22U
-#define SPARC64_OP3_LDDF 0x23U
-#define SPARC64_OP3_STF 0x24U
-#define SPARC64_OP3_STFSR 0x25U
-#define SPARC64_OP3_STTW 0x26U
-#define SPARC64_OP3_STDF 0x27U
-#define SPARC64_OP3_LDFA 0x30U
-#define SPARC64_OP3_LDDFA 0x33U
-#define SPARC64_OP3_STFA 0x34U
-#define SPARC64_OP3_STDFA 0x37U
-#define SPARC64_OP3_PREFETCH 0x2DU
-#define SPARC64_OP3_CASA 0x3CU
-#define SPARC64_OP3_CASXA 0x3EU
-
-/* ASR numbers for RDASR/WRASR (rs1/rd field). TICK/PC/SOFTINT (20-22),
- * TICK_CMPR (23), STICK/STICK_CMPR (24-25) are supervisor-only. */
-#define SPARC64_ASR_Y 0U
-#define SPARC64_ASR_CCR 2U
-#define SPARC64_ASR_ASI 3U
-#define SPARC64_ASR_TICK 4U
-#define SPARC64_ASR_PC 5U
-#define SPARC64_ASR_FPRS 6U
-#define SPARC64_ASR_GSR 19U
+/* Short aliases onto canonical SPARC V9 op3 names in decode.h. */
+#define SPARC64_OP3_XORN    SPARC64_OP3_XNOR
+#define SPARC64_OP3_XORNCC  SPARC64_OP3_XNORCC
+#define SPARC64_OP3_TADDCTV SPARC64_OP3_TADDCCTV
+#define SPARC64_OP3_TSUBCTV SPARC64_OP3_TSUBCCTV
+#define SPARC64_OP3_VIS     SPARC64_OP3_ALIGN
+#define SPARC64_OP3_RETRY   0x3FU
+#define SPARC64_OP3_LDTW    SPARC64_OP3_LDQF
+#define SPARC64_OP3_STTW    SPARC64_OP3_STQF
 
 /* User data ASIs (SPEC 2.1). 0x80/0x82 big-endian, 0x88/0x8a little-endian
  * (endianness selects on bit 3). Anything below 0x80 traps privileged. */

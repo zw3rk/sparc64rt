@@ -64,4 +64,16 @@ uint64_t vm64_seq_rewind_live(uint64_t pc);
 /* Zero a host span (memset); split out for testability. */
 void vm64_zero_span(void *host_addr, size_t len);
 
+/* Guest-visible 8 KiB argument validation and ELF PT_LOAD rounding
+ * (section 4.2.1). */
+int vm64_check_mmap_args(uint64_t addr, uint64_t len, uint64_t offset,
+    unsigned flags_fixed);
+int vm64_check_mprotect_args(uint64_t addr, uint64_t len, uint64_t *size_out);
+int vm64_check_munmap_args(uint64_t addr, uint64_t len, uint64_t *base_out,
+    uint64_t *size_out);
+int vm64_check_mremap_args(uint64_t old_addr, uint64_t old_size,
+    uint64_t new_size, unsigned flags, uint64_t new_addr);
+int vm64_round_elf_span(uint64_t p_vaddr, uint64_t p_memsz,
+    uint64_t p_filesz, uint64_t *start_out, uint64_t *end_out);
+
 #endif /* SPARC64RT_VM_VM64_H */

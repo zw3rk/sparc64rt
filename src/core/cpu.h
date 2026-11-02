@@ -213,7 +213,7 @@ static inline void sparc64_ctx_init(sparc64_ctx_t *ctx, uint64_t entry_pc)
     ctx->asi = 0U;
     ctx->pil = 0U;
     for (unsigned i = 0; i < 32; ++i)
-        ctx->fp.f[i] = 0U;
+        ctx->fp.d[i] = UINT64_C(0);
     for (unsigned i = 0; i < 4; ++i)
         ctx->fcc[i] = 0U;
     ctx->cwp = 0U;

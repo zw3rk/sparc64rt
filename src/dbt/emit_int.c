@@ -88,7 +88,8 @@ static bool e_cc_lookahead_xcc(sparc64_emit_ctx_t *ec)
         sparc64_classify_word(raw, &d);
         if (d.cls == (uint8_t)SPARC64_ICLS_BICC ||
             d.cls == (uint8_t)SPARC64_ICLS_BPCC ||
-            d.cls == (uint8_t)SPARC64_ICLS_MOVCC) {
+            (d.cls == (uint8_t)SPARC64_ICLS_MOVCC &&
+             (d.cc & 4U) == 0U)) {
             return d.cc == 2U;
         }
         if (!e_cc_transparent(&d)) {

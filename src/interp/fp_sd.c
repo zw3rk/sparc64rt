@@ -124,7 +124,7 @@ typedef struct sd_unp {
 
 /* Classify a raw pattern: 0 zero, 2 finite nonzero, 3 infinity,
  * 4 quiet NaN, 5 signaling NaN. Width selects single (0) / double. */
-static unsigned sd_class(uint64_t u, unsigned w)
+unsigned sparc64_sd_class(uint64_t u, unsigned w)
 {
     unsigned eshift = (w == 0U) ? 23U : 52U;
     uint64_t emask = (w == 0U) ? UINT64_C(0xFF) : UINT64_C(0x7FF);
@@ -149,7 +149,7 @@ static unsigned sd_class(uint64_t u, unsigned w)
 
 /* Unpack a finite-nonzero pattern (caller classifies first). P is the
  * significand width (24/53); emin the least normal exponent. */
-static void sd_unpack(uint64_t u, unsigned w, unsigned p, int emin,
+void sparc64_sd_unpack(uint64_t u, unsigned w, unsigned p, int emin,
     sd_unp_t *q)
 {
     unsigned eshift = (w == 0U) ? 23U : 52U;
@@ -182,11 +182,11 @@ static void sd_unpack(uint64_t u, unsigned w, unsigned p, int emin,
  * NaN (larger payload first, tie: rs1); QNaN-only inputs yield the
  * larger-payload QNaN (tie: rs1), quietly. Width selects single (0) /
  * double. Returns true when a NaN input was present. */
-static bool sd_nan2(uint64_t a, uint64_t b, unsigned w, uint64_t *out,
+bool sparc64_sd_nan2(uint64_t a, uint64_t b, unsigned w, uint64_t *out,
     unsigned *nv)
 {
-    unsigned ca = sd_class(a, w);
-    unsigned cb = sd_class(b, w);
+    unsigned ca = sparc64_sd_class(a, w);
+    unsigned cb = sparc64_sd_class(b, w);
     uint64_t fmask = (w == 0U) ? UINT64_C(0x7FFFFF)
                                : UINT64_C(0x000FFFFFFFFFFFFF);
     uint64_t qbit = (w == 0U) ? UINT64_C(0x400000)
@@ -221,9 +221,9 @@ static bool sd_nan2(uint64_t a, uint64_t b, unsigned w, uint64_t *out,
 
 /* Unary NaN propagation (sqrt, and single-source moves use raw copy).
  * SNaN sets NV and quiets; QNaN propagates quietly. */
-static bool sd_nan1(uint64_t a, unsigned w, uint64_t *out, unsigned *nv)
+bool sparc64_sd_nan1(uint64_t a, unsigned w, uint64_t *out, unsigned *nv)
 {
-    unsigned ca = sd_class(a, w);
+    unsigned ca = sparc64_sd_class(a, w);
     uint64_t qbit = (w == 0U) ? UINT64_C(0x400000)
                               : UINT64_C(0x0008000000000000);
     if (ca != 4U && ca != 5U) {
@@ -240,7 +240,7 @@ static bool sd_nan1(uint64_t a, unsigned w, uint64_t *out, unsigned *nv)
  * P - 1, exp the unbiased exponent, g/r/s the guard/round/sticky bits.
  * Yields the encoded value and the cexc flags (OF|NX on overflow,
  * UF when tiny and inexact, NX whenever anything was discarded). */
-static unsigned sd_pack(unsigned neg, int exp, uint64_t sig, unsigned g,
+unsigned sparc64_sd_pack(unsigned neg, int exp, uint64_t sig, unsigned g,
     unsigned r, unsigned s, unsigned p, int emin, int emax, int bias,
     int rm, uint64_t *out)
 {
@@ -482,62 +482,17 @@ static void sd_div(const sd_unp_t *a, const sd_unp_t *b, unsigned p,
         (__uint128_t)0)) ? 1U : 0U);
 }
 
-/* Integer square root: restoring binary sqrt over the even bit
- * positions down from top, remainder jammed into the sticky bit. */
-static void sd_isqrt(__uint128_t n, unsigned top, uint64_t *root,
-    unsigned *s)
-{
-    __uint128_t rr = (__uint128_t)0;
-    __uint128_t rem = (__uint128_t)0;
-    unsigned i = top;
-    for (;;) {
-        __uint128_t trial;
-        rem = (rem << 2) | ((n >> i) & (__uint128_t)3);
-        rr <<= 1;
-        trial = (rr << 1) | (__uint128_t)1;
-        if (rem >= trial) {
-            rem -= trial;
-            rr |= (__uint128_t)1;
-        }
-        if (i == 0U) {
-            break;
-        }
-        i -= 2U;
-    }
-    *root = (uint64_t)rr;
-    *s = (rem != (__uint128_t)0) ? 1U : 0U;
-}
-
-/* Square root of a finite nonzero positive value. With the P + 3
- * shift the radicand spans [2^(2P+2), 2^(2P+4)), so the root has
- * exactly P + 2 bits and splits into sig P + guard + round. */
-static void sd_sqrt(const sd_unp_t *a, unsigned p, unsigned *neg, int *exp,
-    uint64_t *sig, unsigned *g, unsigned *r, unsigned *s)
-{
-    __uint128_t top = (__uint128_t)a->sig;
-    __uint128_t n;
-    uint64_t root;
-    unsigned ss;
-    int e = a->exp;
-    unsigned topbit = 2U * p + 2U;
-    if ((e & 1) != 0) {
-        top <<= 1;
-        e -= 1;
-    }
-    n = top << (p + 3U);
-    sd_isqrt(n, topbit, &root, &ss);
-    *neg = a->neg;
-    *exp = e / 2;
-    *sig = root >> 2;
-    *g = (unsigned)((root >> 1) & UINT64_C(1));
-    *r = (unsigned)(root & UINT64_C(1));
-    *s = ss;
-}
-
-/* Forward declarations: the op dispatcher precedes the mul core. */
-static void sd_mul(const sd_unp_t *a, const sd_unp_t *b, unsigned p,
+/* Forward declarations: the op dispatcher precedes the mul core;
+ * sqrt/fsmuld/dtos helpers live in src/interp/fp_conv.c (S64-14). */
+void sparc64_sd_mul(const sd_unp_t *a, const sd_unp_t *b, unsigned p,
     unsigned *neg, int *exp, uint64_t *sig, unsigned *g, unsigned *r,
     unsigned *s);
+sparc64_step_result_t sparc64_sd_sqrt_op(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned w);
+sparc64_step_result_t sparc64_sd_fsmuld(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d);
+sparc64_step_result_t sparc64_sd_dtos(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d);
 
 /* All-ones result (invalid non-NaN): single 0x7FFFFFFF or double
  * 0x7FFFFFFFFFFFFFFF. */
@@ -575,8 +530,8 @@ static sparc64_step_result_t sd_arith(sparc64_cpu_t *cpu, uint64_t pc,
     int emin = (w == 0U) ? -126 : -1022;
     int emax = (w == 0U) ? 127 : 1023;
     int bias = (w == 0U) ? 127 : 1023;
-    unsigned ca = sd_class(a, w);
-    unsigned cb = sd_class(b, w);
+    unsigned ca = sparc64_sd_class(a, w);
+    unsigned cb = sparc64_sd_class(b, w);
     unsigned aneg = (unsigned)(a >> ((w == 0U) ? 31U : 63U));
     unsigned bneg = (unsigned)(b >> ((w == 0U) ? 31U : 63U));
     int rm = sd_rd_mode(cpu);
@@ -594,7 +549,7 @@ static sparc64_step_result_t sd_arith(sparc64_cpu_t *cpu, uint64_t pc,
     uint64_t rzero = (w == 0U) ? (uint64_t)((unsigned)(aneg ^ bneg ^ (op == 1U ? 1U : 0U)) << 31)
                                : ((uint64_t)(aneg ^ bneg ^ (op == 1U ? 1U : 0U)) << 63);
     if (ca >= 4U || cb >= 4U) {
-        if (!sd_nan2(a, b, w, &o, &fl)) {
+        if (!sparc64_sd_nan2(a, b, w, &o, &fl)) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
         sd_store(cpu, w, d->rd, o);
@@ -659,23 +614,23 @@ static sparc64_step_result_t sd_arith(sparc64_cpu_t *cpu, uint64_t pc,
             return sd_commit(cpu, pc, d, 0U);
         }
     }
-    sd_unpack(a, w, p, emin, &ua);
-    sd_unpack(b, w, p, emin, &ub);
+    sparc64_sd_unpack(a, w, p, emin, &ua);
+    sparc64_sd_unpack(b, w, p, emin, &ub);
     if (op <= 1U) {
         sd_addsub(&ua, &ub, op & 1U, p, rd, &neg, &exp, &sig, &g, &r, &s);
     } else if (op == 2U) {
-        sd_mul(&ua, &ub, p, &neg, &exp, &sig, &g, &r, &s);
+        sparc64_sd_mul(&ua, &ub, p, &neg, &exp, &sig, &g, &r, &s);
     } else {
         sd_div(&ua, &ub, p, &neg, &exp, &sig, &g, &r, &s);
     }
-    fl = sd_pack(neg, exp, sig, g, r, s, p, emin, emax, bias, rm, &o);
+    fl = sparc64_sd_pack(neg, exp, sig, g, r, s, p, emin, emax, bias, rm, &o);
     sd_store(cpu, w, d->rd, o);
     return sd_commit(cpu, pc, d, fl);
 }
 
 /* Multiply unpacked finite nonzero values. The product has at most
  * 2P bits; the top P feed sig (hidden at P - 1) with GRS below. */
-static void sd_mul(const sd_unp_t *a, const sd_unp_t *b, unsigned p,
+void sparc64_sd_mul(const sd_unp_t *a, const sd_unp_t *b, unsigned p,
     unsigned *neg, int *exp, uint64_t *sig, unsigned *g, unsigned *r,
     unsigned *s)
 {
@@ -696,162 +651,6 @@ static void sd_mul(const sd_unp_t *a, const sd_unp_t *b, unsigned p,
         smask = (((__uint128_t)1 << (p - 3U)) - (__uint128_t)1);
         *s = ((prod & smask) != (__uint128_t)0) ? 1U : 0U;
         *exp = a->exp + b->exp;
-    }
-}
-
-/* Square root with the oracle's edge rules. */
-static sparc64_step_result_t sd_sqrt_op(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d, unsigned w)
-{
-    uint64_t a = sd_load(cpu, w, d->raw & 31U);
-    unsigned p = (w == 0U) ? 24U : 53U;
-    int emin = (w == 0U) ? -126 : -1022;
-    int emax = (w == 0U) ? 127 : 1023;
-    int bias = (w == 0U) ? 127 : 1023;
-    unsigned ca = sd_class(a, w);
-    unsigned aneg = (unsigned)(a >> ((w == 0U) ? 31U : 63U));
-    int rm = sd_rd_mode(cpu);
-    sd_unp_t ua;
-    unsigned neg = 0U;
-    int exp = 0;
-    uint64_t sig = UINT64_C(0);
-    unsigned g = 0U;
-    unsigned r = 0U;
-    unsigned s = 0U;
-    uint64_t o;
-    unsigned fl;
-    if (ca >= 4U) {
-        if (!sd_nan1(a, w, &o, &fl)) {
-            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
-        }
-        sd_store(cpu, w, d->rd, o);
-        return sd_commit(cpu, pc, d, fl);
-    }
-    if (aneg != 0U && ca != 0U) {
-        sd_store(cpu, w, d->rd, sd_allones(w));
-        return sd_commit(cpu, pc, d, 0x10U);
-    }
-    if (ca == 0U || ca == 3U) {
-        sd_store(cpu, w, d->rd, a);
-        return sd_commit(cpu, pc, d, 0U);
-    }
-    sd_unpack(a, w, p, emin, &ua);
-    sd_sqrt(&ua, p, &neg, &exp, &sig, &g, &r, &s);
-    fl = sd_pack(neg, exp, sig, g, r, s, p, emin, emax, bias, rm, &o);
-    sd_store(cpu, w, d->rd, o);
-    return sd_commit(cpu, pc, d, fl);
-}
-
-/* FSMULD: single * single -> double. The product needs at most 48
- * significand bits, so it is always exact; only NaN and inf*0 need
- * handling (invalid -> all-ones double + NV). A subnormal double
- * result sets UF. */
-static sparc64_step_result_t sd_fsmuld(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d)
-{
-    uint32_t a = cpu->fp.f[(d->rs1 & 31U) ^ 1U];
-    uint32_t b = cpu->fp.f[(d->raw & 31U) ^ 1U];
-    bool an = sd_class((uint64_t)a, 0U) >= 4U;
-    bool bn = sd_class((uint64_t)b, 0U) >= 4U;
-    bool az = ((a & UINT32_C(0x7FFFFFFF)) == UINT32_C(0));
-    bool bz = ((b & UINT32_C(0x7FFFFFFF)) == UINT32_C(0));
-    bool ai = ((a & UINT32_C(0x7FFFFFFF)) == UINT32_C(0x7F800000));
-    bool bi = ((b & UINT32_C(0x7FFFFFFF)) == UINT32_C(0x7F800000));
-    uint64_t r;
-    if (an || bn) {
-        uint64_t o;
-        unsigned fl;
-        uint64_t aw = (uint64_t)a;
-        uint64_t bw = (uint64_t)b;
-        if (!sd_nan2(aw, bw, 0U, &o, &fl)) {
-            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
-        }
-        r = ((o & UINT64_C(0x80000000)) << 32) |
-            UINT64_C(0x7FF0000000000000) |
-            ((o & UINT64_C(0x007FFFFF)) << 29);
-        cpu->fp.d[sd_pair(d->rd)] = r;
-        return sd_commit(cpu, pc, d, fl);
-    }
-    if ((ai && bz) || (az && bi)) {
-        cpu->fp.d[sd_pair(d->rd)] = UINT64_C(0x7FFFFFFFFFFFFFFF);
-        return sd_commit(cpu, pc, d, 0x10U);
-    }
-    if (ai || bi) {
-        cpu->fp.d[sd_pair(d->rd)] =
-            ((uint64_t)(((a ^ b) >> 31) & 1U) << 63) |
-            (UINT64_C(0x7FF) << 52);
-        return sd_commit(cpu, pc, d, 0U);
-    }
-    if (az || bz) {
-        cpu->fp.d[sd_pair(d->rd)] =
-            (uint64_t)(((a ^ b) >> 31) & 1U) << 63;
-        return sd_commit(cpu, pc, d, 0U);
-    }
-    {
-        sd_unp_t ua;
-        sd_unp_t ub;
-        unsigned neg;
-        int exp;
-        uint64_t sig;
-        unsigned g;
-        unsigned rr;
-        unsigned ss;
-        uint64_t o;
-        unsigned fl;
-        sd_unpack((uint64_t)a, 0U, 24U, -126, &ua);
-        sd_unpack((uint64_t)b, 0U, 24U, -126, &ub);
-        sd_mul(&ua, &ub, 24U, &neg, &exp, &sig, &g, &rr, &ss);
-        fl = sd_pack(neg, exp, sig << 29, 0U, 0U, 0U, 53U, -1022,
-            1023, 1023, sd_rd_mode(cpu), &o);
-        cpu->fp.d[sd_pair(d->rd)] = o;
-        return sd_commit(cpu, pc, d, fl);
-    }
-}
-
-/* Double to single narrowing with explicit overflow/underflow: the
- * 53-bit significand splits into 24 bits + GRS without rounding. */
-static sparc64_step_result_t sd_dtos(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d)
-{
-    uint64_t a = cpu->fp.d[sd_pair(d->raw & 31U)];
-    unsigned ca = sd_class(a, 1U);
-    unsigned aneg = (unsigned)(a >> 63);
-    int rm = sd_rd_mode(cpu);
-    uint64_t o;
-    unsigned fl;
-    if (ca >= 4U) {
-        uint64_t frac = a & UINT64_C(0x000FFFFFFFFFFFFF);
-        bool quiet = ((a & UINT64_C(0x0008000000000000)) != UINT64_C(0));
-        uint32_t r = (aneg << 31) | UINT32_C(0x7F800000) |
-            (uint32_t)(frac >> 29);
-        if (!quiet) {
-            r |= UINT32_C(0x00400000);
-            cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-            return sd_commit(cpu, pc, d, 0x10U);
-        }
-        cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-        return sd_commit(cpu, pc, d, 0U);
-    }
-    if (ca == 0U || ca == 3U) {
-        uint32_t r = (aneg << 31) |
-            ((ca == 3U) ? UINT32_C(0x7F800000) : UINT32_C(0));
-        cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-        return sd_commit(cpu, pc, d, 0U);
-    }
-    {
-        sd_unp_t u;
-        unsigned g;
-        unsigned rr;
-        unsigned ss;
-        sd_unpack(a, 1U, 53U, -1022, &u);
-        g = (unsigned)((u.sig >> 28) & UINT64_C(1));
-        rr = (unsigned)((u.sig >> 27) & UINT64_C(1));
-        ss = ((u.sig & (((UINT64_C(1) << 27) - UINT64_C(1)))) !=
-            UINT64_C(0)) ? 1U : 0U;
-        fl = sd_pack(u.neg, u.exp, u.sig >> 29, g, rr, ss, 24U,
-            -126, 127, 127, rm, &o);
-        cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)o;
-        return sd_commit(cpu, pc, d, fl);
     }
 }
 
@@ -876,13 +675,13 @@ sparc64_step_result_t sparc64_fp_sd(sparc64_cpu_t *cpu, uint64_t pc,
     case 0x4EU:
         return sd_arith(cpu, pc, d, 1U, 3U);
     case 0x29U:
-        return sd_sqrt_op(cpu, pc, d, 0U);
+        return sparc64_sd_sqrt_op(cpu, pc, d, 0U);
     case 0x2AU:
-        return sd_sqrt_op(cpu, pc, d, 1U);
+        return sparc64_sd_sqrt_op(cpu, pc, d, 1U);
     case 0x69U:
-        return sd_fsmuld(cpu, pc, d);
+        return sparc64_sd_fsmuld(cpu, pc, d);
     case 0x0C6U:
-        return sd_dtos(cpu, pc, d);
+        return sparc64_sd_dtos(cpu, pc, d);
     default:
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
     }

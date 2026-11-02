@@ -500,8 +500,8 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         sparc64_wreg(cpu, d->rd, a / b);
         return sparc64_step_ok(pc);
     case SPARC64_OP3_SDIV: {
-        int64_t dvd = ((int64_t)(int32_t)(uint32_t)cpu->y << 32) |
-            (int64_t)(uint32_t)a;
+        int64_t dvd = (int64_t)(((uint64_t)(uint32_t)cpu->y << 32) |
+            (uint64_t)(uint32_t)a);
         int32_t dvs = (int32_t)(uint32_t)b;
         if (dvs == 0) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
@@ -613,8 +613,8 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_SDIVCC: {
-        int64_t dvd = ((int64_t)(int32_t)(uint32_t)cpu->y << 32) |
-            (int64_t)(uint32_t)a;
+        int64_t dvd = (int64_t)(((uint64_t)(uint32_t)cpu->y << 32) |
+            (uint64_t)(uint32_t)a);
         int32_t dvs = (int32_t)(uint32_t)b;
         int64_t q;
         if (dvs == 0) {
@@ -745,127 +745,6 @@ sparc64_step_result_t sparc64_exec_shift(sparc64_cpu_t *cpu, uint64_t pc,
         }
     }
     return sparc64_step_ok(pc);
-}
-
-/* Integer MOVcc/MOVr; FP forms decode as FPU and never reach here. */
-sparc64_step_result_t sparc64_exec_mov(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d)
-{
-    uint64_t src = (d->is_imm != 0U) ? (uint64_t)d->imm
-                                     : sparc64_rreg(cpu, d->rs2);
-    bool take;
-    if (d->cls == (uint8_t)SPARC64_ICLS_MOVCC) {
-        unsigned nib = (d->cc == 2U) ? sparc64_cc_xcc(cpu)
-                                     : sparc64_cc_icc(cpu);
-        take = sparc64_eval_cond(d->cond, nib);
-    } else {
-        take = sparc64_eval_rcond(d->cond, sparc64_rreg(cpu, d->rs1));
-    }
-    if (take) {
-        sparc64_wreg(cpu, d->rd, src);
-    }
-    return sparc64_step_ok(pc);
-}
-
-/* User state registers: %y/%ccr/%asi/%pc/%fprs/%gsr (RDPC reads the
- * address of the instruction itself, V9 6.6.5). %tick is emulated
- * with a fixed value (Phase 5, L5a): the oracle returns its virtual
- * clock, but a live clock would diverge lockstep difftest (two
- * copies, separate reads) and interp-vs-dbt runs, so determinism
- * wins; the guest only samples it for startup mixing. */
-#define SPARC64RT_TICK_VALUE UINT64_C(0x100000001)
-sparc64_step_result_t sparc64_exec_rdasr(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d)
-{
-    switch (d->rs1) {
-    case SPARC64_ASR_Y:
-        sparc64_wreg(cpu, d->rd, cpu->y);
-        break;
-    case SPARC64_ASR_TICK:
-        sparc64_wreg(cpu, d->rd, SPARC64RT_TICK_VALUE);
-        break;
-    case SPARC64_ASR_PC:
-        sparc64_wreg(cpu, d->rd, pc);
-        break;
-    case SPARC64_ASR_CCR:
-        sparc64_wreg(cpu, d->rd, cpu->ccr & UINT64_C(0xff));
-        break;
-    case SPARC64_ASR_ASI:
-        sparc64_wreg(cpu, d->rd, (uint64_t)cpu->asi);
-        break;
-    case SPARC64_ASR_FPRS:
-        sparc64_wreg(cpu, d->rd, cpu->fprs);
-        break;
-    case SPARC64_ASR_GSR:
-        sparc64_wreg(cpu, d->rd, cpu->gsr);
-        break;
-    default:
-        return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
-    }
-    return sparc64_step_ok(pc);
-}
-
-sparc64_step_result_t sparc64_exec_wrasr(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d)
-{
-    uint64_t a = sparc64_rreg(cpu, d->rs1);
-    uint64_t b = (d->is_imm != 0U) ? (uint64_t)d->imm
-                                   : sparc64_rreg(cpu, d->rs2);
-    switch (d->rd) {
-    case SPARC64_ASR_Y:
-        cpu->y = a ^ b;
-        break;
-    case SPARC64_ASR_CCR:
-        cpu->ccr = (cpu->ccr & ~(UINT64_C(0xff))) | ((a ^ b) & UINT64_C(0xff));
-        break;
-    case SPARC64_ASR_ASI:
-        cpu->asi = (uint32_t)((a ^ b) & UINT64_C(0xff));
-        break;
-    case SPARC64_ASR_FPRS:
-        cpu->fprs = a ^ b;
-        break;
-    case SPARC64_ASR_GSR:
-        cpu->gsr = a ^ b;
-        break;
-    default:
-        return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
-    }
-    return sparc64_step_ok(pc);
-}
-
-/* ALIGNADDR/ALIGNADDRL (E05: rd = sum & ~7, GSR offset = sum & 7). The two
- * variants differ only in the Phase 3 FALIGNDATA merge direction. */
-sparc64_step_result_t sparc64_exec_align(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d)
-{
-    uint64_t a = sparc64_rreg(cpu, d->rs1);
-    uint64_t b = (d->is_imm != 0U) ? (uint64_t)d->imm
-                                   : sparc64_rreg(cpu, d->rs2);
-    uint64_t sum = a + b;
-    cpu->gsr = (cpu->gsr & ~(UINT64_C(7))) | (sum & UINT64_C(7));
-    sparc64_wreg(cpu, d->rd, sum & ~(UINT64_C(7)));
-    return sparc64_step_ok(pc);
-}
-
-/* Privileged-class execution. FLUSHW is the V9 exception: it is
- * unprivileged and spills all non-current windows to their stack homes,
- * leaving CANRESTORE == 0 so subsequent RESTOREs refill from memory
- * (required by libgcc uw_install_context, which rewrites the caller save
- * area on the stack before executing RETURN). */
-sparc64_step_result_t sparc64_exec_priv(sparc64_cpu_t *cpu,
-    const sparc64_mem_ops_t *mem, void *mc, uint64_t pc,
-    const sparc64_dec_t *d)
-{
-    sparc64_step_result_t res;
-    if (d->op3 == SPARC64_OP3_FLUSHW) {
-        if (!sparc64_win_flush_all(cpu, mem, mc, &res, pc)) {
-            return res;
-        }
-        cpu->canrestore = 0U;
-        cpu->cansave = SPARC64_NWINDOWS - 1U;
-        return sparc64_step_ok(pc);
-    }
-    return sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
 }
 
 /* Lane P5: DBT fast-path window bases; spill/fill stay on the slow path. */

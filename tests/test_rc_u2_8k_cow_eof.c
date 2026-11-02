@@ -47,8 +47,6 @@
  * declarations, not int-punned externs); the file-table pointer stays
  * opaque and the op code is the small vm_file_op_t enum. */
 #include "vm/vm64.h"
-extern int vm64_check_mremap_args(uint64_t old_addr, uint64_t old_size,
-    uint64_t new_size, unsigned flags, uint64_t new_addr);
 extern long vm_file_populate_segment(int host_fd, uint64_t file_offset,
     uint64_t file_size, void *host_addr, size_t seg_len,
     vm64_page_state_t *lower_state, vm64_page_state_t *upper_state,
@@ -422,6 +420,19 @@ int main(void)
     check("mremap-fixed-8k-new-accepted",
         vm64_check_mremap_args(UINT64_C(0x10000), UINT64_C(8192),
             UINT64_C(16384), 3u, UINT64_C(0x20000)) == 0);
+    /* S64-9: unsigned wrap/overflow inputs rejected. */
+    check("mprotect-len-max-rejected",
+        vm64_check_mprotect_args(UINT64_C(0x10000), ~UINT64_C(0), NULL) < 0);
+    check("munmap-wrap-rejected",
+        vm64_check_munmap_args(UINT64_C(0x10000),
+            ~UINT64_C(0) - UINT64_C(0x10000) + UINT64_C(1), NULL, NULL) == -22);
+    check("mremap-old-size-wrap-rejected",
+        vm64_check_mremap_args(UINT64_C(0x10000),
+            ~UINT64_C(0) - UINT64_C(0x10000) + UINT64_C(1),
+            UINT64_C(8192), 0u, UINT64_C(0)) == -22);
+    check("elf-span-wrap-rejected",
+        vm64_round_elf_span(UINT64_C(0x10000), ~UINT64_C(0), UINT64_C(0),
+            NULL, NULL) == -14);
 
     /* G. dbt_mem_site_t[] AOT round-trip. */
     {
