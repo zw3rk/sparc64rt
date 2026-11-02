@@ -650,38 +650,33 @@ static const sparc64_dbt_block_t *dbt_translate(
 
 /* Single-instruction step for difftest lockstep (a CTI plus its delay
  * slot counts as one step, matching sparc64_step). Emits at most the
- * pair into scratch staging, enters it once, and commits the exit;
- * falls back to the interpreter whenever anything refuses, so every
- * natively executed step is exactly what the block runner executes. */
+ * pair into scratch staging, enters it once, and commits the exit. */
 sparc64_step_result_t sparc64_dbt_step_one(sparc64_dbt_t *dbt,
     sparc64_ctx_t *ctx, const sparc64_mem_ops_t *mem, void *mc)
 {
-    uint64_t pc = ctx->pc;
+    uint64_t pc = ctx->pc, span = 4U;
     sparc64_dec_t d;
-    uint64_t span = 4U;
     const void *code;
-    if (dbt == NULL) {
-        return sparc64_step(ctx, mem, mc);
-    }
+    if (dbt == NULL) return sparc64_step(ctx, mem, mc);
     dbt_publish_chain(dbt);
     if (!dbt_fetch_classify(mem, mc, pc, &d)) {
         sparc64_step_result_t fail;
-        (void)sparc64_fetch_word(mem, mc, pc, &(uint32_t){ 0U },
-            &fail);
+        (void)sparc64_fetch_word(mem, mc, pc, &(uint32_t){ 0U }, &fail);
         return fail;
     }
     if (d.cls != (uint8_t)SPARC64_ICLS_TCC && dbt_is_cti(&d)) {
         sparc64_dec_t dl;
         if (!dbt_fetch_classify(mem, mc, pc + 4U, &dl) ||
-            !dbt_delay_emittable(&dl)) {
-            return sparc64_step(ctx, mem, mc);
-        }
+            !dbt_delay_emittable(&dl)) return sparc64_step(ctx, mem, mc);
         span = 8U;
     }
-    code = dbt_emit_range(dbt, mem, mc, pc, pc + span);
-    if (code == NULL) {
-        return sparc64_step(ctx, mem, mc);
+    if (dbt->arena_published &&
+        a32h_wx_reopen(dbt->arena_base, a32h_page_span(dbt->arena_used)) == 0) {
+        dbt->arena_published = false;
     }
+    if (!dbt->arena_published) dbt->arena_used = 0U;
+    code = dbt_emit_range(dbt, mem, mc, pc, pc + span);
+    if (code == NULL) return sparc64_step(ctx, mem, mc);
     dbt_publish(dbt);
     return dbt_enter_block(ctx, mem, mc, dbt, code, false);
 }
