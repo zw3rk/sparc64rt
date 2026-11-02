@@ -714,16 +714,24 @@ static size_t vm64_find_or_claim_self(uint64_t tid)
  * Darwin). Idempotent: re-registering a live thread only marks it
  * running. Called once at engine startup for the thread that runs
  * guest code, and on every CLONE_VM worker-thread entry; without it
- * Step-2 preemption has no live addressee. */
-void vm64_worker_register(void)
+ * Step-2 preemption has no live addressee. S64-R3-5: returns 0 on
+ * success, -ENOMEM when the backend (id 0) or the vm table is full,
+ * so the caller refuses to run guest code unregistered. */
+int vm64_worker_register(void)
 {
     uint64_t tid = rt_host_register_self();
+    size_t idx;
     if (tid == UINT64_C(0)) {
-        return;
+        return -VM64_ENOMEM;
     }
     vm64_table_lock_acq();
-    (void)vm64_find_or_claim_self(tid);
+    idx = vm64_find_or_claim_self(tid);
     vm64_table_lock_rel();
+    if (idx >= (size_t)VM64_MAX_WORKERS) {
+        rt_host_unregister_self();
+        return -VM64_ENOMEM;
+    }
+    return 0;
 }
 
 /* Drop the calling thread's quiescence slot (worker-thread exit). The
@@ -774,9 +782,9 @@ unsigned vm64_worker_live_count(void)
 }
 
 /* Historical startup entry: registers the calling (main) thread. */
-void vm64_stxn_register_self(void)
+int vm64_stxn_register_self(void)
 {
-    vm64_worker_register();
+    return vm64_worker_register();
 }
 
 /* Steps 1-2: park self, announce the mutation, preempt live peers.

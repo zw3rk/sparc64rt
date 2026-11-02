@@ -263,6 +263,13 @@ long thr_darwin_futex_wait(sparc64_ctx_t *ctx,
             if (cur != (uint32_t)val) {
                 return -THR_LINUX_EAGAIN;
             }
+            /* S64-R3-4: consume the signal that interrupted the wait;
+             * without this the next backend call sees the same stale
+             * seq and returns -EINTR immediately, spinning. */
+            if (ws != NULL) {
+                expected_seq = atomic_load_explicit(&ws->sig_seq,
+                    memory_order_acquire);
+            }
             continue;
         }
         if (wrc == -11L) {

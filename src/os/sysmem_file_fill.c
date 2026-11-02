@@ -132,6 +132,34 @@ size_t sysmem_file_span_extra(uint64_t old_base, uint64_t old_len,
     return extra;
 }
 
+/* Worst-case extra slots a munmap/MAP_FIXED excision needs (S64-R3-3):
+ * every overlapping entry can leave one split tail. Reserved before
+ * the drop legs so claim_free cannot realloc mid-iteration. */
+size_t sysmem_file_drop_extra(uint64_t base, uint64_t len)
+{
+    uint64_t end = base + len;
+    size_t extra = 0u;
+    size_t i;
+    if (len == 0u) {
+        return 0u;
+    }
+    if (end < base) {
+        end = UINT64_C(0xffffffffffffffff);
+    }
+    for (i = 0u; i < sysmem_file_cap; i++) {
+        const sysmem_file_range_t *slot = &sysmem_files[i];
+        uint64_t s1;
+        if (!slot->live) {
+            continue;
+        }
+        s1 = slot->base + slot->len;
+        if (slot->base < end && s1 > base) {
+            extra += 1u;
+        }
+    }
+    return extra;
+}
+
 /* Populate one mremap growth-tail overlap [o0, o1) from an entry's
  * retained description (S64-R3-2): file bytes through the same
  * populate path as the initial mmap fill (so MAP_PRIVATE tails land

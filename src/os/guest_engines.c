@@ -24,7 +24,7 @@
 
 /* Active quiescence worker table (src/vm/vm64.c); local externs keep
  * this TU off the shared headers, matching guest_run_sysmem.c. */
-extern void vm64_worker_register(void);
+extern int vm64_worker_register(void);
 extern void vm64_worker_unregister(void);
 #include "os/sync_sig.h"
 #include "os/syscalls_min.h"
@@ -376,8 +376,13 @@ void *sparc64_thread_entry(void *arg)
     sparc64_thread_entry_started(slot);
     /* RC-U4 #3: join the vm64 quiescence worker table for the whole
      * worker lifetime, so a concurrent prepare preempts (or parks)
-     * this thread instead of missing it. */
-    vm64_worker_register();
+     * this thread instead of missing it. S64-R3-5: on exhaustion
+     * refuse to run guest code unregistered (no preemption). */
+    if (vm64_worker_register() != 0) {
+        vm64_worker_unregister();
+        sparc64_thread_entry_done(slot, 1L);
+        return NULL;
+    }
     g = (guest_state_t *)slot->space_ctx;
     if (slot->engine == 1) {
         rc = (long)run_dbt(g, slot->ctx_ref, slot->ops);

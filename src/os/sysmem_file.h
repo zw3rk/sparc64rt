@@ -97,6 +97,11 @@ int sysmem_file_fill(void *context, int fd, uint64_t file_offset,
 size_t sysmem_file_span_extra(uint64_t old_base, uint64_t old_len,
     uint64_t dest, uint64_t new_len);
 
+/* Worst-case extra slots a munmap/MAP_FIXED excision needs (one tail per
+ * overlapping entry). Shells reserve this before the drop legs so a
+ * later claim_free cannot realloc mid-iteration (S64-R3-3). */
+size_t sysmem_file_drop_extra(uint64_t base, uint64_t len);
+
 /* Populate the mremap growth tail before the commit leg. */
 int sysmem_file_fill_growth(void *context, uint64_t dest,
     uint64_t old_len, uint64_t new_len);

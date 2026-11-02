@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "os/sysmem_file.h"
@@ -114,6 +115,28 @@ unsigned sysmem_file_live_count(void)
     return n;
 }
 
+/* Retained-fd duplication with close-on-exec (S64-R3 follow-up #4):
+ * every live entry owns a dup'd description; without CLOEXEC a guest
+ * with ~100 file mappings exhausts the 256 soft fd budget and leaks
+ * retained fds across exec. F_DUPFD_CLOEXEC is atomic (no dup + SETFD
+ * race). */
+static int sysmem_file_dup_cloexec(int fd)
+{
+    int nfd;
+    if (fd < 0) {
+        return -1;
+    }
+#ifdef F_DUPFD_CLOEXEC
+    nfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+#else
+    nfd = dup(fd);
+    if (nfd >= 0) {
+        (void)fcntl(nfd, F_SETFD, FD_CLOEXEC);
+    }
+#endif
+    return nfd;
+}
+
 static uint64_t sysmem_align_up_8k(uint64_t v)
 {
     if (v > UINT64_C(0xffffffffffffffff) - UINT64_C(8191)) {
@@ -181,7 +204,7 @@ int sysmem_file_note_map(void *context, int fd, uint64_t dev,
     }
     slot = &sysmem_files[i];
     slot->live = true;
-    slot->fd = (fd >= 0) ? dup(fd) : -1;
+    slot->fd = (fd >= 0) ? sysmem_file_dup_cloexec(fd) : -1;
     slot->dev = dev;
     slot->ino = ino;
     slot->file_offset = file_offset;
@@ -238,7 +261,7 @@ static int sysmem_file_clone_fd(const sysmem_file_range_t *slot)
     if (slot->fd < 0) {
         return -1;
     }
-    return dup(slot->fd);
+    return sysmem_file_dup_cloexec(slot->fd);
 }
 
 /* Copy one coverage piece's per-chunk states: slices the materialized
@@ -298,11 +321,15 @@ void sysmem_file_drop_map(void *context, uint64_t base, uint64_t len)
         if (s0 < base && s1 > end) {
             /* Middle excised: the head stays in place, the tail moves
              * to a free slot (or drops when the table is full). The
-             * tail slice reads the pre-trim states (saved count). */
+             * tail slice reads the pre-trim states (saved count).
+             * S64-R3-3 REGRESSION: claim_free can realloc the table,
+             * so snapshot the entry and re-derive slot afterwards. */
+            sysmem_file_range_t orig = *slot;
             sysmem_file_range_t *tail = sysmem_file_claim_free();
-            uint8_t onchunk = slot->nchunk;
+            uint8_t onchunk = orig.nchunk;
             uint64_t keep = base - s0;
             uint64_t tn;
+            slot = &sysmem_files[i];
             slot->len = keep;
             tn = keep / UINT64_C(8192);
             if (tn > (uint64_t)SYSMEM_FILERANGE_CHUNKS) {
@@ -315,19 +342,19 @@ void sysmem_file_drop_map(void *context, uint64_t base, uint64_t len)
                 continue;
             }
             tail->live = true;
-            tail->fd = sysmem_file_clone_fd(slot);
-            tail->dev = slot->dev;
-            tail->ino = slot->ino;
-            tail->file_offset = slot->file_offset + (end - s0);
+            tail->fd = sysmem_file_clone_fd(&orig);
+            tail->dev = orig.dev;
+            tail->ino = orig.ino;
+            tail->file_offset = orig.file_offset + (end - s0);
             tail->base = end;
             tail->len = s1 - end;
-            tail->prot = slot->prot;
-            tail->kind = slot->kind;
+            tail->prot = orig.prot;
+            tail->kind = orig.kind;
             tn = (s1 - end) / UINT64_C(8192);
             if (tn > (uint64_t)SYSMEM_FILERANGE_CHUNKS) {
                 tn = (uint64_t)SYSMEM_FILERANGE_CHUNKS;
             }
-            sysmem_file_slice_states(tail, slot->cstate, onchunk,
+            sysmem_file_slice_states(tail, orig.cstate, onchunk,
                 (end - s0) / UINT64_C(8192), tn);
             continue;
         }
@@ -599,10 +626,12 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
             unsigned oprot = slot->prot;
             uint64_t dev = slot->dev;
             uint64_t ino = slot->ino;
+            int ofd = slot->fd;
             uint8_t saved[SYSMEM_FILERANGE_CHUNKS];
             sysmem_file_range_t *mid = NULL;
             sysmem_file_range_t *tail = NULL;
             uint64_t k;
+            int mid_reuses_slot = (m0 == s0) ? 1 : 0;
             (void)memcpy(saved, slot->cstate, sizeof(saved));
             if (moff < new_len) {
                 if (keep > new_len - moff) {
@@ -615,20 +644,24 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
             }
             /* Claim and install eagerly (in middle, tail, head
              * order): a later claim must see the earlier survivor as
-             * live, never re-claim the same free slot. */
+             * live, never re-claim the same free slot. S64-R3-3
+             * REGRESSION: claim_free can realloc the table, so every
+             * source field is snapshotted above and slot is
+             * re-derived after each claim. */
             if (keep != 0u) {
-                if (m0 == s0) {
+                if (mid_reuses_slot != 0) {
                     mid = slot;
                 } else {
                     mid = sysmem_file_claim_free();
+                    slot = &sysmem_files[i];
                 }
                 if (mid != NULL) {
                     mid->live = true;
                     /* S64-R3-2: the survivor reusing this slot keeps
                      * the retained fd; a fresh slot clones it (its
                      * own close on drop). */
-                    mid->fd = (mid == slot) ? slot->fd :
-                        sysmem_file_clone_fd(slot);
+                    mid->fd = (mid_reuses_slot != 0) ? ofd :
+                        sysmem_file_dup_cloexec(ofd);
                     mid->dev = dev;
                     mid->ino = ino;
                     mid->file_offset = ofo + (m0 - s0);
@@ -645,10 +678,20 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
                 }
             }
             if (m1 < s1) {
+                size_t mid_idx = (size_t)-1;
+                if (mid != NULL && mid_reuses_slot == 0 && keep != 0u) {
+                    mid_idx = (size_t)(mid - sysmem_files);
+                }
                 tail = sysmem_file_claim_free();
+                slot = &sysmem_files[i];
+                if (mid_idx != (size_t)-1) {
+                    mid = &sysmem_files[mid_idx];
+                } else if (mid_reuses_slot != 0 && keep != 0u) {
+                    mid = slot;
+                }
                 if (tail != NULL) {
                     tail->live = true;
-                    tail->fd = sysmem_file_clone_fd(slot);
+                    tail->fd = sysmem_file_dup_cloexec(ofd);
                     tail->dev = dev;
                     tail->ino = ino;
                     tail->file_offset = ofo + (m1 - s0);
@@ -664,7 +707,11 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
                         (m1 - s0) / UINT64_C(8192), k);
                 }
             }
-            if (m0 > s0) {
+            slot = &sysmem_files[i];
+            if (mid_reuses_slot != 0 && keep != 0u) {
+                /* Middle reused this slot: already describes the moved
+                 * piece; the tail (if any) lives elsewhere. */
+            } else if (m0 > s0) {
                 /* The head stays in this slot: trim the length (the
                  * state prefix stays valid). */
                 slot->live = true;
@@ -681,8 +728,24 @@ void sysmem_file_remap_update(void *context, uint64_t old_base,
                 /* No head and no moved survivor: this slot's whole
                  * span is consumed (any tail lives in its own slot,
                  * and a fully covered entry simply drops). */
-                sysmem_file_close_fd(slot);
-                slot->live = false;
+                if (m1 >= s1) {
+                    sysmem_file_close_fd(slot);
+                    slot->live = false;
+                } else {
+                    /* Tail claimed above; this slot no longer owns the
+                     * retained fd (the tail holds its own dup). */
+                    if (tail == NULL) {
+                        sysmem_file_close_fd(slot);
+                        slot->live = false;
+                    } else if (ofd >= 0) {
+                        (void)close(ofd);
+                        slot->live = false;
+                        slot->fd = -1;
+                    } else {
+                        slot->live = false;
+                        slot->fd = -1;
+                    }
+                }
             }
         }
     }

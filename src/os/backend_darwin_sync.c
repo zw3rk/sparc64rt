@@ -238,21 +238,35 @@ int64_t rt_host_clock_getres(int linux_clk_id, struct timespec *res)
     return libret(clock_getres((clockid_t)linux_clk_id, res));
 }
 
+/* S64-R3-7: Linux clock ids do not equal Darwin clock ids
+ * (Linux 1 is MONOTONIC; Darwin 1 is not). Map 0 -> CLOCK_REALTIME
+ * and 1 -> CLOCK_MONOTONIC before any clock_gettime; anything else
+ * is -EINVAL like the guest clock_gettime path. */
+static int darwin_host_clock(int linux_clk_id, clockid_t *out)
+{
+    if (out == NULL) { return -22; }
+    if (linux_clk_id == 0) { *out = CLOCK_REALTIME; return 0; }
+    if (linux_clk_id == 1) { *out = CLOCK_MONOTONIC; return 0; }
+    return -22;
+}
+
 int64_t rt_host_clock_nanosleep(int linux_clk_id, int linux_flags,
     const struct timespec *req, struct timespec *rem, rt_worker_sync_t *ws,
     uint32_t expected_seq)
 {
     struct timespec rel;
+    clockid_t host_clk;
     if (req == NULL || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L) {
         return -22;
     }
+    if (darwin_host_clock(linux_clk_id, &host_clk) != 0) { return -22; }
     if (ws != NULL &&
         atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) {
         return -4;
     }
     if ((linux_flags & 1) != 0) {
         struct timespec now;
-        if (clock_gettime((clockid_t)linux_clk_id, &now) != 0) { return neg_errno(); }
+        if (clock_gettime(host_clk, &now) != 0) { return neg_errno(); }
         rel.tv_sec = req->tv_sec - now.tv_sec;
         rel.tv_nsec = req->tv_nsec - now.tv_nsec;
         if (rel.tv_nsec < 0) { rel.tv_sec -= 1; rel.tv_nsec += 1000000000L; }
@@ -293,8 +307,7 @@ int64_t rt_host_clock_nanosleep(int linux_clk_id, int linux_flags,
             int r;
             if (is_abs) {
                 struct timespec now_clk;
-                if (clock_gettime((clockid_t)linux_clk_id,
-                        &now_clk) != 0) {
+                if (clock_gettime(host_clk, &now_clk) != 0) {
                     return neg_errno();
                 }
                 left.tv_sec = req->tv_sec - now_clk.tv_sec;

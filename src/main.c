@@ -44,7 +44,7 @@ extern uint64_t vm64_seq_rewind(uint64_t pc, uint64_t seq_start,
  * the fast-path opener and rewinds only inside a live sequence;
  * identity anywhere else, so a stray preempt can never misdirect. */
 extern uint64_t vm64_seq_rewind_live(uint64_t pc);
-extern void vm64_stxn_register_self(void);
+extern int vm64_stxn_register_self(void);
 
 static uint64_t a2_host_pc(void *host_ucontext)
 {
@@ -188,8 +188,13 @@ int main(int argc, char **argv)
     }
     /* RC-U12: register this thread in the vm64 worker table so Step-2
      * preemption has a live addressee (numeric tid on Linux,
-     * worker-table key on Darwin). */
-    vm64_stxn_register_self();
+     * worker-table key on Darwin). S64-R3-5: exhaustion here is
+     * fatal (running the main thread unregistered would miss
+     * preemption). */
+    if (vm64_stxn_register_self() != 0) {
+        (void)fprintf(stderr, "sparc64rt: worker table exhausted\n");
+        return 1;
+    }
 #endif
     if (opts.guest_argv == NULL) {
         synthetic[0] = (char *)((exec_path != NULL) ? exec_path :

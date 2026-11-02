@@ -248,11 +248,22 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
             return rc;
         }
     }
-    /* S64-R3-3: reserve the registry slot BEFORE the 6-step legs so
+    /* S64-R3-3: reserve the registry slots BEFORE the 6-step legs so
      * a full table reports -ENOMEM with zero mutation instead of
-     * evicting a live mapping's truncate metadata. */
-    if ((flags & SYSMEM_MAP_ANONYMOUS) == 0U) {
-        if (sysmem_file_reserve(1u) != 0) {
+     * evicting a live mapping's truncate metadata. MAP_FIXED replaces
+     * the destination span, so its drop-split tail is reserved too
+     * (S64-R3-3 REGRESSION: claim_free can realloc mid-drop). */
+    {
+        size_t need = 0u;
+        int is_fixed = ((flags & SYSMEM_MAP_FIXED) != 0U) ? 1 : 0;
+        int is_anon = ((flags & SYSMEM_MAP_ANONYMOUS) != 0U) ? 1 : 0;
+        if (is_fixed != 0) {
+            need += sysmem_file_drop_extra(base, size);
+        }
+        if (is_anon == 0) {
+            need += 1u;
+        }
+        if (need != 0u && sysmem_file_reserve(need) != 0) {
             return -ENOMEM;
         }
     }
@@ -273,6 +284,11 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
     hop = vm64_stxn_host_op(sysmem_space_op, &pub);
     if (hop != 0) {
         return hop;
+    }
+    /* MAP_FIXED replaces the destination span: excise tracked file
+     * ranges first (reserved above, so no realloc mid-drop). */
+    if ((flags & SYSMEM_MAP_FIXED) != 0U) {
+        sysmem_file_drop_map(g, base, size);
     }
     if ((flags & SYSMEM_MAP_ANONYMOUS) != 0U) {
         /* Commit edge: publish done above; drop paired 4 KiB
@@ -386,7 +402,12 @@ long sparc64_sysmem_munmap(void *context, uint64_t addr, uint64_t len)
         return -EINVAL;
     }
     /* 6-step legs: unmap tolerates holes (no failure leg); commit then
-     * drops paired Soft-TLB entries and the block-cache range. */
+     * drops paired Soft-TLB entries and the block-cache range.
+     * S64-R3-3 REGRESSION: reserve the drop-split tail BEFORE the legs
+     * so claim_free cannot realloc mid-drop. The syscall cannot fail
+     * for registry pressure, so a reserve miss degrades (drop loses
+     * the tail) instead of failing. */
+    (void)sysmem_file_reserve(sysmem_file_drop_extra(base, size));
     if (vm64_stxn_prepare() != 0) {
         return -EFAULT;
     }
@@ -563,7 +584,12 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
         }
     } else if (new_len < old_len) {
         /* Shrink in place: drop the tail (holes tolerated, like the
-         * munmap path above). */
+         * munmap path above). S64-R3-3: reserve before the legs so
+         * the coverage trim cannot realloc mid-update. */
+        if (sysmem_file_reserve(sysmem_file_span_extra(old_addr,
+                old_len, old_addr, new_len)) != 0) {
+            return -ENOMEM;
+        }
         if (vm64_stxn_prepare() != 0) {
             return -EFAULT;
         }
@@ -668,9 +694,11 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     if (new_len > old_len) {
         long frc = (long)sysmem_file_fill_growth(g, dest, old_len,
             new_len);
-        if (frc == -12L && dest == old_addr) {
-            /* In-place extension rejected: drop the fresh tail for
-             * zero net mutation and report resource exhaustion. */
+        if (frc == -12L) {
+            /* Extension rejected: drop the fresh tail and report
+             * resource exhaustion. In place this restores zero net
+             * mutation; moved it leaves the relocated old_len bytes
+             * without committing a zero tail (S64-R3 follow-up #6). */
             sysmem_span_op_t tail;
             tail.g = g;
             tail.base = dest + old_len;
