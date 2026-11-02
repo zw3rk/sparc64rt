@@ -192,9 +192,8 @@ uint32_t sparc64_mem_slow_step(sparc64_ctx_t *ctx,
          * replays it with the interpreter (signal delivery, precise
          * traps). Never masquerade as BRANCH: the per-block miss
          * trampoline would resume the faulting block and spin on the
-         * same miss instead of trapping. The s64_rt_mem caller is
-         * unaffected (it already collapses every nonzero code to
-         * UNDEF before the dispatcher). */
+         * same miss instead of trapping. The dispatcher already
+         * collapses every nonzero code to UNDEF before dispatch. */
         ctx->pc = saved_pc;
         ctx->npc = saved_npc;
         ctx->exit_reason = (uint32_t)SPARC64_EXIT_UNDEF;

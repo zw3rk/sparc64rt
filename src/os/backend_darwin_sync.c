@@ -225,6 +225,26 @@ uint64_t rt_host_register_self(void)
 }
 
 /* 7a. futex wait/wake/requeue (S64-5) */
+
+/* Drain stale wake-pipe bytes after a signal-driven -EINTR (Section 3 #2):
+ * the notifier writes one byte per signal, and a futex -EINTR return that
+ * leaves the byte queued makes a later ppoll/epoll_pwait/clock_nanosleep
+ * see POLLIN immediately and report a spurious -EINTR even when
+ * sig_seq == expected_seq. The pipe read end is O_NONBLOCK, so this
+ * never blocks. */
+static void darwin_drain_wake_pipe(rt_worker_sync_t *ws)
+{
+    char tmp[32];
+    ssize_t n;
+    int saved_errno;
+    if (ws == NULL || ws->wake_pipe_rd < 0) { return; }
+    saved_errno = errno;
+    do {
+        n = read(ws->wake_pipe_rd, tmp, sizeof(tmp));
+    } while (n > 0);
+    errno = saved_errno;
+}
+
 int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr,
     const rt_futex_key_t *key, uint32_t host_endian_val,
     const struct timespec *timeout, int is_abs_timeout, int clock_realtime,
@@ -291,6 +311,7 @@ int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr,
     if (ws != NULL &&
         atomic_load_explicit(&ws->sig_seq, memory_order_acquire) != expected_seq) {
         (void)pthread_mutex_unlock(&g_futex_mu);
+        darwin_drain_wake_pipe(ws);
         return -4;
     }
     if (atomic_load_explicit(pinned_host_uaddr, memory_order_seq_cst) != host_endian_val) {
@@ -359,6 +380,9 @@ int64_t rt_host_futex_wait_bitset(_Atomic uint32_t *pinned_host_uaddr,
     }
     g_futex_q[(unsigned)slot].used = 0;
     (void)pthread_mutex_unlock(&g_futex_mu);
+    if (ret == -4) {
+        darwin_drain_wake_pipe(ws);
+    }
     return ret;
 }
 
