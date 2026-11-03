@@ -197,8 +197,7 @@ long sparc64_sig_rt_sigprocmask(sparc64_ctx_t *ctx,
         how != (uint64_t)SPARC64_SIG_SETMASK) {
         return -EINVAL;
     }
-    (void)ctx;
-    prev = sparc64_sync_sig_blocked_get();
+    prev = sparc64_sync_sig_blocked_get(ctx);
     for (i = 0U; i < (unsigned)sizeof(old); i++) {
         old[i] = (uint8_t)(prev >> (56U - 8U * i));
     }
@@ -219,7 +218,7 @@ long sparc64_sig_rt_sigprocmask(sparc64_ctx_t *ctx,
             } else if (how == (uint64_t)SPARC64_SIG_UNBLOCK) {
                 updated = prev & ~set;
             }
-            sparc64_sync_sig_blocked_set(updated);
+            sparc64_sync_sig_blocked_set(ctx, updated);
         }
     }
     if (oset_va != UINT64_C(0)) {
@@ -252,14 +251,13 @@ long sparc64_sig_rt_sigpending(sparc64_ctx_t *ctx,
     uint8_t out[8];
     uint64_t pend;
     unsigned i;
-    (void)ctx;
     if (sigsetsize != 8U) {
         return -EINVAL;
     }
     if (set_va == UINT64_C(0)) {
         return -EFAULT;
     }
-    pend = sparc64_sync_sig_pending_get();
+    pend = sparc64_sync_sig_pending_get(ctx);
     for (i = 0U; i < (unsigned)sizeof(out); i++) {
         out[i] = (uint8_t)(pend >> (56U - 8U * i));
     }
@@ -303,7 +301,7 @@ long sparc64_sig_sigaltstack(sparc64_ctx_t *ctx,
         uint64_t osize;
         unsigned i;
         uint64_t cur = ctx->r[SPARC64_SP] + SPARC64_STACK_BIAS;
-        sparc64_sync_sig_altstack_get(&osp, &oflags, &osize, cur);
+        sparc64_sync_sig_altstack_get(ctx, &osp, &oflags, &osize, cur);
         for (i = 0U; i < 8U; i++) {
             old[i] = (uint8_t)(osp >> (56U - 8U * i));
             old[16U + i] = (uint8_t)(osize >> (56U - 8U * i));
@@ -322,7 +320,7 @@ long sparc64_sig_sigaltstack(sparc64_ctx_t *ctx,
         }
     }
     if (have_new != 0) {
-        return sparc64_sync_sig_altstack_set(sp, flags, size);
+        return sparc64_sync_sig_altstack_set(ctx, sp, flags, size);
     }
     return 0L;
 }

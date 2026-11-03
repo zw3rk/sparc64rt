@@ -139,7 +139,7 @@ static int engine_setjmp_trap(sparc64_ctx_t *ctx,
         engine_put64(&jb[0x110] + (uint64_t)i * 8U,
             ctx->r[SPARC64_I0 + i]);
     }
-    engine_put64(&jb[0x150], sparc64_sync_sig_blocked_get());
+    engine_put64(&jb[0x150], sparc64_sync_sig_blocked_get(ctx));
     engine_put64(&jb[0x158], (uint64_t)ctx->cansave);
     engine_put64(&jb[0x160], (uint64_t)ctx->canrestore);
     engine_put64(&jb[0x168], (uint64_t)ctx->otherwin);
@@ -220,7 +220,7 @@ static int engine_longjmp_trap(sparc64_ctx_t *ctx,
         uint64_t saved = engine_get64(&jb[0x150]);
         /* SIGKILL/SIGSTOP can never be blocked. */
         saved &= ~(SPARC64_SIGKILL_BIT | SPARC64_SIGSTOP_BIT);
-        sparc64_sync_sig_blocked_set(saved);
+        sparc64_sync_sig_blocked_set(ctx, saved);
     }
     ctx->pc = rpc;
     ctx->npc = rpc + 4U;

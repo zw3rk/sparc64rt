@@ -9,7 +9,7 @@
 # or: nix build .#sparc64rt (uses the configured aarch64-linux builder).
 
 .DEFAULT_GOAL := help
-.PHONY: help all build check test check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r3-darwin darwin-sparc64rt clean
+.PHONY: help all build check test check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin darwin-sparc64rt clean
 MAKEFLAGS += -j8
 
 BUILD_DIR := _build
@@ -154,10 +154,22 @@ check-rc-u2: ## Build and run the RC-U2 8 KiB COW/EOF gate test (Lane A3)
 check-r3: ## Build and run the Round-3 file-registry regression test (S64-R3-1/2/3)
 	$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r3_registry.c \
 		src/os/guest_run_sysmem_file.c src/os/sysmem_file_fill.c \
+		src/os/sysmem_file_remap.c src/os/sysmem_file_resize.c \
 		src/os/mem_space.c src/os/mem_space_write.c \
 		src/vm/vm64.c src/vm/vm_file.c \
 		-o $(BUILD_DIR)/test_r3_registry && \
 	./$(BUILD_DIR)/test_r3_registry
+
+# ---- Round-4 remediation gate (S64-R4-3/4/5/6/10) ---------------------------
+check-r4: ## Build and run the Round-4 sysmem transaction test (S64-R4-10)
+	$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r4_sysmem_txn.c \
+		src/os/guest_run_sysmem.c src/os/guest_run_sysmem_file.c \
+		src/os/sysmem_file_fill.c src/os/sysmem_file_remap.c \
+		src/os/sysmem_file_resize.c \
+		src/os/mem_space.c src/os/mem_space_write.c \
+		src/vm/vm64.c src/vm/vm_file.c \
+		-o $(BUILD_DIR)/test_r4_sysmem_txn && \
+	./$(BUILD_DIR)/test_r4_sysmem_txn
 
 check-r3-darwin: ## Build and run the Round-3 Darwin backend test (S64-R3-4/5/6/7)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
@@ -171,4 +183,4 @@ check-r3-darwin: ## Build and run the Round-3 Darwin backend test (S64-R3-4/5/6/
 		echo "check-r3-darwin: Darwin-only backend, pass"; \
 	fi
 
-test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r3-darwin ## Host-side gates with -Werror (no cross toolchain needed)
+test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin ## Host-side gates with -Werror (no cross toolchain needed)

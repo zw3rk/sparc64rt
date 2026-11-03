@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "core/cpu.h"
+#include "interp/fp_commit.h"
 #include "interp/interp.h"
 
 /* Double-pair index (mirrors fp.c): even field is the lower f-pair,
@@ -65,21 +66,9 @@ static unsigned sd_rd_raw(const sparc64_cpu_t *cpu)
     return (unsigned)((cpu->fsr >> 30) & UINT64_C(3));
 }
 
-/* Commit one operate instruction's flags: cexc overwritten, aexc
- * sticky. A trapped (TEM & cexc) condition takes the generic
- * synchronous-trap path, like ILLEGAL. */
-static sparc64_step_result_t sd_commit(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d, unsigned fresh)
-{
-    fresh &= 0x1FU;
-    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
-    cpu->fsr |= (uint64_t)fresh << 5;
-    if ((((cpu->fsr >> 23) & UINT64_C(0x1F)) & (cpu->fsr & UINT64_C(0x1F))) !=
-        UINT64_C(0)) {
-        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
-    }
-    return sparc64_step_ok(pc);
-}
+/* Commits go through the shared fp_commit helper (S64-R4-11):
+ * cexc overwritten, aexc sticky, trapped (TEM & cexc) conditions take
+ * the generic synchronous-trap path, like ILLEGAL. */
 
 static unsigned sd_clz64(uint64_t v)
 {
@@ -553,41 +542,41 @@ static sparc64_step_result_t sd_arith(sparc64_cpu_t *cpu, uint64_t pc,
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
         sd_store(cpu, w, d->rd, o);
-        return sd_commit(cpu, pc, d, fl);
+        return sparc64_fp_commit(cpu, pc, d, fl);
     }
     if (op <= 1U) {
         unsigned eff = bneg ^ (op & 1U);
         if (ca == 3U && cb == 3U && aneg != eff) {
             sd_store(cpu, w, d->rd, sd_allones(w));
-            return sd_commit(cpu, pc, d, 0x10U);
+            return sparc64_fp_commit(cpu, pc, d, 0x10U);
         }
         if (ca == 3U || cb == 3U) {
             unsigned n = (ca == 3U) ? aneg : eff;
             o = (w == 0U) ? ((uint64_t)n << 31) | UINT64_C(0x7F800000)
                           : ((uint64_t)n << 63) | (UINT64_C(0x7FF) << 52);
             sd_store(cpu, w, d->rd, o);
-            return sd_commit(cpu, pc, d, 0U);
+            return sparc64_fp_commit(cpu, pc, d, 0U);
         }
     } else if (op == 2U) {
         if ((ca == 3U && cb == 0U) || (ca == 0U && cb == 3U)) {
             sd_store(cpu, w, d->rd, sd_allones(w));
-            return sd_commit(cpu, pc, d, 0x10U);
+            return sparc64_fp_commit(cpu, pc, d, 0x10U);
         }
         if (ca == 3U || cb == 3U) {
             unsigned n = aneg ^ bneg;
             o = (w == 0U) ? ((uint64_t)n << 31) | UINT64_C(0x7F800000)
                           : ((uint64_t)n << 63) | (UINT64_C(0x7FF) << 52);
             sd_store(cpu, w, d->rd, o);
-            return sd_commit(cpu, pc, d, 0U);
+            return sparc64_fp_commit(cpu, pc, d, 0U);
         }
         if (ca == 0U || cb == 0U) {
             sd_store(cpu, w, d->rd, rzero);
-            return sd_commit(cpu, pc, d, 0U);
+            return sparc64_fp_commit(cpu, pc, d, 0U);
         }
     } else {
         if ((ca == 0U && cb == 0U) || (ca == 3U && cb == 3U)) {
             sd_store(cpu, w, d->rd, sd_allones(w));
-            return sd_commit(cpu, pc, d, 0x10U);
+            return sparc64_fp_commit(cpu, pc, d, 0x10U);
         }
         if (cb == 0U) {
             unsigned n = aneg ^ bneg;
@@ -595,10 +584,10 @@ static sparc64_step_result_t sd_arith(sparc64_cpu_t *cpu, uint64_t pc,
                           : ((uint64_t)n << 63) | (UINT64_C(0x7FF) << 52);
             if (ca == 3U) {
                 sd_store(cpu, w, d->rd, o);
-                return sd_commit(cpu, pc, d, 0U);
+                return sparc64_fp_commit(cpu, pc, d, 0U);
             }
             sd_store(cpu, w, d->rd, o);
-            return sd_commit(cpu, pc, d, 0x02U);
+            return sparc64_fp_commit(cpu, pc, d, 0x02U);
         }
         if (ca == 3U || cb == 3U) {
             unsigned n = aneg ^ bneg;
@@ -607,11 +596,11 @@ static sparc64_step_result_t sd_arith(sparc64_cpu_t *cpu, uint64_t pc,
                              : ((uint64_t)n << 63) | (UINT64_C(0x7FF) << 52))
                 : rzero;
             sd_store(cpu, w, d->rd, o);
-            return sd_commit(cpu, pc, d, 0U);
+            return sparc64_fp_commit(cpu, pc, d, 0U);
         }
         if (ca == 0U) {
             sd_store(cpu, w, d->rd, rzero);
-            return sd_commit(cpu, pc, d, 0U);
+            return sparc64_fp_commit(cpu, pc, d, 0U);
         }
     }
     sparc64_sd_unpack(a, w, p, emin, &ua);
@@ -625,7 +614,7 @@ static sparc64_step_result_t sd_arith(sparc64_cpu_t *cpu, uint64_t pc,
     }
     fl = sparc64_sd_pack(neg, exp, sig, g, r, s, p, emin, emax, bias, rm, &o);
     sd_store(cpu, w, d->rd, o);
-    return sd_commit(cpu, pc, d, fl);
+    return sparc64_fp_commit(cpu, pc, d, fl);
 }
 
 /* Multiply unpacked finite nonzero values. The product has at most

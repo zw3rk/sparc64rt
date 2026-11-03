@@ -9,21 +9,13 @@
  * guest tid allocation, per-thread robust-list state, %g7 TLS install,
  * and the host-__atomic fast path for CASA/CASXA/LDSTUB/SWAP.
  *
- * Concurrency model: one big guest lock serializes interp/DBT execution
- * (the interp winfile and the DBT window helper are process-global, and
- * the space layer's scratch/epoch metadata is not thread-proof). Threads
- * therefore time-slice at blocking points; futex WAIT drops the big lock
- * while sleeping in host futex(2) so a waker can run. No true parallelism
- * is claimed; mutex/condvar/TLS semantics are exact.
+ * Concurrency model: one big guest lock serializes execution; threads
+ * time-slice at blocking points (futex WAIT drops the lock across the
+ * host sleep). No true parallelism; mutex/condvar/TLS semantics exact.
  *
- * Futex words are big-endian guest u32s. The host futex compares the
- * host-endian view, so WAIT passes the byte-swapped expectation; WAKE
- * carries no value and needs no swap. Only WAIT/WAKE (+PRIVATE_FLAG) are
- * implemented; the rest is -ENOSYS like the single-threaded predecessor.
- *
- * Robust lists are recorded per thread and reported back; dead-thread
- * EOWNERDEAD recovery (kernel robust-list walk on thread death) is not
- * implemented. rseq stays -ENOSYS (glibc falls back without it).
+ * Futex words are big-endian guest u32s (host compares the swapped
+ * view). Only WAIT/WAKE (+PRIVATE_FLAG) exist; the rest is -ENOSYS.
+ * Robust lists are recorded, not recovered; rseq stays -ENOSYS.
  *
  * Needs _GNU_SOURCE: musl hides syscall(2) under -std=c11.
  */
@@ -45,6 +37,7 @@
 #include "os/guest_run_priv.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
+#include "os/syscalls_sig.h"
 #include "os/threads.h"
 #include "os/threads_darwin.h"
 #include "os/mem_space_split.h"
@@ -57,12 +50,9 @@
      SPARC64_CLONE_SETTLS | SPARC64_CLONE_PARENT_SETTID | \
      SPARC64_CLONE_CHILD_CLEARTID | SPARC64_CLONE_CHILD_SETTID)
 
-/* Futex op bits (Linux UAPI). WAIT_BITSET (with an absolute timeout,
- * realtime when CLOCK_REALTIME is set) is what glibc condvars use; the
- * oracle serves it, so it is required here too. Anything else (REQUEUE
- * family, etc.) stays -ENOSYS per the lane contract.
- * Guest-visible futex results below use fixed Linux numbers (-11,
- * -38, -110: Darwin BSD EAGAIN/ENOSYS/ETIMEDOUT are 35/78/60). */
+/* Futex op bits (Linux UAPI). WAIT_BITSET (absolute timeout) is what
+ * glibc condvars use; the rest (REQUEUE family, etc.) stays -ENOSYS.
+ * Results use fixed Linux numbers (-11/-38/-110; Darwin differs). */
 #define THR_FUTEX_WAIT 0U
 #define THR_FUTEX_WAKE 1U
 #define THR_FUTEX_WAIT_BITSET 9U
@@ -93,11 +83,8 @@ static long thr_group_status = 0;
 
 /* ---- boot / lookup ------------------------------------------------------ */
 
-/* The loader maps only the initial stack page; threaded guests (deep
- * glibc paths: printf/vasprintf, condvars, TLS setup) overflow it,
- * faulting or silently corrupting state. Extend the stack mapping down
- * toward the 8 MiB Linux default while that region is free. Best
- * effort: if it is occupied, leave the mapping untouched. */
+/* The loader maps one stack page; threaded guests overflow it. Extend
+ * down toward the 8 MiB Linux default while that region is free. */
 #define THR_STACK_GROW_SIZE UINT64_C(0x800000)
 
 static void thr_grow_stack(void *mc)
@@ -116,8 +103,7 @@ static void thr_grow_stack(void *mc)
     }
     want_base = stack_top - THR_STACK_GROW_SIZE;
     want_base &= ~(GUEST_PAGE_SIZE - UINT64_C(1));
-    /* Lowest page already mapped at/above want_base (the loader's stack
-     * page); extend the mapping down from there. */
+    /* Lowest mapped page at/above want_base; extend down from there. */
     {
         uint64_t i;
         uint64_t low = stack_top;
@@ -229,13 +215,10 @@ static unsigned thr_live_locked(void)
 
 /* ---- shared-mapping host pointer ---------------------------------------- */
 
-/* Resolve [va, va+size) to a host pointer on the shared mapping. The rt64
- * space layer exposes no accessor, but the registry (pages, backing
- * bytes) is public: validate permissions/range, then pin the single page
- * (atomics and futex words never cross a page). NULL when anything is
- * off; the caller falls back to the precise copy path. A mapping change
- * after resolve is the caller's documented race (futex re-resolves after
- * every sleep chunk). */
+/* Resolve [va, va+size) to a host pointer on the shared mapping.
+ * Single page only (atomics/futex words never cross one); NULL when
+ * anything is off. A later mapping change is the caller's documented
+ * race (futex re-resolves after every sleep chunk). */
 static void *thr_resolve(void *mc, uint64_t va, size_t size,
     unsigned int perm)
 {
@@ -251,11 +234,8 @@ static void *thr_resolve(void *mc, uint64_t va, size_t size,
         va > SPARC64_TASK_SIZE - (uint64_t)size) {
         return NULL;
     }
-    /* Wave U2: resolve at the 4 KiB translation granule
-     * (RT_TRANSLATION_GRANULE), never at the 8 KiB guest ABI page size:
-     * the space substrate pages are 4 KiB, so an 8 KiB base would land
-     * on the neighboring lower page and off would overread past the
-     * 4 KiB backing (heap overread + wrong atomic/futex address). */
+    /* Wave U2: resolve at the 4 KiB granule, never the 8 KiB ABI page:
+     * an 8 KiB base would land on the neighboring page and overread. */
     base = va & ~(SPARC64_PAGE_SIZE - UINT64_C(1));
     off = (size_t)(va - base);
     if (off + size > (size_t)SPARC64_PAGE_SIZE) {
@@ -342,27 +322,28 @@ static int thr_read_ts(const sparc64_syscall_mem_t *mem, uint64_t va,
     return 0;
 }
 
-/* Real WAIT/WAIT_BITSET on the shared mapping: the big lock is held on
- * entry and re-held on return. The guest timeout is forwarded to the
- * host as-is (relative for WAIT, absolute for WAIT_BITSET, whose clock
- * follows CLOCK_REALTIME); the lock drops across the sleep so a waker
- * can run. Spurious wakeups re-verify and re-sleep; EINTR during a group
- * exit reports -EINTR (the delivery-model check point). */
+/* Real WAIT/WAIT_BITSET on the shared mapping: big lock held on entry
+ * and return, dropped across the sleep. Spurious wakeups re-verify;
+ * EINTR during a group exit reports -EINTR. */
 static long thr_futex_wait(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *mem, uint64_t uaddr, uint64_t op,
     uint32_t val, uint32_t bitset, const struct timespec *ts)
 {
     uint64_t cmd = op & (uint64_t)THR_FUTEX_CMD_MASK;
     uint64_t flags = op & THR_FUTEX_FLAG_MASK;
-    /* Consumed only by the Linux futex path below; keep -Werror clean
-     * on hosts where that path is compiled out. */
-    (void)cmd;
+    /* flags feeds only the Linux path below; cmd feeds the deadline. */
     (void)flags;
 #if defined(__linux__) && defined(SYS_futex)
     uint32_t host_val = __builtin_bswap32(val);
 #endif
     uint32_t cur = 0U;
     int rc;
+    /* S64-R4-9: one monotonic deadline for relative WAIT retries. */
+    int rel = (cmd == (uint64_t)THR_FUTEX_WAIT) ? 1 : 0;
+    int have_dl = 0;
+    struct timespec dl = { 0, 0 };
+    struct timespec remain = { 0, 0 };
+    const struct timespec *tp = ts;
     (void)ctx;
     rc = thr_read_u32(mem, uaddr, &cur);
     if (rc != 0) {
@@ -371,11 +352,8 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
     if (cur != val) {
         return -11; /* Linux EAGAIN (Darwin: 35). */
     }
-    /* Lock handoff: spill every cached window image to its architectural
-     * home and drop the cache before sleeping. The winfile is process-
-     * global while each thread has its own counters/stack, so a resuming
-     * thread must refill from its own homes, never trust the cache. The
-     * re-acquire below (and every engine-loop entry) invalidates again. */
+    /* Lock handoff: flush cached window images home and drop the cache;
+     * a resuming thread refills from its own homes, never the cache. */
     {
         sparc64_step_result_t fres;
         if (!sparc64_win_flush_all(ctx, &guest_mem_ops, mem->context,
@@ -394,6 +372,16 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
             return 0;
         }
     }
+    if (rel != 0 && ts != NULL &&
+        clock_gettime(CLOCK_MONOTONIC, &dl) == 0) {
+        have_dl = 1;
+        dl.tv_sec += ts->tv_sec;
+        dl.tv_nsec += ts->tv_nsec;
+        if (dl.tv_nsec >= 1000000000L) {
+            dl.tv_sec += 1;
+            dl.tv_nsec -= 1000000000L;
+        }
+    }
     for (;;) {
         void *hp;
         long hrc;
@@ -408,35 +396,46 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
         if (hp == NULL) {
             return -EFAULT;
         }
-        /* S64-R3-1: snapshot the shared code generation across the
-         * sleep; a peer's mapping change commits a new generation
-         * while the lock is dropped. */
+        /* S64-R3-1: snapshot the code generation across the sleep. */
         epoch_before = vm64_code_epoch_get();
+        /* S64-R4-9: sleep the remaining slice of the same deadline. */
+        tp = ts;
+        if (have_dl != 0) {
+            struct timespec now;
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > dl.tv_sec ||
+                (now.tv_sec == dl.tv_sec && now.tv_nsec >= dl.tv_nsec)) {
+                return -110; /* Linux ETIMEDOUT. */
+            }
+            remain.tv_sec = dl.tv_sec - now.tv_sec;
+            remain.tv_nsec = dl.tv_nsec - now.tv_nsec;
+            if (remain.tv_nsec < 0) {
+                remain.tv_sec -= 1;
+                remain.tv_nsec += 1000000000L;
+            }
+            tp = &remain;
+        }
 #if defined(__linux__) && defined(SYS_futex)
         sparc64_thread_big_unlock();
-        hrc = thr_host_futex(hp, cmd | flags, host_val, ts, NULL, bitset);
+        hrc = thr_host_futex(hp, cmd | flags, host_val, tp, NULL, bitset);
         sparc64_thread_big_lock();
 #elif defined(__APPLE__) && defined(__aarch64__)
         /* S64-R3-4: the Darwin callee pins the backing under the held
-         * lock, drops it across the backend wait, and re-acquires
-         * before returning; the lock is held on both sides here. */
+         * lock and re-acquires before returning. */
         hrc = thr_darwin_futex_wait(ctx, mem, uaddr, op, val, bitset,
-            ts);
+            tp);
 #else
         (void)hp;
         (void)bitset;
+        (void)tp;
         sparc64_thread_big_unlock();
         hrc = -38; /* Linux ENOSYS (Darwin: 78). */
         sparc64_thread_big_lock();
 #endif
-        /* Re-acquired after a drop: another thread may have cached its
-         * own images since; refill from our own homes henceforth. */
+        /* Re-acquired: another thread may have cached images since. */
         sparc64_win_invalidate_all();
-        /* S64-R3-1: a mapping change slept through above leaves every
-         * per-thread DBT stale (only g->dbt is invalidated at the
-         * mutation site). Flush the live instance before executing
-         * cached code again; the engine loop's own generation check
-         * repeats this for the resuming thread's private DBT. */
+        /* S64-R3-1: a slept-through mapping change leaves every DBT
+         * stale; flush the live instance before executing again. */
         if (vm64_code_epoch_get() != epoch_before) {
             guest_state_t *g = (guest_state_t *)mem->context;
             if (g != NULL && g->dbt != NULL) {
@@ -513,9 +512,7 @@ long sparc64_thread_futex(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
             (uint32_t)val, NULL, NULL, 0U);
         return hrc;
 #elif defined(__APPLE__) && defined(__aarch64__)
-        /* S64-R3-4: route guest WAKE through the Darwin keyed backend
-         * (validated key, all-bits match); the big lock is held here,
-         * so the resolve above cannot race a remap. */
+        /* S64-R3-4: guest WAKE through the Darwin keyed backend. */
         return thr_darwin_futex_wake(mem, uaddr, val);
 #else
         return -38;
@@ -582,8 +579,10 @@ long sparc64_thread_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     slot->ctid_va = ((flags & (uint64_t)SPARC64_CLONE_CHILD_CLEARTID) !=
         UINT64_C(0)) ? ctid : UINT64_C(0);
     memcpy(&slot->ctx, ctx, sizeof(slot->ctx));
-    /* The child starts after the trapping ta with %o0 = 0, like the
-     * parent's own syscall commit (pc = npc; npc += 4, carries clear). */
+    /* S64-R4-8: the child inherits the parent's blocked mask with an
+     * empty pending set and a disabled altstack. */
+    sparc64_sync_sig_clone(&slot->ctx, ctx);
+    /* The child starts after the trapping ta with %o0 = 0. */
     slot->ctx.pc = ctx->npc;
     slot->ctx.npc = ctx->npc + 4U;
     slot->ctx.r[SPARC64_O0] = UINT64_C(0);
@@ -595,9 +594,7 @@ long sparc64_thread_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         slot->ctx.r[SPARC64_G7] = tls;
     }
     (void)pthread_mutex_unlock(&thr_table_lock);
-    /* Flush the parent's windows so every outstanding image sits in its
-     * architectural home before the copy runs on; the shared winfile then
-     * behaves as if the parent had made the child's calls itself. */
+    /* Flush the parent's windows home before the child context copies. */
     if (!sparc64_win_flush_all(ctx, &guest_mem_ops, mem->context, &res,
             ctx->pc)) {
         (void)pthread_mutex_lock(&thr_table_lock);
@@ -626,9 +623,7 @@ long sparc64_thread_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     {
         pthread_t host;
         int prc;
-        /* The child blocks on the big lock until this thread reaches a
-         * blocking point, so creating it while holding the lock is safe:
-         * the parent never waits on the child while holding it. */
+        /* The child blocks on the big lock, so creating it locked is safe. */
         prc = pthread_create(&host, NULL, sparc64_thread_entry, slot);
         if (prc != 0) {
             (void)pthread_mutex_lock(&thr_table_lock);
@@ -773,13 +768,11 @@ void sparc64_thread_entry_done(sparc64_thread_t *slot, long status)
     }
     slot->running = 0;
     slot->done = 1;
-    /* No group-exit arming here: this slot ended only itself (NR exit).
-     * exit_group arms it via sparc64_threads_note_group_exit instead. */
+    /* No group-exit arming here (NR exit ended only this slot). */
     (void)pthread_mutex_unlock(&thr_table_lock);
     sparc64_thread_big_unlock();
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* S64-R3-5: this host thread exits here; release its Darwin worker
-     * sync + table slot (the main thread never reaches this path). */
+    /* S64-R3-5: release this exiting host thread's Darwin worker sync. */
     thr_darwin_ws_teardown();
 #endif
 }

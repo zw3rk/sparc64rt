@@ -51,6 +51,7 @@
 #include "os/sync_sig.h"
 
 #include <errno.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "core/cpu.h"
@@ -69,13 +70,45 @@ static uint64_t sync_flags[SYNC_SIG_MAX + 1U];
 static uint64_t sync_restorer[SYNC_SIG_MAX + 1U];
 static uint64_t sync_sa_mask[SYNC_SIG_MAX + 1U];
 
-/* Single-threaded signal state (L4b introduces the thread table and
- * routes cross-thread kills to ESRCH until threads exist). */
-static uint64_t sync_blocked = UINT64_C(0);
-static uint64_t sync_pending = UINT64_C(0);
-static uint64_t sync_ss_sp = UINT64_C(0);
-static uint64_t sync_ss_size = UINT64_C(0);
-static uint64_t sync_ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+/* Per-thread signal state (S64-R4-8): the blocked mask, the
+ * thread-pending set, and the alternate stack live per guest thread,
+ * indexed by the thread's context pointer. Dispositions (handler,
+ * flags, restorer, sa_mask above) stay process-global, matching
+ * Linux. 65 slots cover the 64-thread table plus the pre-boot main
+ * thread; every guest signal path runs serialized on the big guest
+ * lock, so no locking is needed here. fork() inherits the whole table
+ * through the address-space copy; clone() inherits through
+ * sparc64_sync_sig_clone below. */
+#define SYNC_THR_MAX 65u
+typedef struct {
+    const sparc64_ctx_t *ctx;
+    uint64_t blocked;
+    uint64_t pending;
+    uint64_t ss_sp;
+    uint64_t ss_size;
+    uint64_t ss_flags;
+} sync_thr_t;
+static sync_thr_t sync_thr[SYNC_THR_MAX];
+
+static sync_thr_t *sync_resolve(const sparc64_ctx_t *ctx)
+{
+    unsigned i;
+    for (i = 0u; i < SYNC_THR_MAX; i++) {
+        if (sync_thr[i].ctx == ctx) {
+            return &sync_thr[i];
+        }
+    }
+    for (i = 0u; i < SYNC_THR_MAX; i++) {
+        if (sync_thr[i].ctx == NULL) {
+            sync_thr[i].ctx = ctx;
+            sync_thr[i].ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+            return &sync_thr[i];
+        }
+    }
+    /* Unreachable (at most 64 live threads): reuse slot 0 so state
+     * stays observable instead of faulting. */
+    return &sync_thr[0];
+}
 
 int sparc64_sync_sig_install(uint64_t sig, uint64_t handler_va,
     uint64_t restorer_va)
@@ -137,24 +170,55 @@ int sparc64_sync_sig_query(uint64_t sig, uint64_t *handler,
     return 0;
 }
 
-uint64_t sparc64_sync_sig_blocked_get(void)
+uint64_t sparc64_sync_sig_blocked_get(const sparc64_ctx_t *ctx)
 {
-    return sync_blocked;
+    return sync_resolve(ctx)->blocked;
 }
 
-void sparc64_sync_sig_blocked_set(uint64_t mask)
+void sparc64_sync_sig_blocked_set(const sparc64_ctx_t *ctx, uint64_t mask)
 {
-    sync_blocked = mask;
+    sync_resolve(ctx)->blocked = mask;
 }
 
-uint64_t sparc64_sync_sig_pending_get(void)
+uint64_t sparc64_sync_sig_pending_get(const sparc64_ctx_t *ctx)
 {
-    return sync_pending;
+    return sync_resolve(ctx)->pending;
 }
 
-long sparc64_sync_sig_altstack_set(uint64_t sp, uint64_t flags,
-    uint64_t size)
+/* Clone inheritance (S64-R4-8): the child starts with the parent's
+ * blocked mask, an empty pending set, and a disabled altstack. */
+void sparc64_sync_sig_clone(sparc64_ctx_t *child,
+    const sparc64_ctx_t *parent)
 {
+    const sync_thr_t *src;
+    sync_thr_t *dst;
+    if (child == NULL) {
+        return;
+    }
+    if (parent == NULL || parent == (const sparc64_ctx_t *)child) {
+        dst = sync_resolve(child);
+        dst->pending = UINT64_C(0);
+        dst->ss_sp = UINT64_C(0);
+        dst->ss_size = UINT64_C(0);
+        dst->ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+        return;
+    }
+    src = sync_resolve(parent);
+    dst = sync_resolve(child);
+    if (dst == src) {
+        return;
+    }
+    dst->blocked = src->blocked;
+    dst->pending = UINT64_C(0);
+    dst->ss_sp = UINT64_C(0);
+    dst->ss_size = UINT64_C(0);
+    dst->ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+}
+
+long sparc64_sync_sig_altstack_set(const sparc64_ctx_t *ctx, uint64_t sp,
+    uint64_t flags, uint64_t size)
+{
+    sync_thr_t *st = sync_resolve(ctx);
     if ((flags & ~(uint64_t)SPARC64_SS_DISABLE) != UINT64_C(0)) {
         return -EINVAL;
     }
@@ -168,26 +232,27 @@ long sparc64_sync_sig_altstack_set(uint64_t sp, uint64_t flags,
             return -ENOMEM;
         }
     }
-    sync_ss_sp = sp;
-    sync_ss_flags = flags;
-    sync_ss_size = size;
+    st->ss_sp = sp;
+    st->ss_flags = flags;
+    st->ss_size = size;
     return 0L;
 }
 
-void sparc64_sync_sig_altstack_get(uint64_t *sp, uint64_t *flags,
-    uint64_t *size, uint64_t cur_sp_unbiased)
+void sparc64_sync_sig_altstack_get(const sparc64_ctx_t *ctx, uint64_t *sp,
+    uint64_t *flags, uint64_t *size, uint64_t cur_sp_unbiased)
 {
+    const sync_thr_t *st = sync_resolve(ctx);
     if (sp != NULL) {
-        *sp = sync_ss_sp;
+        *sp = st->ss_sp;
     }
     if (flags != NULL) {
-        uint64_t f = sync_ss_flags;
+        uint64_t f = st->ss_flags;
         /* SS_ONSTACK is dynamic: report it when the stack is enabled
          * and the current stack pointer is inside its range. */
         if ((f & (uint64_t)SPARC64_SS_DISABLE) == UINT64_C(0) &&
-            sync_ss_sp != UINT64_C(0)) {
-            uint64_t end = sync_ss_sp + sync_ss_size;
-            if (end >= sync_ss_sp && cur_sp_unbiased >= sync_ss_sp &&
+            st->ss_sp != UINT64_C(0)) {
+            uint64_t end = st->ss_sp + st->ss_size;
+            if (end >= st->ss_sp && cur_sp_unbiased >= st->ss_sp &&
                 cur_sp_unbiased < end) {
                 f |= (uint64_t)SPARC64_SS_ONSTACK;
             }
@@ -195,7 +260,7 @@ void sparc64_sync_sig_altstack_get(uint64_t *sp, uint64_t *flags,
         *flags = f;
     }
     if (size != NULL) {
-        *size = sync_ss_size;
+        *size = st->ss_size;
     }
 }
 
@@ -208,11 +273,7 @@ void sparc64_sync_sig_reset_all(void)
         sync_restorer[i] = UINT64_C(0);
         sync_sa_mask[i] = UINT64_C(0);
     }
-    sync_blocked = UINT64_C(0);
-    sync_pending = UINT64_C(0);
-    sync_ss_sp = UINT64_C(0);
-    sync_ss_size = UINT64_C(0);
-    sync_ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+    (void)memset(sync_thr, 0, sizeof(sync_thr));
 }
 
 /* execve reset (cross-RT Round-3 class): caught dispositions return to
@@ -231,9 +292,16 @@ void sparc64_sync_sig_exec_reset(void)
             sync_sa_mask[i] = UINT64_C(0);
         }
     }
-    sync_ss_sp = UINT64_C(0);
-    sync_ss_size = UINT64_C(0);
-    sync_ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+    /* The blocked mask and pending signals survive the replacement
+     * (Linux execve semantics); every thread's altstack disables (it
+     * described the old image's address space). */
+    for (i = 0U; i < SYNC_THR_MAX; i++) {
+        if (sync_thr[i].ctx != NULL) {
+            sync_thr[i].ss_sp = UINT64_C(0);
+            sync_thr[i].ss_size = UINT64_C(0);
+            sync_thr[i].ss_flags = (uint64_t)SPARC64_SS_DISABLE;
+        }
+    }
 }
 
 int sparc64_sync_sig_for_trap(sparc64_trap_cause_t cause, int *code_out)
@@ -385,8 +453,9 @@ int sparc64_sync_sig_queue(sparc64_ctx_t *ctx,
     if (handler == UINT64_C(0) || handler == UINT64_C(1)) {
         return -1;
     }
-    if ((sync_blocked & sig_mask_bit(signo)) != UINT64_C(0)) {
-        sync_pending |= sig_mask_bit(signo);
+    if ((sync_resolve(ctx)->blocked & sig_mask_bit(signo)) !=
+        UINT64_C(0)) {
+        sync_resolve(ctx)->pending |= sig_mask_bit(signo);
         return 1;
     }
     return sparc64_sync_sig_deliver(ctx, mem, signo, SPARC64_SI_USER,
@@ -413,6 +482,7 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
     unsigned i;
     unsigned w;
     sparc64_step_result_t res;
+    sync_thr_t *st;
     if (!sig_bit(signo)) {
         return -1;
     }
@@ -421,6 +491,7 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
     if (handler == UINT64_C(0) || handler == UINT64_C(1)) {
         return -1;
     }
+    st = sync_resolve(ctx);
     /* ILLEGAL-caused traps refine from the raw word (32-bit): integer
      * divide forms become SIGFPE, trap instructions SIGTRAP. Fault
      * addresses are full 64-bit VAs and never collide with raw words
@@ -449,13 +520,13 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
      * header plus the inline 280-byte sigfpu tail. */
     unbiased = ctx->r[SPARC64_SP] + SPARC64_STACK_BIAS;
     top = unbiased;
-    if ((sync_ss_flags & (uint64_t)SPARC64_SS_DISABLE) == UINT64_C(0) &&
-        sync_ss_sp != UINT64_C(0) &&
+    if ((st->ss_flags & (uint64_t)SPARC64_SS_DISABLE) == UINT64_C(0) &&
+        st->ss_sp != UINT64_C(0) &&
         ((sync_flags[(unsigned)signo] &
           (uint64_t)SPARC64_SA_ONSTACK) != UINT64_C(0))) {
-        uint64_t end = sync_ss_sp + sync_ss_size;
-        if (end < sync_ss_sp ||
-            unbiased < sync_ss_sp || unbiased >= end) {
+        uint64_t end = st->ss_sp + st->ss_size;
+        if (end < st->ss_sp ||
+            unbiased < st->ss_sp || unbiased >= end) {
             top = end;
         }
     }
@@ -510,11 +581,11 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
      * mask @0x200 is the pre-delivery blocked set; rwin_save is 0. */
     /* The inline tail starts right past the 528-byte header. */
     put_u64be(&frame[0x1e0], base + UINT64_C(0x210));
-    put_u64be(&frame[0x1e8], sync_ss_sp);
-    put_u32be(&frame[0x1f0], (uint32_t)sync_ss_flags);
+    put_u64be(&frame[0x1e8], st->ss_sp);
+    put_u32be(&frame[0x1f0], (uint32_t)st->ss_flags);
     put_u32be(&frame[0x1f4], 0U);
-    put_u64be(&frame[0x1f8], sync_ss_size);
-    old_blocked = sync_blocked;
+    put_u64be(&frame[0x1f8], st->ss_size);
+    old_blocked = st->blocked;
     put_u64be(&frame[0x200], old_blocked);
     put_u64be(&frame[0x208], UINT64_C(0));
     /* Inline sigfpu tail @0x210: 32 doubles, fsr, gsr, fprs. */
@@ -539,8 +610,8 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
         UINT64_C(0) : sig_mask_bit(signo);
     new_blocked = (old_blocked | sync_sa_mask[(unsigned)signo] |
         self_bit) & ~(SPARC64_SIGKILL_BIT | SPARC64_SIGSTOP_BIT);
-    sync_blocked = new_blocked;
-    sync_pending &= ~sig_mask_bit(signo);
+    st->blocked = new_blocked;
+    st->pending &= ~sig_mask_bit(signo);
     /* Handler entry: signo in %o0, &info in %o1 and %o2, restorer in
      * %o7, biased handler %sp, pc/npc at handler/+4. */
     ctx->r[SPARC64_O0] = (uint64_t)signo;
@@ -558,7 +629,8 @@ int sparc64_sync_sig_deliver_pending(sparc64_ctx_t *ctx,
 {
     uint64_t deliverable;
     int signo;
-    deliverable = sync_pending & ~sync_blocked;
+    sync_thr_t *st = sync_resolve(ctx);
+    deliverable = st->pending & ~st->blocked;
     if (deliverable == UINT64_C(0)) {
         return 1;
     }
@@ -633,11 +705,11 @@ long sparc64_sync_sig_return(sparc64_ctx_t *ctx,
     }
     /* Blocked mask, altstack, then pc/npc (absolute: the caller must
      * skip the usual advance on success). */
-    sync_blocked = get_u64be(&frame[0x200]) &
+    sync_resolve(ctx)->blocked = get_u64be(&frame[0x200]) &
         ~(SPARC64_SIGKILL_BIT | SPARC64_SIGSTOP_BIT);
-    sync_ss_sp = get_u64be(&frame[0x1e8]);
-    sync_ss_flags = (uint64_t)get_u32be(&frame[0x1f0]);
-    sync_ss_size = get_u64be(&frame[0x1f8]);
+    sync_resolve(ctx)->ss_sp = get_u64be(&frame[0x1e8]);
+    sync_resolve(ctx)->ss_flags = (uint64_t)get_u32be(&frame[0x1f0]);
+    sync_resolve(ctx)->ss_size = get_u64be(&frame[0x1f8]);
     rwin_save = get_u64be(&frame[0x208]);
     if (rwin_save != UINT64_C(0)) {
         /* The translator always flushes windows to the user stack

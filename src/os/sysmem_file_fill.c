@@ -21,6 +21,16 @@
 
 #include "os/sysmem_file.h"
 
+/* Armed by the R4 transaction tests (S64-R4-10): the next `count`
+ * fills report -LOAD_NOMEM without touching guest pages, so the
+ * caller's rollback leg runs. Production callers never arm this. */
+static int sysmem_test_fail_fill;
+
+void sysmem_file_test_fail_next_fill(int count)
+{
+    sysmem_test_fail_fill = (count > 0) ? count : 0;
+}
+
 
 /* Populate len bytes from fd@file_offset into guest space at base via
  * the Provider-A helper (RC-U4 #5): each 8 KiB chunk goes through
@@ -47,6 +57,13 @@ int sysmem_file_fill(void *context, int fd, uint64_t file_offset,
     }
     kind = (is_private != 0) ? (uint8_t)VM64_PAGE_COW_CLEAN :
         (uint8_t)VM64_PAGE_SHARED;
+    if (sysmem_test_fail_fill > 0) {
+        sysmem_test_fail_fill--;
+        if (nchunk_out != NULL) {
+            *nchunk_out = 0u;
+        }
+        return -LOAD_NOMEM;
+    }
     while (done < len) {
         uint64_t want = len - done;
         long got;
@@ -175,18 +192,22 @@ static int sysmem_file_fill_overlap(guest_state_t *g,
     uint64_t foff;
     uint64_t len;
     int is_private;
+    int retained_fd;
     uint8_t cstate[SYSMEM_FILERANGE_CHUNKS];
     size_t nchunk = 0u;
     uint64_t bus;
     uint64_t bus_len;
     size_t k;
     int frc;
-    if (slot->fd < 0 || o1 <= o0) {
-        /* No retained description (dup failed at note time): the tail
-         * stays zero, exactly like an anonymous extension. */
+    /* S64-R4-4: live entries always carry a retained description (note
+     * fails instead of recording a descriptor-less entry), so a NULL
+     * description here only means there is nothing file-backed to
+     * serve and the tail stays zero like an anonymous extension. */
+    if (slot->desc == NULL || slot->desc->fd < 0 || o1 <= o0) {
         return 0;
     }
-    if (fstat(slot->fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+    retained_fd = slot->desc->fd;
+    if (fstat(retained_fd, &st) != 0 || !S_ISREG(st.st_mode) ||
         st.st_size < 0 ||
         (uint64_t)st.st_size > (uint64_t)INT64_MAX) {
         return 0;
@@ -195,7 +216,7 @@ static int sysmem_file_fill_overlap(guest_state_t *g,
     foff = slot->file_offset + (o0 - slot->base);
     len = o1 - o0;
     is_private = (slot->kind == (uint8_t)VM64_PAGE_SHARED) ? 0 : 1;
-    frc = sysmem_file_fill(g, slot->fd, foff, o0, len, fsize,
+    frc = sysmem_file_fill(g, retained_fd, foff, o0, len, fsize,
         is_private, cstate, sizeof(cstate), &nchunk);
     if (frc == -LOAD_NOMEM) {
         return -12;

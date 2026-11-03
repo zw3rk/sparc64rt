@@ -194,6 +194,12 @@ long thr_darwin_futex_wait(sparc64_ctx_t *ctx,
     uint32_t expected_seq = 0U;
     int prc;
     uint32_t cur = 0U;
+    /* S64-R4-9: one monotonic deadline for relative waits; every retry
+     * sleeps only the remaining slice instead of restarting the clock. */
+    int have_dl = 0;
+    struct timespec dl = { 0, 0 };
+    struct timespec remain = { 0, 0 };
+    const struct timespec *tp = ts;
     (void)ctx;
     if (cmd != UINT64_C(0) && cmd != (uint64_t)THR_DARWIN_WAIT_BITSET) {
         return -THR_LINUX_ENOSYS;
@@ -203,6 +209,17 @@ long thr_darwin_futex_wait(sparc64_ctx_t *ctx,
     }
     if (is_abs != 0 && bitset == 0U) {
         return -THR_LINUX_EINVAL;
+    }
+    if (is_abs == 0 && ts != NULL && ts->tv_sec >= 0 && ts->tv_nsec >= 0 &&
+        ts->tv_nsec < 1000000000L &&
+        clock_gettime(CLOCK_MONOTONIC, &dl) == 0) {
+        dl.tv_sec += ts->tv_sec;
+        dl.tv_nsec += ts->tv_nsec;
+        if (dl.tv_nsec >= 1000000000L) {
+            dl.tv_sec += 1;
+            dl.tv_nsec -= 1000000000L;
+        }
+        have_dl = 1;
     }
     /* Worker signal state for the sleeping thread (lazy; a NULL ws
      * still sleeps with deadline slices, only without signal
@@ -235,7 +252,27 @@ long thr_darwin_futex_wait(sparc64_ctx_t *ctx,
         }
         key = thr_darwin_key(uaddr);
         sparc64_thread_big_unlock();
-        wrc = rt_host_futex_wait_bitset(pin.word, &key, host_val, ts,
+        /* S64-R4-9: sleep the remaining slice of the same deadline. */
+        tp = ts;
+        if (have_dl != 0) {
+            struct timespec now;
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > dl.tv_sec ||
+                (now.tv_sec == dl.tv_sec && now.tv_nsec >= dl.tv_nsec)) {
+                sparc64_thread_big_lock();
+                thr_darwin_unpin(&pin);
+                sparc64_win_invalidate_all();
+                return -THR_LINUX_ETIMEDOUT;
+            }
+            remain.tv_sec = dl.tv_sec - now.tv_sec;
+            remain.tv_nsec = dl.tv_nsec - now.tv_nsec;
+            if (remain.tv_nsec < 0) {
+                remain.tv_sec -= 1;
+                remain.tv_nsec += 1000000000L;
+            }
+            tp = &remain;
+        }
+        wrc = rt_host_futex_wait_bitset(pin.word, &key, host_val, tp,
             is_abs, realtime, (is_abs != 0) ? bitset : UINT32_C(0xffffffff),
             ws, expected_seq);
         sparc64_thread_big_lock();

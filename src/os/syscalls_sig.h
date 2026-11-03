@@ -98,18 +98,23 @@ int sparc64_sync_sig_install_full(uint64_t sig, uint64_t handler,
 int sparc64_sync_sig_query(uint64_t sig, uint64_t *handler,
     uint64_t *flags, uint64_t *restorer, uint64_t *mask);
 
-/* Current blocked mask (file-static, single thread; L4b adds threads). */
-uint64_t sparc64_sync_sig_blocked_get(void);
+/* Current blocked mask (per thread, S64-R4-8; resolved by ctx). */
+uint64_t sparc64_sync_sig_blocked_get(const sparc64_ctx_t *ctx);
 
 /* Replace the blocked mask (KILL/STOP bits must already be stripped). */
-void sparc64_sync_sig_blocked_set(uint64_t mask);
+void sparc64_sync_sig_blocked_set(const sparc64_ctx_t *ctx, uint64_t mask);
 
 /* Store (0) or report (-EFAULT on bad guest address) the altstack. */
-long sparc64_sync_sig_altstack_set(uint64_t sp, uint64_t flags,
-    uint64_t size);
-uint64_t sparc64_sync_sig_pending_get(void);
-void sparc64_sync_sig_altstack_get(uint64_t *sp, uint64_t *flags,
-    uint64_t *size, uint64_t cur_sp_unbiased);
+long sparc64_sync_sig_altstack_set(const sparc64_ctx_t *ctx, uint64_t sp,
+    uint64_t flags, uint64_t size);
+uint64_t sparc64_sync_sig_pending_get(const sparc64_ctx_t *ctx);
+void sparc64_sync_sig_altstack_get(const sparc64_ctx_t *ctx, uint64_t *sp,
+    uint64_t *flags, uint64_t *size, uint64_t cur_sp_unbiased);
+
+/* Clone inheritance (S64-R4-8): the child starts with the parent's
+ * blocked mask, an empty pending set, and a disabled altstack. */
+void sparc64_sync_sig_clone(sparc64_ctx_t *child,
+    const sparc64_ctx_t *parent);
 
 /* Deliver the lowest pending unblocked signal with a handler.
  * Returns 0 on delivery, 1 when nothing is deliverable, -1 when the

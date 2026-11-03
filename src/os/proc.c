@@ -33,6 +33,7 @@
 #include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
 #include "os/proc.h"
+#include "os/sysmem_file.h"
 #include "os/guest_interp_map.h"
 
 #include <unistd.h>
@@ -202,8 +203,12 @@ long sparc64_proc_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     return proc_do_fork(ctx, mem, parent_tid_va, child_tid_va, set_flags);
 }
 
-/* Close every CLOEXEC fd >= 3 (execve semantics). Portable
- * fcntl-probe loop; no close_range dependency. */
+/* Close every CLOEXEC fd >= 3 (execve semantics), except the
+ * translator-retained file-mapping descriptors (S64-R4-7: those stay
+ * open across the sweep and are released with the replaced address
+ * space instead). Portable fcntl-probe loop; no close_range
+ * dependency. Runs only after the target binary validated and the new
+ * image committed, never before a potentially failing execve. */
 static void proc_close_cloexec(void)
 {
     long maxfd = sysconf(_SC_OPEN_MAX);
@@ -213,7 +218,8 @@ static void proc_close_cloexec(void)
     }
     for (fd = 3L; fd < maxfd; fd++) {
         int flags = fcntl((int)fd, F_GETFD);
-        if (flags >= 0 && (flags & FD_CLOEXEC) != 0) {
+        if (flags >= 0 && (flags & FD_CLOEXEC) != 0 &&
+            !sparc64_sysmem_is_retained_fd((int)fd)) {
             (void)close((int)fd);
         }
     }
@@ -489,10 +495,12 @@ long sparc64_proc_execve(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         proc_free_vec(envp, envc);
         return -EFAULT;
     }
-    proc_close_cloexec();
     /* qemu parity: sysroot misses for non-SPARC host binaries run
      * natively (the forked guest child is replaced; the parent
-     * wait4s and continues). Only returns on host-exec failure. */
+     * wait4s and continues). Host execve performs its own atomic
+     * CLOEXEC handling, so no sweep runs here: a failed execve must
+     * destroy no guest descriptor (S64-R4-7). Only returns on
+     * host-exec failure. */
     if (proc_should_host_exec(path)) {
         long erc;
         (void)execve(path, argv, envp);
@@ -515,7 +523,12 @@ long sparc64_proc_execve(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     /* Fresh image: caught handlers return to SIG_DFL while ignored
      * dispositions, the blocked mask, and pending signals survive the
      * replacement (Linux execve semantics); brk/tids reset, the host
-     * pid is kept. Robust/futex state persists (lane L4b owns it). */
+     * pid is kept. Robust/futex state persists (lane L4b owns it).
+     * S64-R4-7: the image committed, so the guest CLOEXEC sweep runs
+     * now (skipping translator-retained mapping fds) and the replaced
+     * address space's retained backing state is released. */
+    proc_close_cloexec();
+    sysmem_file_drop_all();
     sparc64_sync_sig_exec_reset();
     return 0;
 }

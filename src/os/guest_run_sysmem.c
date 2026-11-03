@@ -404,10 +404,12 @@ long sparc64_sysmem_munmap(void *context, uint64_t addr, uint64_t len)
     /* 6-step legs: unmap tolerates holes (no failure leg); commit then
      * drops paired Soft-TLB entries and the block-cache range.
      * S64-R3-3 REGRESSION: reserve the drop-split tail BEFORE the legs
-     * so claim_free cannot realloc mid-drop. The syscall cannot fail
-     * for registry pressure, so a reserve miss degrades (drop loses
-     * the tail) instead of failing. */
-    (void)sysmem_file_reserve(sysmem_file_drop_extra(base, size));
+     * so claim_free cannot realloc mid-drop. S64-R4-5: a reserve miss
+     * reports -ENOMEM with zero mutation instead of silently dropping
+     * the surviving tail's truncate metadata. */
+    if (sysmem_file_reserve(sysmem_file_drop_extra(base, size)) != 0) {
+        return -ENOMEM;
+    }
     if (vm64_stxn_prepare() != 0) {
         return -EFAULT;
     }
@@ -457,7 +459,13 @@ long sparc64_sysmem_mprotect(void *context, uint64_t addr, uint64_t len,
         }
     }
     /* 6-step legs: protect mutates nothing unless every page is mapped
-     * (zero-mutation abort otherwise); commit invalidates the span. */
+     * (zero-mutation abort otherwise); commit invalidates the span.
+     * S64-R4-6: reserve the protect-split slots BEFORE the legs so the
+     * registry update below cannot fail mid-mutation; a reserve miss
+     * reports -ENOMEM with zero mutation. */
+    if (sysmem_file_reserve(sysmem_file_protect_extra(addr, size)) != 0) {
+        return -ENOMEM;
+    }
     if (vm64_stxn_prepare() != 0) {
         return -EFAULT;
     }
@@ -479,6 +487,10 @@ long sparc64_sysmem_mprotect(void *context, uint64_t addr, uint64_t len,
     if (g->dbt != NULL) {
         sparc64_dbt_invalidate(g->dbt, addr, size);
     }
+    /* S64-R4-6: the registry tracks the new permissions (split-aware),
+     * so a later truncate resize restores the current prot instead of
+     * the stale one (reserved above: no split can fail mid-update). */
+    sysmem_file_protect_update(g, addr, size, prot & 7U);
     (void)vm64_stxn_commit(addr, size);
     return 0;
 }
@@ -557,6 +569,8 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     unsigned perms = 7U;
     sysmem_span_op_t op;
     long hop;
+    sysmem_file_range_t *snap = NULL;
+    size_t snap_cap = 0u;
     if (g == NULL) {
         return -EFAULT;
     }
@@ -644,12 +658,19 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     }
     /* S64-R3-3: reserve the worst-case registry slots BEFORE the
      * 6-step legs (straddler splits + destination excision), so the
-     * coverage update below cannot fail mid-mutation. */
+     * coverage update below cannot fail mid-mutation. S64-R4-3:
+     * snapshot the registry too, so a failed growth fill can restore
+     * the pre-relocation coverage exactly; either failure below
+     * reports -ENOMEM with zero mutation. */
     if (sysmem_file_reserve(sysmem_file_span_extra(old_addr, old_len,
             dest, new_len)) != 0) {
         return -ENOMEM;
     }
+    if (sysmem_file_snapshot(&snap, &snap_cap) != 0) {
+        return -ENOMEM;
+    }
     if (vm64_stxn_prepare() != 0) {
+        sysmem_file_snapshot_discard(snap, snap_cap);
         return -EFAULT;
     }
     op.g = g;
@@ -664,6 +685,7 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
         /* The substrate stamps fault_reason: unmapped source reads as
          * -EFAULT (Linux class), range faults as -EINVAL, everything
          * else (resource/internal) as -ENOMEM. */
+        sysmem_file_snapshot_discard(snap, snap_cap);
         if (g->space.fault_reason == SPARC64_FAULT_UNMAPPED) {
             return -EFAULT;
         }
@@ -695,10 +717,17 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
         long frc = (long)sysmem_file_fill_growth(g, dest, old_len,
             new_len);
         if (frc == -12L) {
-            /* Extension rejected: drop the fresh tail and report
-             * resource exhaustion. In place this restores zero net
-             * mutation; moved it leaves the relocated old_len bytes
-             * without committing a zero tail (S64-R3 follow-up #6). */
+            /* S64-R4-3: the relocation published but the growth tail
+             * rejected the fill. Roll everything back: drop the fresh
+             * tail, move the relocated head back to the source (the
+             * substrate reuses the same backings, so the source bytes
+             * are intact), restore the registry snapshot, invalidate
+             * both spans, and bump the code generation (mappings
+             * changed under the announcement, which aborts without
+             * bumping). A failed move-back keeps the relocated state
+             * (with its matching mutated registry) instead of
+             * restoring half. */
+            int space_ok = 1;
             sysmem_span_op_t tail;
             tail.g = g;
             tail.base = dest + old_len;
@@ -708,12 +737,30 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
             tail.dest = UINT64_C(0);
             tail.new_size = UINT64_C(0);
             (void)sysmem_space_op(&tail);
-            sysmem_file_drop_map(g, dest + old_len,
-                new_len - old_len);
+            if (dest != old_addr) {
+                sysmem_span_op_t back;
+                back.g = g;
+                back.base = dest;
+                back.size = old_len;
+                back.prot = perms;
+                back.kind = SYSOP_REMAP;
+                back.dest = old_addr;
+                back.new_size = old_len;
+                space_ok = (sysmem_space_op(&back) == 0);
+            }
+            if (space_ok) {
+                sysmem_file_restore(snap, snap_cap);
+            } else {
+                sysmem_file_snapshot_discard(snap, snap_cap);
+            }
+            snap = NULL;
+            sparc64_tlb_invalidate_gva(old_addr, old_len);
             sparc64_tlb_invalidate_gva(dest, new_len);
             if (g->dbt != NULL) {
+                sparc64_dbt_invalidate(g->dbt, old_addr, old_len);
                 sparc64_dbt_invalidate(g->dbt, dest, new_len);
             }
+            vm64_code_epoch_bump();
             vm64_stxn_abort();
             return -ENOMEM;
         }
@@ -722,6 +769,7 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
         old_addr < g->brk_cur && old_addr + old_len >= g->brk_cur) {
         g->brk_cur = dest + (g->brk_cur - old_addr);
     }
+    sysmem_file_snapshot_discard(snap, snap_cap);
     (void)vm64_stxn_commit(dest, new_len);
     return (long)dest;
 }

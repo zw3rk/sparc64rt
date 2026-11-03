@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "core/cpu.h"
+#include "interp/fp_commit.h"
 #include "interp/interp.h"
 
 typedef struct sd_unp {
@@ -77,19 +78,6 @@ static double cv_f64(uint64_t u)
     double v = 0.0;
     memcpy(&v, &u, sizeof(v));
     return v;
-}
-
-static sparc64_step_result_t cv_commit(sparc64_cpu_t *cpu, uint64_t pc,
-    const sparc64_dec_t *d, unsigned fresh)
-{
-    fresh &= 0x1FU;
-    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
-    cpu->fsr |= (uint64_t)fresh << 5;
-    if ((((cpu->fsr >> 23) & UINT64_C(0x1F)) & (cpu->fsr & UINT64_C(0x1F))) !=
-        UINT64_C(0)) {
-        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
-    }
-    return sparc64_step_ok(pc);
 }
 
 /* 64-bit leading-zero count (unrolled binary search). */
@@ -166,9 +154,11 @@ static uint64_t cv_int_bits(uint64_t mag, unsigned neg, unsigned p,
     } else if (rm == 1U) {
         up = false;
     } else if (rm == 2U) {
-        up = neg == 0U;
+        /* S64-R4-2: directed increments need discarded bits; exact
+         * integers never round up. */
+        up = (*nx != 0U) && neg == 0U;
     } else {
-        up = neg != 0U;
+        up = (*nx != 0U) && neg != 0U;
     }
     if (up) {
         sig += UINT64_C(1);
@@ -188,7 +178,9 @@ static sparc64_step_result_t cv_itos(sparc64_cpu_t *cpu, uint64_t pc,
 {
     int32_t v = (int32_t)cpu->fp.f[(d->raw & 31U) ^ 1U];
     unsigned neg = (v < 0) ? 1U : 0U;
-    uint64_t mag = (neg != 0U) ? (UINT64_C(0) - (uint64_t)(uint32_t)v)
+    /* S64-R4-1: sign-extend before unsigned negation so negative
+     * inputs (v == -1, INT32_MIN) yield the right magnitude. */
+    uint64_t mag = (neg != 0U) ? (UINT64_C(0) - (uint64_t)(int64_t)v)
                                : (uint64_t)(uint32_t)v;
     unsigned rm = (unsigned)((cpu->fsr >> 30) & UINT64_C(3));
     unsigned nx = 0U;
@@ -199,7 +191,7 @@ static sparc64_step_result_t cv_itos(sparc64_cpu_t *cpu, uint64_t pc,
         cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)cv_int_bits(mag, neg,
             24U, rm, 127, 23U, UINT64_C(0x7FFFFF), &nx);
     }
-    return cv_commit(cpu, pc, d, nx);
+    return sparc64_fp_commit(cpu, pc, d, nx);
 }
 
 /* 64-bit integer source to single/double: same rules as 32-bit. */
@@ -221,7 +213,7 @@ static sparc64_step_result_t cv_xtos(sparc64_cpu_t *cpu, uint64_t pc,
         cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)cv_int_bits(mag, neg,
             24U, rm, 127, 23U, UINT64_C(0x7FFFFF), &nx);
     }
-    return cv_commit(cpu, pc, d, nx);
+    return sparc64_fp_commit(cpu, pc, d, nx);
 }
 
 /* Inexact-truncation test on double bits: true when the value has a
@@ -259,7 +251,7 @@ static sparc64_step_result_t cv_dtoi32(sparc64_cpu_t *cpu, uint64_t pc,
         r = (v < -2147483648.0) ? UINT32_C(0x80000000)
                                 : UINT32_C(0x7FFFFFFF);
         cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-        return cv_commit(cpu, pc, d, fl);
+        return sparc64_fp_commit(cpu, pc, d, fl);
     }
     t = (int64_t)v;
     memcpy(&u, &v, sizeof(u));
@@ -267,7 +259,7 @@ static sparc64_step_result_t cv_dtoi32(sparc64_cpu_t *cpu, uint64_t pc,
         fl = 0x01U;
     }
     cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)t;
-    return cv_commit(cpu, pc, d, fl);
+    return sparc64_fp_commit(cpu, pc, d, fl);
 }
 
 /* Double value to 64-bit integer, same rules with 64-bit range. */
@@ -282,7 +274,7 @@ static sparc64_step_result_t cv_dtoi64(sparc64_cpu_t *cpu, uint64_t pc,
         t = (v < -9223372036854775808.0) ? (int64_t)INT64_C(-9223372036854775807 - 1)
                                          : (int64_t)INT64_C(9223372036854775807);
         memcpy(&cpu->fp.d[cv_pair(d->rd)], &t, sizeof(t));
-        return cv_commit(cpu, pc, d, fl);
+        return sparc64_fp_commit(cpu, pc, d, fl);
     }
     t = (int64_t)v;
     memcpy(&u, &v, sizeof(u));
@@ -290,7 +282,7 @@ static sparc64_step_result_t cv_dtoi64(sparc64_cpu_t *cpu, uint64_t pc,
         fl = 0x01U;
     }
     memcpy(&cpu->fp.d[cv_pair(d->rd)], &t, sizeof(t));
-    return cv_commit(cpu, pc, d, fl);
+    return sparc64_fp_commit(cpu, pc, d, fl);
 }
 
 /* Single to double widening: exact for finite values; NaN widens the
@@ -308,13 +300,13 @@ static sparc64_step_result_t cv_stod(sparc64_cpu_t *cpu, uint64_t pc,
         if ((a & UINT32_C(0x00400000)) == UINT32_C(0)) {
             r |= UINT64_C(0x0008000000000000);
             cpu->fp.d[cv_pair(d->rd)] = r;
-            return cv_commit(cpu, pc, d, 0x10U);
+            return sparc64_fp_commit(cpu, pc, d, 0x10U);
         }
         cpu->fp.d[cv_pair(d->rd)] = r;
-        return cv_commit(cpu, pc, d, 0U);
+        return sparc64_fp_commit(cpu, pc, d, 0U);
     }
     cpu->fp.d[cv_pair(d->rd)] = cv_b64((double)cv_f32(a));
-    return cv_commit(cpu, pc, d, 0U);
+    return sparc64_fp_commit(cpu, pc, d, 0U);
 }
 
 sparc64_step_result_t sparc64_fp_conv(sparc64_cpu_t *cpu, uint64_t pc,
@@ -426,25 +418,25 @@ sparc64_step_result_t sparc64_sd_sqrt_op(sparc64_cpu_t *cpu, uint64_t pc,
         }
         if (w == 0U) { cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)o; }
         else { cpu->fp.d[cv_pair(d->rd)] = o; }
-        return cv_commit(cpu, pc, d, fl);
+        return sparc64_fp_commit(cpu, pc, d, fl);
     }
     if (aneg != 0U && ca != 0U) {
         o = (w == 0U) ? UINT64_C(0x7FFFFFFF) : UINT64_C(0x7FFFFFFFFFFFFFFF);
         if (w == 0U) { cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)o; }
         else { cpu->fp.d[cv_pair(d->rd)] = o; }
-        return cv_commit(cpu, pc, d, 0x10U);
+        return sparc64_fp_commit(cpu, pc, d, 0x10U);
     }
     if (ca == 0U || ca == 3U) {
         if (w == 0U) { cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)a; }
         else { cpu->fp.d[cv_pair(d->rd)] = a; }
-        return cv_commit(cpu, pc, d, 0U);
+        return sparc64_fp_commit(cpu, pc, d, 0U);
     }
     sparc64_sd_unpack(a, w, p, emin, &ua);
     cv_sqrt(&ua, p, &neg, &exp, &sig, &g, &r, &s);
     fl = sparc64_sd_pack(neg, exp, sig, g, r, s, p, emin, emax, bias, rm, &o);
     if (w == 0U) { cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)o; }
     else { cpu->fp.d[cv_pair(d->rd)] = o; }
-    return cv_commit(cpu, pc, d, fl);
+    return sparc64_fp_commit(cpu, pc, d, fl);
 }
 
 sparc64_step_result_t sparc64_sd_fsmuld(sparc64_cpu_t *cpu, uint64_t pc,
@@ -469,22 +461,22 @@ sparc64_step_result_t sparc64_sd_fsmuld(sparc64_cpu_t *cpu, uint64_t pc,
             UINT64_C(0x7FF0000000000000) |
             ((o & UINT64_C(0x007FFFFF)) << 29);
         cpu->fp.d[cv_pair(d->rd)] = r;
-        return cv_commit(cpu, pc, d, fl);
+        return sparc64_fp_commit(cpu, pc, d, fl);
     }
     if ((ai && bz) || (az && bi)) {
         cpu->fp.d[cv_pair(d->rd)] = UINT64_C(0x7FFFFFFFFFFFFFFF);
-        return cv_commit(cpu, pc, d, 0x10U);
+        return sparc64_fp_commit(cpu, pc, d, 0x10U);
     }
     if (ai || bi) {
         cpu->fp.d[cv_pair(d->rd)] =
             ((uint64_t)(((a ^ b) >> 31) & 1U) << 63) |
             (UINT64_C(0x7FF) << 52);
-        return cv_commit(cpu, pc, d, 0U);
+        return sparc64_fp_commit(cpu, pc, d, 0U);
     }
     if (az || bz) {
         cpu->fp.d[cv_pair(d->rd)] =
             (uint64_t)(((a ^ b) >> 31) & 1U) << 63;
-        return cv_commit(cpu, pc, d, 0U);
+        return sparc64_fp_commit(cpu, pc, d, 0U);
     }
     {
         sd_unp_t ua, ub;
@@ -497,7 +489,7 @@ sparc64_step_result_t sparc64_sd_fsmuld(sparc64_cpu_t *cpu, uint64_t pc,
         fl = sparc64_sd_pack(neg, exp, sig << 29, 0U, 0U, 0U, 53U, -1022,
             1023, 1023, cv_rd_mode(cpu), &o);
         cpu->fp.d[cv_pair(d->rd)] = o;
-        return cv_commit(cpu, pc, d, fl);
+        return sparc64_fp_commit(cpu, pc, d, fl);
     }
 }
 
@@ -518,16 +510,16 @@ sparc64_step_result_t sparc64_sd_dtos(sparc64_cpu_t *cpu, uint64_t pc,
         if (!quiet) {
             r |= UINT32_C(0x00400000);
             cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-            return cv_commit(cpu, pc, d, 0x10U);
+            return sparc64_fp_commit(cpu, pc, d, 0x10U);
         }
         cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-        return cv_commit(cpu, pc, d, 0U);
+        return sparc64_fp_commit(cpu, pc, d, 0U);
     }
     if (ca == 0U || ca == 3U) {
         uint32_t r = (aneg << 31) |
             ((ca == 3U) ? UINT32_C(0x7F800000) : UINT32_C(0));
         cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-        return cv_commit(cpu, pc, d, 0U);
+        return sparc64_fp_commit(cpu, pc, d, 0U);
     }
     {
         sd_unp_t u;
@@ -540,6 +532,6 @@ sparc64_step_result_t sparc64_sd_dtos(sparc64_cpu_t *cpu, uint64_t pc,
         fl = sparc64_sd_pack(u.neg, u.exp, u.sig >> 29, g, rr, ss, 24U,
             -126, 127, 127, rm, &o);
         cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)o;
-        return cv_commit(cpu, pc, d, fl);
+        return sparc64_fp_commit(cpu, pc, d, fl);
     }
 }
