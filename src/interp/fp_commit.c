@@ -15,12 +15,17 @@
 sparc64_step_result_t sparc64_fp_commit(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned fresh)
 {
+    unsigned tem;
     fresh &= 0x1FU;
-    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
-    cpu->fsr |= (uint64_t)fresh << 5;
-    if ((((cpu->fsr >> 23) & UINT64_C(0x1F)) & (cpu->fsr & UINT64_C(0x1F))) !=
-        UINT64_C(0)) {
+    tem = (unsigned)((cpu->fsr >> 23) & UINT64_C(0x1F));
+    if (((unsigned)fresh & tem) != 0U) {
+        cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
+        cpu->fsr = (cpu->fsr & ~(UINT64_C(7) << 14)) |
+            (UINT64_C(1) << 14);
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
     }
+    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
+    cpu->fsr |= (uint64_t)fresh << 5;
+    cpu->fsr &= ~(UINT64_C(7) << 14);
     return sparc64_step_ok(pc);
 }

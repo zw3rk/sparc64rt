@@ -347,6 +347,27 @@ static uint32_t sync_bits(uint32_t w, unsigned lo, unsigned n)
         ((1U << n) - 1U));
 }
 
+/* Map an FSR cexc value to the Linux SIGFPE si_code (S64-R6-4). */
+static int sync_fpe_code_for_cexc(unsigned cexc)
+{
+    if ((cexc & 0x10U) != 0U) {
+        return SPARC64_FPE_FLTINV;
+    }
+    if ((cexc & 0x08U) != 0U) {
+        return SPARC64_FPE_FLTOVF;
+    }
+    if ((cexc & 0x04U) != 0U) {
+        return SPARC64_FPE_FLTUND;
+    }
+    if ((cexc & 0x02U) != 0U) {
+        return SPARC64_FPE_FLTDIV;
+    }
+    if ((cexc & 0x01U) != 0U) {
+        return SPARC64_FPE_FLTRES;
+    }
+    return SPARC64_FPE_FLTINV;
+}
+
 void sparc64_sync_sig_classify_raw(uint32_t raw, int *signo_out,
     int *code_out)
 {
@@ -354,7 +375,13 @@ void sparc64_sync_sig_classify_raw(uint32_t raw, int *signo_out,
     int code = SPARC64_ILL_ILLOPC;
     if (sync_bits(raw, 30U, 2U) == 2U) {
         uint32_t op3 = sync_bits(raw, 19U, 6U);
-        if (op3 == 0x3aU) {
+        if (op3 == 0x34U || op3 == 0x35U) {
+            /* S64-R6-4: FPOP1/FPOP2 with an enabled TEM trap (FSR.ftt
+             * == IEEE_754_exception) delivers SIGFPE, not SIGILL. The
+             * precise FLT* code comes from FSR.cexc at delivery. */
+            signo = (int)SPARC64_SIG_FPE;
+            code = SPARC64_FPE_FLTINV;
+        } else if (op3 == 0x3aU) {
             /* Tcc / TA (trap on condition, always): breakpoint. */
             signo = (int)SPARC64_SIG_TRAP;
             code = SPARC64_TRAP_BRKPT;
@@ -493,12 +520,25 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
     }
     st = sync_resolve(ctx);
     /* ILLEGAL-caused traps refine from the raw word (32-bit): integer
-     * divide forms become SIGFPE, trap instructions SIGTRAP. Fault
-     * addresses are full 64-bit VAs and never collide with raw words
-     * that decode as op==2 divide/trap forms. */
+     * divide forms become SIGFPE, trap instructions SIGTRAP, and FPOP1/2
+     * with FSR.ftt == IEEE_754_exception become SIGFPE with the FLT*
+     * code from FSR.cexc. Fault addresses are full 64-bit VAs and never
+     * collide with raw words that decode as op==2 divide/trap/FP forms. */
     if (signo == (int)SPARC64_SIG_ILL && fault_addr <= UINT64_C(0xffffffff)) {
-        sparc64_sync_sig_classify_raw((uint32_t)fault_addr, &signo,
-            &code);
+        uint32_t raw = (uint32_t)fault_addr;
+        unsigned ftt = (unsigned)((ctx->fsr >> 14) & UINT64_C(7));
+        sparc64_sync_sig_classify_raw(raw, &signo, &code);
+        if (signo == (int)SPARC64_SIG_FPE &&
+            (((raw >> 30) & 3U) == 2U) &&
+            ((((raw >> 19) & 63U) == 0x34U) ||
+                (((raw >> 19) & 63U) == 0x35U))) {
+            code = sync_fpe_code_for_cexc(
+                (unsigned)(ctx->fsr & UINT64_C(0x1F)));
+        } else if (signo == (int)SPARC64_SIG_ILL && ftt == 1U) {
+            signo = (int)SPARC64_SIG_FPE;
+            code = sync_fpe_code_for_cexc(
+                (unsigned)(ctx->fsr & UINT64_C(0x1F)));
+        }
         handler = sync_handler[(unsigned)signo];
         restorer = sync_restorer[(unsigned)signo];
         if (handler == UINT64_C(0) || handler == UINT64_C(1)) {

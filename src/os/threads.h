@@ -69,7 +69,8 @@ void sparc64_threads_boot(const sparc64_syscall_mem_t *ops, int engine,
 
 /* Big guest lock: serializes interp/DBT execution (shared winfile and
  * shared space metadata). Held across whole engine runs; dropped only
- * while blocked in futex WAIT. */
+ * while blocked in futex WAIT or blocking host I/O (read/write/readv/
+ * writev, S64-R6-2). */
 void sparc64_thread_big_lock(void);
 void sparc64_thread_big_unlock(void);
 

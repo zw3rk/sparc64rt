@@ -54,6 +54,13 @@
 #define SPARC64_BUS_ADRALN 1
 #define SPARC64_ILL_ILLOPC 1
 #define SPARC64_FPE_INTDIV 1
+#define SPARC64_FPE_INTOVF 2
+#define SPARC64_FPE_FLTDIV 3
+#define SPARC64_FPE_FLTOVF 4
+#define SPARC64_FPE_FLTUND 5
+#define SPARC64_FPE_FLTRES 6
+#define SPARC64_FPE_FLTINV 7
+#define SPARC64_FPE_FLTSUB 8
 #define SPARC64_TRAP_BRKPT 1
 
 /* sa_flags bits accepted by rt_sigaction (SA_SIGINFO required). */

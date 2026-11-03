@@ -148,18 +148,23 @@ static bool fp_issnan_d(uint64_t u)
 }
 
 /* Commit one operate instruction's flags: cexc overwritten, aexc sticky.
- * A trapped (TEM & cexc) condition takes the generic synchronous-trap
- * path, like ILLEGAL. */
+ * A trapped (TEM & cexc) condition sets cexc/ftt (IEEE_754_exception)
+ * without touching aexc and takes the synchronous-trap path. */
 static sparc64_step_result_t fp_commit(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned fresh)
 {
+    unsigned tem;
     fresh &= 0x1FU;
-    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
-    cpu->fsr |= (uint64_t)fresh << 5;
-    if ((((cpu->fsr >> 23) & UINT64_C(0x1F)) & (cpu->fsr & UINT64_C(0x1F))) !=
-        UINT64_C(0)) {
+    tem = (unsigned)((cpu->fsr >> 23) & UINT64_C(0x1F));
+    if (((unsigned)fresh & tem) != 0U) {
+        cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
+        cpu->fsr = (cpu->fsr & ~(UINT64_C(7) << 14)) |
+            (UINT64_C(1) << 14);
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
     }
+    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
+    cpu->fsr |= (uint64_t)fresh << 5;
+    cpu->fsr &= ~(UINT64_C(7) << 14);
     return sparc64_step_ok(pc);
 }
 
@@ -183,26 +188,36 @@ static sparc64_step_result_t fp_move_s(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned op)
 {
     uint32_t a = cpu->fp.f[(d->raw & 31U) ^ 1U];
+    sparc64_step_result_t tr;
     if (op == 1U) {
         a ^= UINT32_C(0x80000000);
     } else if (op == 2U) {
         a &= ~UINT32_C(0x80000000);
     }
+    tr = fp_commit(cpu, pc, d, 0U);
+    if (tr.kind != SPARC64_STEP_CONTINUE) {
+        return tr;
+    }
     cpu->fp.f[(d->rd & 31U) ^ 1U] = a;
-    return fp_commit(cpu, pc, d, 0U);
+    return tr;
 }
 
 static sparc64_step_result_t fp_move_d(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned op)
 {
     uint64_t a = cpu->fp.d[fp_pair(d->raw & 31U)];
+    sparc64_step_result_t tr;
     if (op == 1U) {
         a ^= UINT64_C(0x8000000000000000);
     } else if (op == 2U) {
         a &= ~UINT64_C(0x8000000000000000);
     }
+    tr = fp_commit(cpu, pc, d, 0U);
+    if (tr.kind != SPARC64_STEP_CONTINUE) {
+        return tr;
+    }
     cpu->fp.d[fp_pair(d->rd)] = a;
-    return fp_commit(cpu, pc, d, 0U);
+    return tr;
 }
 
 /* Ordered magnitude compare for finite nonzero operands of equal sign
@@ -257,8 +272,14 @@ static sparc64_step_result_t fp_cmp_s(sparc64_cpu_t *cpu, uint64_t pc,
             fcc = m;
         }
     }
-    fp_fcc_write(cpu, d->rd, fcc);
-    return fp_commit(cpu, pc, d, nv);
+    {
+        sparc64_step_result_t tr = fp_commit(cpu, pc, d, nv);
+        if (tr.kind != SPARC64_STEP_CONTINUE) {
+            return tr;
+        }
+        fp_fcc_write(cpu, d->rd, fcc);
+        return tr;
+    }
 }
 
 /* FCMP/FCMPE (double), same rules as single. */
@@ -290,8 +311,14 @@ static sparc64_step_result_t fp_cmp_d(sparc64_cpu_t *cpu, uint64_t pc,
             fcc = m;
         }
     }
-    fp_fcc_write(cpu, d->rd, fcc);
-    return fp_commit(cpu, pc, d, nv);
+    {
+        sparc64_step_result_t tr = fp_commit(cpu, pc, d, nv);
+        if (tr.kind != SPARC64_STEP_CONTINUE) {
+            return tr;
+        }
+        fp_fcc_write(cpu, d->rd, fcc);
+        return tr;
+    }
 }
 
 /* Floating-point condition test over an fcc value (0 equal, 1 less,
@@ -371,19 +398,27 @@ static sparc64_step_result_t fp_movcc(sparc64_cpu_t *cpu, uint64_t pc,
         return fp_commit(cpu, pc, d, 0U);
     }
     rs2 = d->raw & 31U;
-    if (size == 1U) {
-        cpu->fp.f[(d->rd & 31U) ^ 1U] = cpu->fp.f[(rs2) ^ 1U];
-    } else if (size == 2U) {
-        cpu->fp.d[fp_pair(d->rd)] = cpu->fp.d[fp_pair(rs2)];
-    } else {
+    if (size == 3U) {
         unsigned qd = fp_qidx(d->rd);
         unsigned qs = fp_qidx(rs2);
         if (qd > 15U || qs > 15U) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
-        fp_copy_q(cpu, d->rd, rs2);
     }
-    return fp_commit(cpu, pc, d, 0U);
+    {
+        sparc64_step_result_t tr = fp_commit(cpu, pc, d, 0U);
+        if (tr.kind != SPARC64_STEP_CONTINUE) {
+            return tr;
+        }
+        if (size == 1U) {
+            cpu->fp.f[(d->rd & 31U) ^ 1U] = cpu->fp.f[(rs2) ^ 1U];
+        } else if (size == 2U) {
+            cpu->fp.d[fp_pair(d->rd)] = cpu->fp.d[fp_pair(rs2)];
+        } else {
+            fp_copy_q(cpu, d->rd, rs2);
+        }
+        return tr;
+    }
 }
 
 /* FMOVr: opf = 0x100|size (%icc) or 0x180|size (%xcc); the integer
@@ -412,19 +447,27 @@ static sparc64_step_result_t fp_movr(sparc64_cpu_t *cpu, uint64_t pc,
         return fp_commit(cpu, pc, d, 0U);
     }
     rs2 = d->raw & 31U;
-    if (size == 1U) {
-        cpu->fp.f[(d->rd & 31U) ^ 1U] = cpu->fp.f[(rs2) ^ 1U];
-    } else if (size == 2U) {
-        cpu->fp.d[fp_pair(d->rd)] = cpu->fp.d[fp_pair(rs2)];
-    } else {
+    if (size == 3U) {
         unsigned qd = fp_qidx(d->rd);
         unsigned qs = fp_qidx(rs2);
         if (qd > 15U || qs > 15U) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
-        fp_copy_q(cpu, d->rd, rs2);
     }
-    return fp_commit(cpu, pc, d, 0U);
+    {
+        sparc64_step_result_t tr = fp_commit(cpu, pc, d, 0U);
+        if (tr.kind != SPARC64_STEP_CONTINUE) {
+            return tr;
+        }
+        if (size == 1U) {
+            cpu->fp.f[(d->rd & 31U) ^ 1U] = cpu->fp.f[(rs2) ^ 1U];
+        } else if (size == 2U) {
+            cpu->fp.d[fp_pair(d->rd)] = cpu->fp.d[fp_pair(rs2)];
+        } else {
+            fp_copy_q(cpu, d->rd, rs2);
+        }
+        return tr;
+    }
 }
 
 sparc64_step_result_t sparc64_exec_fpu(sparc64_ctx_t *cpu,

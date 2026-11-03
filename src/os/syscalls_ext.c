@@ -22,10 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -44,6 +46,16 @@
 #ifdef st_ctime
 #undef st_ctime
 #endif
+/* macOS <sys/signal.h> (reached via <stdlib.h>) #defines sa_handler and
+ * sa_sigaction over the frozen guest sparc64_sigaction_t field names
+ * (same pattern as src/os/syscalls_sig.h); drop them here (this TU
+ * only, which never uses the host struct sigaction). */
+#ifdef sa_handler
+#undef sa_handler
+#endif
+#ifdef sa_sigaction
+#undef sa_sigaction
+#endif
 
 #include "core/cpu.h"
 #include "os/guest_proc.h"
@@ -52,6 +64,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
 #include "os/syscalls_min.h"
+#include "os/threads.h"
 
 /* SPARC open flags (arch/sparc fcntl.h, shared 32/64-bit); low 2 access
  * bits match the host. */
@@ -227,11 +240,36 @@ long sparc64_l2a_getuid(void) { return (long)getuid(); }
 
 long sparc64_l2a_getgid(void) { return (long)getgid(); }
 
+/* Permission-checked range helper (S64-R6-3): bounds first, then the
+ * writability pin for readv destinations. Readability for writev sources
+ * is proven by the staging copy before any host I/O. */
+static int l2a_range_prot_ok(const sparc64_syscall_mem_t *mem, uint64_t va,
+    uint64_t len, int prot)
+{
+    if (l2a_range_ok(va, len) != 0) {
+        return -EFAULT;
+    }
+    if (len == 0U) {
+        return 0;
+    }
+    if ((prot & PROT_WRITE) != 0) {
+        if (!mem->prepare_write(mem->context, va, len)) {
+            return -EFAULT;
+        }
+    }
+    return 0;
+}
+
 /* readv/writev over guest iovec chains ({BE u64 base, BE u64 len}).
  * All entries are validated first, the bytes are staged into a single
  * contiguous host buffer, and exactly one host read/write call runs so
  * pipe atomicity holds and a partial readv never blocks for more data.
- * Short counts scatter back to the guest and read as the result. */
+ * Short counts scatter back to the guest and read as the result.
+ * S64-R6-2: the big lock is dropped across the single blocking host
+ * call (inputs already staged, destinations pre-validated). S64-R6-3:
+ * readv destinations are permission-checked before any host input is
+ * consumed; a leading-invalid chain fails with -EFAULT, a later-invalid
+ * chain caps to the valid prefix. */
 static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t fd, uint64_t iov_va, uint64_t iovcnt, int is_write)
 {
@@ -301,6 +339,17 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     }
     if (is_write) {
         for (i = 0U; i < iovcnt; i++) {
+            if (vec[i].len == 0U) {
+                continue;
+            }
+            if (l2a_range_prot_ok(mem, vec[i].base, vec[i].len,
+                    PROT_READ) != 0) {
+                free(buf);
+                free(vec);
+                return -EFAULT;
+            }
+        }
+        for (i = 0U; i < iovcnt; i++) {
             uint64_t base = vec[i].base;
             uint64_t len = vec[i].len;
             if (len == 0U) {
@@ -315,8 +364,11 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         }
         /* S2 hook point: host op runs first (Step 3); the coordinator
          * lands vm_file_commit_resize here (Step 4) once the family
-         * table + truncate dispatch exist. */
+         * table + truncate dispatch exist. S64-R6-2: inputs are staged
+         * above, so drop the big lock across the blocking host call. */
+        sparc64_thread_big_unlock();
         got = write((int)fd, buf, (size_t)total);
+        sparc64_thread_big_lock();
         free(buf);
         free(vec);
         if (got < 0) {
@@ -324,7 +376,34 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         }
         return (long)got;
     }
-    got = read((int)fd, buf, (size_t)total);
+    {
+        uint64_t valid_total = 0U;
+        uint64_t valid_cnt = iovcnt;
+        uint64_t k;
+        for (k = 0U; k < iovcnt; k++) {
+            if (vec[k].len == 0U) {
+                continue;
+            }
+            if (l2a_range_prot_ok(mem, vec[k].base, vec[k].len,
+                    PROT_WRITE) != 0) {
+                valid_cnt = k;
+                break;
+            }
+            valid_total += vec[k].len;
+        }
+        if (valid_cnt != iovcnt) {
+            if (valid_total == 0U) {
+                free(buf);
+                free(vec);
+                return -EFAULT;
+            }
+            total = valid_total;
+            iovcnt = valid_cnt;
+        }
+        sparc64_thread_big_unlock();
+        got = read((int)fd, buf, (size_t)total);
+        sparc64_thread_big_lock();
+    }
     if (got < 0) {
         free(buf);
         free(vec);
@@ -381,9 +460,28 @@ static long flags_host_to_guest(int host)
     if ((host & O_NONBLOCK) != 0) {
         g |= (uint64_t)SP_O_NONBLOCK;
     }
+#ifdef O_DIRECTORY
+    if ((host & O_DIRECTORY) != 0) {
+        g |= (uint64_t)SP_O_DIRECTORY;
+    }
+#endif
+#ifdef O_PATH
+    if ((host & O_PATH) != 0) {
+        g |= (uint64_t)SP_O_PATH;
+    }
+#endif
 #ifdef O_SYNC
-    if ((host & O_SYNC) != 0) {
+    if ((host & O_SYNC) == O_SYNC) {
         g |= (uint64_t)SP_O_SYNC;
+    }
+#ifdef O_DSYNC
+    else if ((host & O_DSYNC) != 0) {
+        g |= (uint64_t)SP_O_DSYNC;
+    }
+#endif
+#elif defined(O_DSYNC)
+    if ((host & O_DSYNC) != 0) {
+        g |= (uint64_t)SP_O_DSYNC;
     }
 #endif
 #ifdef O_ASYNC
@@ -436,8 +534,8 @@ long sparc64_l2a_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
             rest &= ~(uint64_t)SP_O_APPEND;
         }
         if (((rest & (uint64_t)SP_O_NDELAY) == (uint64_t)SP_O_NDELAY) ||
-            ((rest & (uint64_t)SP_O_NONBLOCK) != 0U ||
-            ((rest & (uint64_t)0x0004U) != 0U)) {
+            ((rest & (uint64_t)SP_O_NONBLOCK) != 0U) ||
+            (((rest & (uint64_t)0x0004U) != 0U))) {
             host |= O_NONBLOCK;
             rest &= ~((uint64_t)SP_O_NDELAY | (uint64_t)SP_O_NONBLOCK |
                 (uint64_t)0x0004U);
@@ -501,12 +599,21 @@ static long sys_clock_get(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     case SP_CLOCK_MONOTONIC: host_clk = CLOCK_MONOTONIC; break;
     default: return -EINVAL;
     }
-    if (l2a_range_ok(tp_va, 16U) != 0) {
-        return -EFAULT;
+    if (is_res == 0 && tp_va == 0U) {
+        if (l2a_range_ok(tp_va, 16U) != 0) {
+            return -EFAULT;
+        }
+    } else if (tp_va != 0U) {
+        if (l2a_range_ok(tp_va, 16U) != 0) {
+            return -EFAULT;
+        }
     }
     if (is_res ? clock_getres(host_clk, &ts) != 0 :
             clock_gettime(host_clk, &ts) != 0) {
         return -(long)errno;
+    }
+    if (is_res != 0 && tp_va == 0U) {
+        return 0;
     }
     return store_timespec(mem, tp_va, &ts);
 }
@@ -654,12 +761,42 @@ long sparc64_l2a_futex(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
 #endif
 }
 
-/* TCGETS answers as an isatty query (no termios copy: the sparc layout
- * differs from the host); TIOCGWINSZ fills the BE winsize. */
+/* TCGETS fills the 36-byte SPARC Linux termios (BE flags, line + cc);
+ * TIOCGWINSZ fills the BE winsize. */
 long sparc64_l2a_ioctl(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t fd, uint64_t request, uint64_t arg_va)
 {
     (void)ctx;
+    if (request == (uint64_t)SP_TCGETS) {
+        struct termios ht;
+        uint8_t b[36];
+        unsigned i;
+        unsigned ncc;
+        if (l2a_range_ok(arg_va, (uint64_t)sizeof(b)) != 0) {
+            return -EFAULT;
+        }
+        if (tcgetattr((int)fd, &ht) != 0) {
+            return -ENOTTY;
+        }
+        memset(b, 0, sizeof(b));
+        l2a_put_be32(b, (uint32_t)ht.c_iflag);
+        l2a_put_be32(b + 4U, (uint32_t)ht.c_oflag);
+        l2a_put_be32(b + 8U, (uint32_t)ht.c_cflag);
+        l2a_put_be32(b + 12U, (uint32_t)ht.c_lflag);
+#if defined(__linux__)
+        b[16] = (uint8_t)ht.c_line;
+#else
+        b[16] = 0;
+#endif
+        ncc = (unsigned)NCCS;
+        if (ncc > 19U) {
+            ncc = 19U;
+        }
+        for (i = 0U; i < ncc; i++) {
+            b[17U + i] = (uint8_t)ht.c_cc[i];
+        }
+        return l2a_store_buf(mem, arg_va, b, (uint64_t)sizeof(b));
+    }
     if (request == (uint64_t)SP_TIOCGWINSZ) {
         struct winsize ws;
         uint8_t b[8];
@@ -675,6 +812,5 @@ long sparc64_l2a_ioctl(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         l2a_put_be16(b + 6U, ws.ws_ypixel);
         return l2a_store_buf(mem, arg_va, b, (uint64_t)sizeof(b));
     }
-    return (request == (uint64_t)SP_TCGETS) ?
-        (isatty((int)fd) ? 0 : -ENOTTY) : -ENOTTY;
+    return -ENOTTY;
 }

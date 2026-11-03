@@ -196,7 +196,11 @@ static long sys_read(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         if (!mem->prepare_write(mem->context, buf_va + done, want)) {
             return (done != 0U) ? (long)done : -EFAULT;
         }
+        /* S64-R6-2: destination validated above; drop the big lock
+         * across the blocking host read, reacquire before copyout. */
+        sparc64_thread_big_unlock();
         got = read((int)fd, chunk, (size_t)want);
+        sparc64_thread_big_lock();
         if (got < 0) {
             return (done != 0U) ? (long)done : host_ret(got);
         }
@@ -237,7 +241,11 @@ static long sys_write(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         if (!mem->read(mem->context, buf_va + done, chunk, want)) {
             return (done != 0U) ? (long)done : -EFAULT;
         }
+        /* S64-R6-2: input staged above; drop the big lock across the
+         * blocking host write. */
+        sparc64_thread_big_unlock();
         got = write((int)fd, chunk, (size_t)want);
+        sparc64_thread_big_lock();
         if (got <= 0) {
             return (done != 0U) ? (long)done : host_ret(got);
         }
@@ -454,6 +462,9 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         ret = sparc64_l2a_getdents64(ctx, mem, o0, o1, o2);
         break;
     case (long)SPARC64__NR_faccessat:
+        ret = sparc64_l2a_faccessat(ctx, mem, o0, o1, o2, 0);
+        break;
+    case (long)SPARC64__NR_faccessat2:
         ret = sparc64_l2a_faccessat(ctx, mem, o0, o1, o2, o3);
         break;
     /* Phase-2 static-libc set (src/os/syscalls_ext.c, additive cases). */
