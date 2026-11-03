@@ -49,10 +49,11 @@ long sparc64_proc_vfork(sparc64_ctx_t *ctx,
 /* clone(217) without CLONE_VM: fork-like (child %o0 = 0, %o1 = 1).
  * Honors CLONE_PARENT_SETTID/CHILD_SETTID stores. Returns -EINVAL
  * when CLONE_VM/CLONE_THREAD/CLONE_SIGHAND/CLONE_SETTLS is set
- * (lane L4b owns host-thread-backed threads). */
+ * (lane L4b owns host-thread-backed threads). SPARC order
+ * (o2=ptid, o3=tls, o4=ctid; S64-R10-1). */
 long sparc64_proc_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t flags, uint64_t stack_va, uint64_t parent_tid_va,
-    uint64_t child_tid_va, uint64_t tls_va);
+    uint64_t tls_va, uint64_t child_tid_va);
 
 /* execve(59): validate ELF, close CLOEXEC, reload the image, reset
  * ctx/signals/brk/tids, keep the pid. Returns 0 with ctx already at

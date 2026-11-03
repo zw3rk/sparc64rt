@@ -70,7 +70,6 @@
 /* First guest tid handed to spawned threads (real pids never reach it). */
 #define THR_FIRST_TID 0x40000000UL
 
-static pthread_mutex_t thr_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t thr_big_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Exported to threads_fork.c (declared in os/threads.h). */
 sparc64_thread_t thr_table[THR_MAX_THREADS];
@@ -132,6 +131,7 @@ void sparc64_threads_boot(const sparc64_syscall_mem_t *ops, int engine,
     (void)pthread_mutex_lock(&thr_table_lock);
     if (!thr_booted) {
         thr_booted = 1;
+        sparc64_threads_fork_init();
         thr_engine = engine;
         thr_ops = ops;
         memset(thr_table, 0, sizeof(thr_table));

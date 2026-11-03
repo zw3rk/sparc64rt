@@ -20,6 +20,7 @@
 #ifndef SPARC64RT_OS_THREADS_H
 #define SPARC64RT_OS_THREADS_H
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -75,6 +76,20 @@ void sparc64_threads_boot(const sparc64_syscall_mem_t *ops, int engine,
 /* Table storage (threads.c). The fork-child reset below is the only
  * cross-TU writer. */
 extern sparc64_thread_t thr_table[THR_MAX_THREADS];
+
+/* Table lock (owned by threads_fork.c so the file stays under the
+ * 900-line limit; threads.c uses it via this declaration). Serializes
+ * clone/futex/robust/entry paths; fork/exec gates take it under the
+ * big guest lock (big -> table order). */
+extern pthread_mutex_t thr_table_lock;
+
+/* True when a live thread other than ctx exists (S64-R10-3 execve
+ * gate). Unbooted layers report none. */
+int sparc64_threads_has_live_peers(sparc64_ctx_t *ctx);
+
+/* Register the fork lock-quiescence triple once (S64-R10-4); called
+ * from sparc64_threads_boot. */
+void sparc64_threads_fork_init(void);
 
 /* Fork-child reset (threads_fork.c; proc.c calls this on the child leg
  * of fork/vfork/clone-noVM): drops every slot except the calling

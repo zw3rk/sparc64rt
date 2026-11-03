@@ -52,7 +52,7 @@ extern char **environ;
 #define PROC_CLONE_SIGHAND 0x800U
 #define PROC_CLONE_THREAD 0x10000U
 #define PROC_CLONE_SETTLS 0x80000U
-#define PROC_CLONE_PARENT_SETTID 0x10U
+#define PROC_CLONE_PARENT_SETTID 0x100000U
 #define PROC_CLONE_CHILD_SETTID 0x1000000U
 #define PROC_CLONE_CHILD_CLEARTID 0x200000U
 
@@ -193,7 +193,7 @@ long sparc64_proc_vfork(sparc64_ctx_t *ctx,
 
 long sparc64_proc_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t flags, uint64_t stack_va, uint64_t parent_tid_va,
-    uint64_t child_tid_va, uint64_t tls_va)
+    uint64_t tls_va, uint64_t child_tid_va)
 {
     uint64_t set_flags;
     (void)stack_va;
@@ -471,6 +471,13 @@ long sparc64_proc_execve(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     g = (guest_state_t *)mem->context;
     if (g == NULL) {
         return -EFAULT;
+    }
+    /* S64-R10-3: Linux kills all other threads at exec; sibling host
+     * threads here share g->space, so replacing it under live peers
+     * would leave them running stale PCs into destroyed mappings.
+     * Refuse while peers are alive (caller must join/exit them). */
+    if (sparc64_threads_has_live_peers(ctx)) {
+        return -EBUSY;
     }
     stage = (char *)malloc((size_t)PROC_MAX_ARG_STRLEN + 1U);
     if (stage == NULL) {
