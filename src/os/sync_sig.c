@@ -375,13 +375,9 @@ void sparc64_sync_sig_classify_raw(uint32_t raw, int *signo_out,
     int code = SPARC64_ILL_ILLOPC;
     if (sync_bits(raw, 30U, 2U) == 2U) {
         uint32_t op3 = sync_bits(raw, 19U, 6U);
-        if (op3 == 0x34U || op3 == 0x35U) {
-            /* S64-R6-4: FPOP1/FPOP2 with an enabled TEM trap (FSR.ftt
-             * == IEEE_754_exception) delivers SIGFPE, not SIGILL. The
-             * precise FLT* code comes from FSR.cexc at delivery. */
-            signo = (int)SPARC64_SIG_FPE;
-            code = SPARC64_FPE_FLTINV;
-        } else if (op3 == 0x3aU) {
+        /* FPop traps stay SIGILL here; only FSR.ftt == 1
+         * (IEEE_754_exception) upgrades to SIGFPE at delivery. */
+        if (op3 == 0x3aU) {
             /* Tcc / TA (trap on condition, always): breakpoint. */
             signo = (int)SPARC64_SIG_TRAP;
             code = SPARC64_TRAP_BRKPT;
@@ -528,13 +524,10 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
         uint32_t raw = (uint32_t)fault_addr;
         unsigned ftt = (unsigned)((ctx->fsr >> 14) & UINT64_C(7));
         sparc64_sync_sig_classify_raw(raw, &signo, &code);
-        if (signo == (int)SPARC64_SIG_FPE &&
-            (((raw >> 30) & 3U) == 2U) &&
+        if ((((raw >> 30) & 3U) == 2U) &&
             ((((raw >> 19) & 63U) == 0x34U) ||
-                (((raw >> 19) & 63U) == 0x35U))) {
-            code = sync_fpe_code_for_cexc(
-                (unsigned)(ctx->fsr & UINT64_C(0x1F)));
-        } else if (signo == (int)SPARC64_SIG_ILL && ftt == 1U) {
+                (((raw >> 19) & 63U) == 0x35U)) &&
+            ftt == 1U) {
             signo = (int)SPARC64_SIG_FPE;
             code = sync_fpe_code_for_cexc(
                 (unsigned)(ctx->fsr & UINT64_C(0x1F)));

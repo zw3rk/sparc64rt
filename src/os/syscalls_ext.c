@@ -770,13 +770,12 @@ long sparc64_l2a_ioctl(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     if (request == (uint64_t)SP_TCGETS) {
         struct termios ht;
         uint8_t b[36];
-        unsigned i;
-        unsigned ncc;
         if (l2a_range_ok(arg_va, (uint64_t)sizeof(b)) != 0) {
             return -EFAULT;
         }
         if (tcgetattr((int)fd, &ht) != 0) {
-            return -ENOTTY;
+            int e = errno;
+            return (e == EBADF) ? -EBADF : -ENOTTY;
         }
         memset(b, 0, sizeof(b));
         l2a_put_be32(b, (uint32_t)ht.c_iflag);
@@ -788,13 +787,56 @@ long sparc64_l2a_ioctl(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
 #else
         b[16] = 0;
 #endif
-        ncc = (unsigned)NCCS;
-        if (ncc > 19U) {
-            ncc = 19U;
+        b[17U + 0U] = (uint8_t)ht.c_cc[VINTR];
+        b[17U + 1U] = (uint8_t)ht.c_cc[VQUIT];
+        b[17U + 2U] = (uint8_t)ht.c_cc[VERASE];
+        b[17U + 3U] = (uint8_t)ht.c_cc[VKILL];
+#if defined(VEOF) && defined(VMIN)
+        if ((ht.c_lflag & (tcflag_t)ICANON) != 0) {
+            b[17U + 4U] = (uint8_t)ht.c_cc[VEOF];
+        } else {
+            b[17U + 4U] = (uint8_t)ht.c_cc[VMIN];
         }
-        for (i = 0U; i < ncc; i++) {
-            b[17U + i] = (uint8_t)ht.c_cc[i];
+#elif defined(VEOF)
+        b[17U + 4U] = (uint8_t)ht.c_cc[VEOF];
+#elif defined(VMIN)
+        b[17U + 4U] = (uint8_t)ht.c_cc[VMIN];
+#endif
+#if defined(VEOL) && defined(VTIME)
+        if ((ht.c_lflag & (tcflag_t)ICANON) != 0) {
+            b[17U + 5U] = (uint8_t)ht.c_cc[VEOL];
+        } else {
+            b[17U + 5U] = (uint8_t)ht.c_cc[VTIME];
         }
+#elif defined(VEOL)
+        b[17U + 5U] = (uint8_t)ht.c_cc[VEOL];
+#elif defined(VTIME)
+        b[17U + 5U] = (uint8_t)ht.c_cc[VTIME];
+#endif
+#ifdef VEOL2
+        b[17U + 6U] = (uint8_t)ht.c_cc[VEOL2];
+#endif
+#ifdef VSTART
+        b[17U + 8U] = (uint8_t)ht.c_cc[VSTART];
+#endif
+#ifdef VSTOP
+        b[17U + 9U] = (uint8_t)ht.c_cc[VSTOP];
+#endif
+#ifdef VSUSP
+        b[17U + 10U] = (uint8_t)ht.c_cc[VSUSP];
+#endif
+#ifdef VREPRINT
+        b[17U + 12U] = (uint8_t)ht.c_cc[VREPRINT];
+#endif
+#ifdef VDISCARD
+        b[17U + 13U] = (uint8_t)ht.c_cc[VDISCARD];
+#endif
+#ifdef VWERASE
+        b[17U + 14U] = (uint8_t)ht.c_cc[VWERASE];
+#endif
+#ifdef VLNEXT
+        b[17U + 15U] = (uint8_t)ht.c_cc[VLNEXT];
+#endif
         return l2a_store_buf(mem, arg_va, b, (uint64_t)sizeof(b));
     }
     if (request == (uint64_t)SP_TIOCGWINSZ) {
