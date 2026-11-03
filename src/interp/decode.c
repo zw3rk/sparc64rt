@@ -119,16 +119,26 @@ void sparc64_classify_word(uint32_t word, sparc64_dec_t *d)
             return;
         }
         if (op2 == 5U) {
-            /* FBfcc: a(29) cond(28:25) fcc(21:20); bit 19 is the static
+            /* FBPfcc: a(29) cond(28:25) fcc(21:20); bit 19 is the static
              * prediction hint (ignored, like BPcc pred); disp19 is
-             * bits 18:0 (oracle-probed). op2 == 6 stays ILLEGAL:
-             * qemu-sparc64 kills it, so it never decodes as a branch. */
+             * bits 18:0 (oracle-probed). */
             d->cls = SPARC64_ICLS_FBR;
             d->annul = (uint8_t)fld(word, 29U, 29U);
             d->cond = (uint8_t)fld(word, 28U, 25U);
             d->cc = (uint8_t)fld(word, 21U, 20U);
             d->pred = (uint8_t)fld(word, 19U, 19U);
             d->disp = sx(fld(word, 18U, 0U), 19U) * INT64_C(4);
+            return;
+        }
+        if (op2 == 6U) {
+            /* Legacy FBfcc (V8 form): a(29) cond(28:25) disp22(21:0)
+             * on FCC0; no prediction hint. */
+            d->cls = SPARC64_ICLS_FBR;
+            d->annul = (uint8_t)fld(word, 29U, 29U);
+            d->cond = (uint8_t)fld(word, 28U, 25U);
+            d->cc = 0U;
+            d->pred = 0U;
+            d->disp = sx(fld(word, 21U, 0U), 22U) * INT64_C(4);
             return;
         }
         d->uimm = word & 0x3FFFFFU;
@@ -195,12 +205,6 @@ static void sparc64_decode_op2(sparc64_dec_t *d, uint32_t word, unsigned op3,
     case SPARC64_OP3_MULSCC:
     case SPARC64_OP3_SDIVX:
     case SPARC64_OP3_POPC:
-        if (op3 == SPARC64_OP3_TADDCC && rd == 31U && rs1 == 0U &&
-            i == 1U) {
-            /* SIR (software-initiated reset) shares the TADDcc opcode. */
-            d->cls = SPARC64_ICLS_PRIV;
-            return;
-        }
         d->cls = SPARC64_ICLS_ALU;
         if (i != 0U) {
             d->imm = sx(fld(word, 12U, 0U), 13U);
@@ -473,13 +477,16 @@ static void sparc64_decode_op3(sparc64_dec_t *d, uint32_t word, unsigned op3,
             d->regasi = 1U;
         }
     }
-    if (i != 0U) {
+    if (op3 == SPARC64_OP3_CASA || op3 == SPARC64_OP3_CASXA) {
+        /* CAS address is rs1+rs2 in both ASI forms; i selects the ASI
+         * source only, so the swap register is always bits 4:0. */
+        d->rs2 = (uint8_t)fld(word, 4U, 0U);
+    } else if (i != 0U) {
         d->imm = sx(fld(word, 12U, 0U), 13U);
     } else {
         d->rs2 = (uint8_t)fld(word, 4U, 0U);
     }
-    if (op3 == SPARC64_OP3_LDDA || op3 == SPARC64_OP3_STDA ||
-        op3 == SPARC64_OP3_LDFA || op3 == SPARC64_OP3_LDDFA ||
+    if (op3 == SPARC64_OP3_LDFA || op3 == SPARC64_OP3_LDDFA ||
         op3 == SPARC64_OP3_STFA || op3 == SPARC64_OP3_STDFA) {
         d->cls = SPARC64_ICLS_FPU;
         return;

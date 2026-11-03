@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "core/cpu.h"
+#include "interp/fp_commit.h"
 #include "interp/interp.h"
 
 #define QC_BIAS 16383
@@ -119,14 +120,7 @@ static int qc_rd_mode(const sparc64_cpu_t *cpu)
 static sparc64_step_result_t qc_commit(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned fresh)
 {
-    fresh &= 0x1FU;
-    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
-    cpu->fsr |= (uint64_t)fresh << 5;
-    if ((((cpu->fsr >> 23) & UINT64_C(0x1F)) & (cpu->fsr & UINT64_C(0x1F))) !=
-        UINT64_C(0)) {
-        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
-    }
-    return sparc64_step_ok(pc);
+    return sparc64_fp_commit(cpu, pc, d, fresh);
 }
 
 static void qc_fcc_write(sparc64_cpu_t *cpu, unsigned idx, unsigned v)
@@ -271,9 +265,9 @@ static unsigned qc_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
     } else if (rm == FE_TOWARDZERO) {
         up = false;
     } else if (rm == FE_UPWARD) {
-        up = neg == 0U;
+        up = (neg == 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     } else {
-        up = neg != 0U;
+        up = (neg != 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     }
     if (up) {
         slo += UINT64_C(1);
@@ -341,11 +335,11 @@ static unsigned qc_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
         } else {
             if (to_inf) {
                 *ohi = UINT64_C(0);
-                *olo = ((uint64_t)neg << 32) |
+                *olo = ((uint64_t)neg << 31) |
                     ((uint64_t)UINT64_C(0xFF) << 23);
             } else {
                 *ohi = UINT64_C(0);
-                *olo = ((uint64_t)neg << 32) |
+                *olo = ((uint64_t)neg << 31) |
                     ((uint64_t)(emax + bias) << 23) |
                     UINT64_C(0x7FFFFF);
             }
@@ -376,10 +370,10 @@ static unsigned qc_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
         uint32_t f = (uint32_t)(slo & UINT64_C(0x7FFFFF));
         if (tiny || (slo == UINT64_C(0))) {
             *ohi = UINT64_C(0);
-            *olo = ((uint64_t)neg << 32) | (uint64_t)f;
+            *olo = ((uint64_t)neg << 31) | (uint64_t)f;
         } else {
             *ohi = UINT64_C(0);
-            *olo = ((uint64_t)neg << 32) |
+            *olo = ((uint64_t)neg << 31) |
                 ((uint64_t)(uint64_t)(exp + bias) << 23) | (uint64_t)f;
         }
     }
@@ -397,6 +391,46 @@ static void qc_put(sparc64_cpu_t *cpu, unsigned qi, uint64_t hi, uint64_t lo)
 {
     cpu->fp.d[2U * qi] = hi;
     cpu->fp.d[2U * qi + 1U] = lo;
+    sparc64_fp_mark_dirty(cpu, (qi >= 8U) ? 1U : 0U);
+}
+
+/* Commit-first publish paths (R7-2): the shared helper runs before the
+ * destination publishes, so a trapped exception leaves dest/FCC/AEXC
+ * untouched; FPRS dirty bits ride inside qc_put. */
+static sparc64_step_result_t qc_publish(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, unsigned qd, uint64_t hi,
+    uint64_t lo)
+{
+    sparc64_step_result_t sr = qc_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    qc_put(cpu, qd, hi, lo);
+    return sr;
+}
+
+static sparc64_step_result_t qc_publish_i32(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, uint32_t r)
+{
+    sparc64_step_result_t sr = qc_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
+    sparc64_fp_mark_dirty(cpu, 0U);
+    return sr;
+}
+
+static sparc64_step_result_t qc_publish_i64(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, uint64_t r)
+{
+    sparc64_step_result_t sr = qc_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    cpu->fp.d[qc_pair(d->rd)] = r;
+    sparc64_fp_mark_dirty(cpu, (qc_pair(d->rd) >= 16U) ? 1U : 0U);
+    return sr;
 }
 
 /* Quad data movement: raw copy, sign flip, sign clear. An operate
@@ -417,8 +451,7 @@ static sparc64_step_result_t qc_move(sparc64_cpu_t *cpu, uint64_t pc,
     } else if (op == 2U) {
         hi &= ~UINT64_C(0x8000000000000000);
     }
-    qc_put(cpu, qd, hi, lo);
-    return qc_commit(cpu, pc, d, 0U);
+    return qc_publish(cpu, pc, d, 0U, qd, hi, lo);
 }
 
 static unsigned qc_ordered(uint64_t ahi, uint64_t alo, uint64_t bhi,
@@ -477,8 +510,14 @@ static sparc64_step_result_t qc_cmp(sparc64_cpu_t *cpu, uint64_t pc,
     } else {
         fcc = qc_ordered(ahi, alo, bhi, blo);
     }
-    qc_fcc_write(cpu, d->rd, fcc);
-    return qc_commit(cpu, pc, d, nv);
+    {
+        sparc64_step_result_t sr = qc_commit(cpu, pc, d, nv);
+        if (sr.kind != SPARC64_STEP_CONTINUE) {
+            return sr;
+        }
+        qc_fcc_write(cpu, d->rd, fcc);
+        return sr;
+    }
 }
 
 /* Signed integer to quad (exact, FSR untouched). */
@@ -497,8 +536,7 @@ static sparc64_step_result_t qc_itoq(sparc64_cpu_t *cpu, uint64_t pc,
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
     }
     if (v == 0) {
-        qc_put(cpu, qd, UINT64_C(0), UINT64_C(0));
-        return sparc64_step_ok(pc);
+        return qc_publish(cpu, pc, d, 0U, qd, UINT64_C(0), UINT64_C(0));
     }
     neg = (v < 0) ? 1U : 0U;
     mag = (neg != 0U) ? (uint64_t)(-(v + 1)) + UINT64_C(1) : (uint64_t)v;
@@ -512,11 +550,10 @@ static sparc64_step_result_t qc_itoq(sparc64_cpu_t *cpu, uint64_t pc,
         shi = mag >> (64U - shift);
         slo = mag << shift;
     }
-    qc_put(cpu, qd,
+    return qc_publish(cpu, pc, d, 0U, qd,
         ((uint64_t)neg << 63) | ((uint64_t)(exp + QC_BIAS) << 48) |
             (shi & UINT64_C(0xFFFFFFFFFFFF)),
         slo);
-    return sparc64_step_ok(pc);
 }
 
 /* Quad to integer (bits 32/64): truncate, NX when inexact, NV + OF
@@ -545,37 +582,48 @@ static sparc64_step_result_t qc_qtoi(sparc64_cpu_t *cpu, uint64_t pc,
     limit = (bits == 32U) ? 31U : 63U;
     if (ca == 0U) {
         if (bits == 32U) {
-            cpu->fp.f[(d->rd & 31U) ^ 1U] = UINT32_C(0);
-        } else {
-            cpu->fp.d[qc_pair(d->rd)] = UINT64_C(0);
+            return qc_publish_i32(cpu, pc, d, 0U, UINT32_C(0));
         }
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish_i64(cpu, pc, d, 0U, UINT64_C(0));
     }
     if (ca >= 4U) {
-        fl = 0x18U;
         if (bits == 32U) {
-            cpu->fp.f[(d->rd & 31U) ^ 1U] =
-                (neg != 0U) ? UINT32_C(0x80000000) : UINT32_C(0x7FFFFFFF);
-        } else {
-            cpu->fp.d[qc_pair(d->rd)] = (neg != 0U)
-                ? UINT64_C(0x8000000000000000)
-                : UINT64_C(0x7FFFFFFFFFFFFFFF);
+            return qc_publish_i32(cpu, pc, d, 0x10U,
+                (neg != 0U) ? UINT32_C(0x80000000) : UINT32_C(0x7FFFFFFF));
         }
-        return qc_commit(cpu, pc, d, fl);
+        return qc_publish_i64(cpu, pc, d, 0x10U, (neg != 0U)
+            ? UINT64_C(0x8000000000000000)
+            : UINT64_C(0x7FFFFFFFFFFFFFFF));
     }
     exp = (int)((ahi >> 48) & UINT64_C(0x7FFF));
     exp = (exp == 0) ? QC_EMIN : exp - QC_BIAS;
-    if (exp >= (int)limit) {
-        fl = 0x18U;
+    if (exp > (int)limit) {
         if (bits == 32U) {
-            cpu->fp.f[(d->rd & 31U) ^ 1U] =
-                (neg != 0U) ? UINT32_C(0x80000000) : UINT32_C(0x7FFFFFFF);
-        } else {
-            cpu->fp.d[qc_pair(d->rd)] = (neg != 0U)
-                ? UINT64_C(0x8000000000000000)
-                : UINT64_C(0x7FFFFFFFFFFFFFFF);
+            return qc_publish_i32(cpu, pc, d, 0x10U,
+                (neg != 0U) ? UINT32_C(0x80000000) : UINT32_C(0x7FFFFFFF));
         }
-        return qc_commit(cpu, pc, d, fl);
+        return qc_publish_i64(cpu, pc, d, 0x10U, (neg != 0U)
+            ? UINT64_C(0x8000000000000000)
+            : UINT64_C(0x7FFFFFFFFFFFFFFF));
+    }
+    if (exp == (int)limit) {
+        /* Only the exact negative endpoint -2^limit is representable. */
+        uint64_t fh = ahi & UINT64_C(0xFFFFFFFFFFFF);
+        if ((neg != 0U) && (fh == UINT64_C(0)) && (alo == UINT64_C(0))) {
+            if (bits == 32U) {
+                return qc_publish_i32(cpu, pc, d, 0U,
+                    UINT32_C(0x80000000));
+            }
+            return qc_publish_i64(cpu, pc, d, 0U,
+                UINT64_C(0x8000000000000000));
+        }
+        if (bits == 32U) {
+            return qc_publish_i32(cpu, pc, d, 0x10U,
+                (neg != 0U) ? UINT32_C(0x80000000) : UINT32_C(0x7FFFFFFF));
+        }
+        return qc_publish_i64(cpu, pc, d, 0x10U, (neg != 0U)
+            ? UINT64_C(0x8000000000000000)
+            : UINT64_C(0x7FFFFFFFFFFFFFFF));
     }
     /* Finite value with exp < limit <= 63 < 112: pure right shift. */
     shi = ahi & UINT64_C(0xFFFFFFFFFFFF);
@@ -604,13 +652,14 @@ static sparc64_step_result_t qc_qtoi(sparc64_cpu_t *cpu, uint64_t pc,
     }
     fl = inexact ? 0x01U : 0U;
     if (bits == 32U) {
-        uint32_t r = (neg != 0U) ? (uint32_t)(0U - (uint32_t)t) : (uint32_t)t;
-        cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-    } else {
-        uint64_t r = (neg != 0U) ? (UINT64_C(0) - t) : t;
-        cpu->fp.d[qc_pair(d->rd)] = r;
+        uint32_t r = (neg != 0U) ? (uint32_t)(0U - (uint32_t)t)
+                                 : (uint32_t)t;
+        return qc_publish_i32(cpu, pc, d, fl, r);
     }
-    return qc_commit(cpu, pc, d, fl);
+    {
+        uint64_t r = (neg != 0U) ? (UINT64_C(0) - t) : t;
+        return qc_publish_i64(cpu, pc, d, fl, r);
+    }
 }
 
 /* Single to quad widening (exact; SNaN sets NV and quiets). */
@@ -629,37 +678,34 @@ static sparc64_step_result_t qc_fstoq(sparc64_cpu_t *cpu, uint64_t pc,
     }
     if (rawexp == 0xFFU) {
         if (frac == UINT32_C(0)) {
-            qc_put(cpu, qd, ((uint64_t)neg << 63) |
+            return qc_publish(cpu, pc, d, 0U, qd,
+                ((uint64_t)neg << 63) |
                     ((uint64_t)UINT64_C(0x7FFF) << 48),
                 UINT64_C(0));
-            return qc_commit(cpu, pc, d, 0U);
         }
         ohi = ((uint64_t)neg << 63) | ((uint64_t)UINT64_C(0x7FFF) << 48) |
             ((uint64_t)frac << 25);
         if ((frac & UINT32_C(0x400000)) == UINT32_C(0)) {
             ohi |= UINT64_C(0x0000800000000000);
-            qc_put(cpu, qd, ohi, UINT64_C(0));
-            return qc_commit(cpu, pc, d, 0x10U);
+            return qc_publish(cpu, pc, d, 0x10U, qd, ohi, UINT64_C(0));
         }
-        qc_put(cpu, qd, ohi, UINT64_C(0));
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish(cpu, pc, d, 0U, qd, ohi, UINT64_C(0));
     }
     if (rawexp == 0U && frac == UINT32_C(0)) {
-        qc_put(cpu, qd, (uint64_t)neg << 63, UINT64_C(0));
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish(cpu, pc, d, 0U, qd, (uint64_t)neg << 63,
+            UINT64_C(0));
     }
     if (rawexp == 0U) {
         unsigned bitlen = 64U - qc_clz64((uint64_t)frac);
         unsigned p = bitlen - 1U;
         exp = (int)p - 149;
-        frac = (frac << (22U - p)) & UINT32_C(0x3FFFFF);
+        frac = (frac << (23U - p)) & UINT32_C(0x7FFFFF);
     } else {
         exp = (int)rawexp - 127;
     }
     ohi = ((uint64_t)neg << 63) | ((uint64_t)(exp + QC_BIAS) << 48) |
         ((uint64_t)frac << 25);
-    qc_put(cpu, qd, ohi, UINT64_C(0));
-    return qc_commit(cpu, pc, d, 0U);
+    return qc_publish(cpu, pc, d, 0U, qd, ohi, UINT64_C(0));
 }
 
 /* Double to quad widening (exact; SNaN sets NV and quiets). */
@@ -679,39 +725,36 @@ static sparc64_step_result_t qc_fdtoq(sparc64_cpu_t *cpu, uint64_t pc,
     }
     if (rawexp == 0x7FFU) {
         if (frac == UINT64_C(0)) {
-            qc_put(cpu, qd, ((uint64_t)neg << 63) |
+            return qc_publish(cpu, pc, d, 0U, qd,
+                ((uint64_t)neg << 63) |
                     ((uint64_t)UINT64_C(0x7FFF) << 48),
                 UINT64_C(0));
-            return qc_commit(cpu, pc, d, 0U);
         }
         ohi = ((uint64_t)neg << 63) | ((uint64_t)UINT64_C(0x7FFF) << 48) |
             (frac >> 4);
         olo = frac << 60;
         if ((frac & UINT64_C(0x0008000000000000)) == UINT64_C(0)) {
             ohi |= UINT64_C(0x0000800000000000);
-            qc_put(cpu, qd, ohi, olo);
-            return qc_commit(cpu, pc, d, 0x10U);
+            return qc_publish(cpu, pc, d, 0x10U, qd, ohi, olo);
         }
-        qc_put(cpu, qd, ohi, olo);
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish(cpu, pc, d, 0U, qd, ohi, olo);
     }
     if (rawexp == 0U && frac == UINT64_C(0)) {
-        qc_put(cpu, qd, (uint64_t)neg << 63, UINT64_C(0));
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish(cpu, pc, d, 0U, qd, (uint64_t)neg << 63,
+            UINT64_C(0));
     }
     if (rawexp == 0U) {
         unsigned bitlen = 64U - qc_clz64(frac);
         unsigned p = bitlen - 1U;
         exp = (int)p - 1074;
-        frac = (frac << (51U - p)) & UINT64_C(0x0007FFFFFFFFFFFF);
+        frac = (frac << (52U - p)) & UINT64_C(0x000FFFFFFFFFFFFF);
     } else {
         exp = (int)rawexp - 1023;
     }
     ohi = ((uint64_t)neg << 63) | ((uint64_t)(exp + QC_BIAS) << 48) |
         (frac >> 4);
     olo = frac << 60;
-    qc_put(cpu, qd, ohi, olo);
-    return qc_commit(cpu, pc, d, 0U);
+    return qc_publish(cpu, pc, d, 0U, qd, ohi, olo);
 }
 
 /* Quad narrowing to single/double: NaN narrows the payload (SNaN sets
@@ -752,48 +795,37 @@ static sparc64_step_result_t qc_qton(sparc64_cpu_t *cpu, uint64_t pc,
                 (uint32_t)(fh >> 25);
             if (!quiet) {
                 r |= UINT32_C(0x00400000);
-                cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-                return qc_commit(cpu, pc, d, 0x10U);
             }
-            cpu->fp.f[(d->rd & 31U) ^ 1U] = r;
-            return qc_commit(cpu, pc, d, 0U);
+            return qc_publish_i32(cpu, pc, d, !quiet ? 0x10U : 0U, r);
         }
         olo = ((uint64_t)neg << 63) | ((uint64_t)UINT64_C(0x7FF) << 52) |
             ((fh << 4) | (alo >> 60));
         if (!quiet) {
             olo |= UINT64_C(0x0008000000000000);
-            cpu->fp.d[qc_pair(d->rd)] = olo;
-            return qc_commit(cpu, pc, d, 0x10U);
         }
-        cpu->fp.d[qc_pair(d->rd)] = olo;
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish_i64(cpu, pc, d, !quiet ? 0x10U : 0U, olo);
     }
     if (ca == 0U) {
         if (bits == 32U) {
-            cpu->fp.f[(d->rd & 31U) ^ 1U] = neg << 31;
-        } else {
-            cpu->fp.d[qc_pair(d->rd)] = (uint64_t)neg << 63;
+            return qc_publish_i32(cpu, pc, d, 0U, neg << 31);
         }
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish_i64(cpu, pc, d, 0U, (uint64_t)neg << 63);
     }
     if (ca == 3U) {
         if (bits == 32U) {
-            cpu->fp.f[(d->rd & 31U) ^ 1U] = (neg << 31) | UINT32_C(0x7F800000);
-        } else {
-            cpu->fp.d[qc_pair(d->rd)] =
-                ((uint64_t)neg << 63) | (UINT64_C(0x7FF) << 52);
+            return qc_publish_i32(cpu, pc, d, 0U,
+                (neg << 31) | UINT32_C(0x7F800000));
         }
-        return qc_commit(cpu, pc, d, 0U);
+        return qc_publish_i64(cpu, pc, d, 0U,
+            ((uint64_t)neg << 63) | (UINT64_C(0x7FF) << 52));
     }
     qc_unpack(ahi, alo, &u);
     fl = qc_pack(u.neg, u.exp, u.shi, u.slo, 0U, 0U, 0U, width, emin, emax,
         bias, rm, &ohi, &olo);
     if (bits == 32U) {
-        cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)olo;
-    } else {
-        cpu->fp.d[qc_pair(d->rd)] = olo;
+        return qc_publish_i32(cpu, pc, d, fl, (uint32_t)olo);
     }
-    return qc_commit(cpu, pc, d, fl);
+    return qc_publish_i64(cpu, pc, d, fl, olo);
 }
 
 sparc64_step_result_t sparc64_fp_qconv(sparc64_cpu_t *cpu, uint64_t pc,

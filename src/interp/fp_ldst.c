@@ -5,19 +5,20 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Data movement between memory and the FP file (plain 0x20-0x27 incl.
- * LDQF/STQF, the 0x30-0x37 alternate group, plus LDDA/STDA) and the VIS
- * fill/align helpers (FZERO/FONE/FALIGNDATA). Entered from the fp.c
- * dispatcher (sparc64_fp_ldst / sparc64_fp_vis). Every encoding and
- * behavior below is verified bit-for-bit against the qemu-sparc64 7.2.22
- * oracle: STQF deliberately duplicates the high double (qemu STQF quirk),
- * VIS block operations (ASI 0xF0-0xF7) move plain 8-byte pieces, and no
- * instruction here ever touches FSR. All other VIS opfs trap ILLEGAL.
+ * LDQF/STQF and the 0x30-0x37 alternate group; integer LDDA/STDA never
+ * reach this file, see below) and the VIS fill/align helpers
+ * (FZERO/FONE/FALIGNDATA). Entered from the fp.c dispatcher
+ * (sparc64_fp_ldst / sparc64_fp_vis). STQF stores both quad halves in
+ * order. VIS block operations (ASI 0xF0-0xF7) move plain 8-byte pieces,
+ * and no instruction here ever touches FSR. All other VIS opfs trap
+ * ILLEGAL.
  */
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "core/cpu.h"
+#include "interp/fp_commit.h"
 #include "interp/interp.h"
 
 /* Double-pair index: even field addresses the lower f-pair, odd field
@@ -53,14 +54,17 @@ static sparc64_step_result_t fp_zero(sparc64_cpu_t *cpu, uint64_t pc,
 {
     if (d->opf == 0x60U) {
         cpu->fp.d[fp_pair(d->rd)] = UINT64_C(0);
+        sparc64_fp_mark_dirty(cpu, (fp_pair(d->rd) >= 16U) ? 1U : 0U);
         return sparc64_step_ok(pc);
     }
     if (d->opf == 0x61U) {
         cpu->fp.f[(d->rd & 31U) ^ 1U] = UINT32_C(0);
+        sparc64_fp_mark_dirty(cpu, 0U);
         return sparc64_step_ok(pc);
     }
     if (d->opf == 0x7EU) {
         cpu->fp.d[fp_pair(d->rd)] = UINT64_C(0xFFFFFFFFFFFFFFFF);
+        sparc64_fp_mark_dirty(cpu, (fp_pair(d->rd) >= 16U) ? 1U : 0U);
         return sparc64_step_ok(pc);
     }
     return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
@@ -72,6 +76,7 @@ static sparc64_step_result_t fp_fsrc2d(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
     cpu->fp.d[fp_pair(d->rd)] = cpu->fp.d[fp_pair(d->raw & 31U)];
+    sparc64_fp_mark_dirty(cpu, (fp_pair(d->rd) >= 16U) ? 1U : 0U);
     return sparc64_step_ok(pc);
 }
 
@@ -90,6 +95,7 @@ static sparc64_step_result_t fp_aligndata(sparc64_cpu_t *cpu, uint64_t pc,
         r = (s1 << (8U * off)) | (s2 >> (64U - 8U * off));
     }
     cpu->fp.d[fp_pair(d->rd)] = r;
+    sparc64_fp_mark_dirty(cpu, (fp_pair(d->rd) >= 16U) ? 1U : 0U);
     return sparc64_step_ok(pc);
 }
 
@@ -108,44 +114,88 @@ sparc64_step_result_t sparc64_fp_vis(sparc64_cpu_t *cpu, uint64_t pc,
     return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
 }
 
-/* FP loads/stores (plain 0x20-0x27 incl. LDQF/STQF, the 0x30-0x37
- * alternate group, plus LDDA/STDA): data movement between memory and
- * the FP file. Never touches FSR. STQF deliberately duplicates the
- * high double (qemu-sparc64 7.2 STQF quirk). */
+/* FP loads/stores (plain 0x20-0x27 incl. LDQF/STQF and the 0x30-0x37
+ * alternate group, never integer LDDA/STDA): data movement between
+ * memory and the FP file. Never touches FSR. */
+
+/* No-fault alternate space: eligible access faults become zero on loads;
+ * stores and atomics through these ASIs fault (interp_mem.c parity). */
+static bool fp_nofault_asi(uint8_t asi)
+{
+    return asi == SPARC64_ASI_PNF || asi == SPARC64_ASI_PNFL;
+}
+
+static bool fp_eligible_fault(const sparc64_step_result_t *r)
+{
+    if (r->kind != SPARC64_STEP_TRAP ||
+        r->cause != SPARC64_TRAP_LOAD_ACCESS) {
+        return false;
+    }
+    switch (r->memory_reason) {
+    case SPARC64_MEM_FAULT_UNMAPPED:
+    case SPARC64_MEM_FAULT_PERMISSION:
+    case SPARC64_MEM_FAULT_RANGE:
+    case SPARC64_MEM_FAULT_BUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* One staged 4-byte load piece: eligible no-fault failures become zero. */
+static bool fp_piece_nofault(const sparc64_mem_ops_t *mem, void *mc,
+    uint64_t va, bool little, bool nofault, uint64_t *out,
+    sparc64_step_result_t *res, uint64_t pc)
+{
+    if (sparc64_ld_int(mem, mc, va, 4U, false, little, out, res, pc)) {
+        return true;
+    }
+    if (!nofault || !fp_eligible_fault(res)) {
+        return false;
+    }
+    *out = UINT64_C(0);
+    return true;
+}
 sparc64_step_result_t sparc64_fp_ldst(sparc64_ctx_t *cpu,
     const sparc64_mem_ops_t *mem, void *mc, uint64_t pc,
     const sparc64_dec_t *d)
 {
-    bool is_load = (d->op3 == SPARC64_OP3_LDF ||
-        d->op3 == SPARC64_OP3_LDDF || d->op3 == SPARC64_OP3_LDDA ||
-        d->op3 == SPARC64_OP3_LDFA || d->op3 == SPARC64_OP3_LDDFA ||
-        d->op3 == SPARC64_OP3_LDTW);
-    bool is_quad = (d->op3 == SPARC64_OP3_LDTW ||
-        d->op3 == SPARC64_OP3_STTW);
-    bool is_double = !is_quad && (d->op3 == SPARC64_OP3_LDDF ||
-        d->op3 == SPARC64_OP3_STDF || d->op3 == SPARC64_OP3_LDDA ||
-        d->op3 == SPARC64_OP3_STDA || d->op3 == SPARC64_OP3_LDDFA ||
-        d->op3 == SPARC64_OP3_STDFA);
-    bool alt = (d->op3 == SPARC64_OP3_LDDA ||
-        d->op3 == SPARC64_OP3_STDA || d->op3 == SPARC64_OP3_LDFA ||
-        d->op3 == SPARC64_OP3_LDDFA || d->op3 == SPARC64_OP3_STFA ||
-        d->op3 == SPARC64_OP3_STDFA);
-    uint64_t va = sparc64_rreg(cpu, d->rs1) +
-        ((d->is_imm != 0U) ? (uint64_t)(int64_t)d->imm
-                           : sparc64_rreg(cpu, d->rs2));
+    bool nofault = false;
+    bool is_load;
+    bool is_quad;
+    bool is_double;
+    bool alt;
+    uint64_t va;
     bool little = false;
     sparc64_step_result_t res;
     uint64_t v = UINT64_C(0);
     unsigned qi;
+    /* Integer LDDA/STDA are classified by the decoder, never here. */
+    if (d->op3 == SPARC64_OP3_LDDA || d->op3 == SPARC64_OP3_STDA) {
+        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+    }
+    is_load = (d->op3 == SPARC64_OP3_LDF ||
+        d->op3 == SPARC64_OP3_LDDF ||
+        d->op3 == SPARC64_OP3_LDFA || d->op3 == SPARC64_OP3_LDDFA ||
+        d->op3 == SPARC64_OP3_LDTW);
+    is_quad = (d->op3 == SPARC64_OP3_LDTW ||
+        d->op3 == SPARC64_OP3_STTW);
+    is_double = !is_quad && (d->op3 == SPARC64_OP3_LDDF ||
+        d->op3 == SPARC64_OP3_STDF || d->op3 == SPARC64_OP3_LDDFA ||
+        d->op3 == SPARC64_OP3_STDFA);
+    alt = (d->op3 == SPARC64_OP3_LDFA ||
+        d->op3 == SPARC64_OP3_LDDFA || d->op3 == SPARC64_OP3_STFA ||
+        d->op3 == SPARC64_OP3_STDFA);
+    va = sparc64_rreg(cpu, d->rs1) +
+        ((d->is_imm != 0U) ? (uint64_t)(int64_t)d->imm
+                           : sparc64_rreg(cpu, d->rs2));
     if (alt) {
         sparc64_dec_t dd = *d;
         if (dd.regasi != 0U) {
             dd.asi = (uint8_t)(cpu->asi & UINT64_C(0xFF));
         }
         if (dd.asi >= 0xF0U && dd.asi <= 0xF7U &&
-            (d->op3 == SPARC64_OP3_LDDA ||
-                d->op3 == SPARC64_OP3_STDA ||
-                d->op3 == SPARC64_OP3_LDDFA ||
+            (d->op3 == SPARC64_OP3_LDDFA ||
                 d->op3 == SPARC64_OP3_STDFA)) {
             /* VIS block operation (UltraSPARC ASI 0xF0-0xF7, e.g. glibc
              * memset/memcpy): a 64-byte line across 8 consecutive double
@@ -164,6 +214,8 @@ sparc64_step_result_t sparc64_fp_ldst(sparc64_ctx_t *cpu,
                         return res;
                     }
                     cpu->fp.d[base + k] = v;
+                    cpu->fprs |= ((base + k) < 16U) ? UINT64_C(0x1)
+                                                   : UINT64_C(0x2);
                 } else {
                     v = cpu->fp.d[base + k];
                     if (!sparc64_st_int(mem, mc, va + (uint64_t)(k * 8U),
@@ -177,60 +229,122 @@ sparc64_step_result_t sparc64_fp_ldst(sparc64_ctx_t *cpu,
         if (!sparc64_asi_check(pc, &dd, &little, &res)) {
             return res;
         }
+        nofault = fp_nofault_asi(dd.asi);
     }
     if (is_quad) {
-        /* LDQF/STQF move 16 bytes at 16-byte alignment. The quad slot
-         * is addressed through its two double halves. */
-        uint64_t hi = UINT64_C(0);
-        uint64_t lo = UINT64_C(0);
+        /* LDQF/STQF move 16 bytes at word alignment: four staged 4-byte
+         * pieces, published only after all succeed. The quad slot is
+         * addressed through its two double halves and stays big-endian
+         * regardless of ASI. */
+        uint64_t p0 = UINT64_C(0);
+        uint64_t p1 = UINT64_C(0);
+        uint64_t p2 = UINT64_C(0);
+        uint64_t p3 = UINT64_C(0);
+        uint64_t hi;
+        uint64_t lo;
         qi = fp_qidx(d->rd);
         if (qi > 15U) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
-        if ((va & UINT64_C(15)) != UINT64_C(0)) {
+        if ((va & UINT64_C(3)) != UINT64_C(0)) {
             return sparc64_trap(is_load ? SPARC64_TRAP_LOAD_MISALIGNED
                                         : SPARC64_TRAP_STORE_MISALIGNED,
                 pc, va);
         }
+        if (!is_load && nofault) {
+            return sparc64_trap(SPARC64_TRAP_STORE_ACCESS, pc, va);
+        }
         if (is_load) {
-            if (!sparc64_ld_int(mem, mc, va, 8U, false, false, &hi, &res,
+            if (!fp_piece_nofault(mem, mc, va, false, nofault, &p0, &res,
                     pc)) {
                 return res;
             }
-            if (!sparc64_ld_int(mem, mc, va + UINT64_C(8), 8U, false, false,
-                    &lo, &res, pc)) {
+            if (!fp_piece_nofault(mem, mc, va + UINT64_C(4), false, nofault,
+                    &p1, &res, pc)) {
                 return res;
             }
+            if (!fp_piece_nofault(mem, mc, va + UINT64_C(8), false, nofault,
+                    &p2, &res, pc)) {
+                return res;
+            }
+            if (!fp_piece_nofault(mem, mc, va + UINT64_C(12), false,
+                    nofault, &p3, &res, pc)) {
+                return res;
+            }
+            hi = (p0 << 32) | p1;
+            lo = (p2 << 32) | p3;
             cpu->fp.d[2U * qi] = hi;
             cpu->fp.d[2U * qi + 1U] = lo;
+            cpu->fprs |= (qi < 8U) ? UINT64_C(0x1) : UINT64_C(0x2);
             return sparc64_step_ok(pc);
         }
         hi = cpu->fp.d[2U * qi];
-        if (!sparc64_st_int(mem, mc, va, 8U, false, hi, &res, pc)) {
+        lo = cpu->fp.d[2U * qi + 1U];
+        if (!sparc64_st_int(mem, mc, va, 4U, false, hi >> 32, &res, pc)) {
             return res;
         }
-        if (!sparc64_st_int(mem, mc, va + UINT64_C(8), 8U, false, hi, &res,
-                pc)) {
+        if (!sparc64_st_int(mem, mc, va + UINT64_C(4), 4U, false,
+                hi & UINT64_C(0xFFFFFFFF), &res, pc)) {
+            return res;
+        }
+        if (!sparc64_st_int(mem, mc, va + UINT64_C(8), 4U, false, lo >> 32,
+                &res, pc)) {
+            return res;
+        }
+        if (!sparc64_st_int(mem, mc, va + UINT64_C(12), 4U, false,
+                lo & UINT64_C(0xFFFFFFFF), &res, pc)) {
             return res;
         }
         return sparc64_step_ok(pc);
     }
     if (is_load) {
-        if (!sparc64_ld_int(mem, mc, va, is_double ? 8U : 4U, false, little,
-                &v, &res, pc)) {
-            return res;
+        if ((va & UINT64_C(3)) != UINT64_C(0)) {
+            return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
         }
         if (is_double) {
+            uint64_t p0 = UINT64_C(0);
+            uint64_t p1 = UINT64_C(0);
+            if (!fp_piece_nofault(mem, mc, va, little, nofault, &p0, &res,
+                    pc)) {
+                return res;
+            }
+            if (!fp_piece_nofault(mem, mc, va + UINT64_C(4), little,
+                    nofault, &p1, &res, pc)) {
+                return res;
+            }
+            v = little ? (p0 | (p1 << 32)) : ((p0 << 32) | p1);
             cpu->fp.d[fp_pair(d->rd)] = v;
+            cpu->fprs |= (fp_pair(d->rd) < 16U) ? UINT64_C(0x1)
+                                               : UINT64_C(0x2);
         } else {
+            if (!fp_piece_nofault(mem, mc, va, little, nofault, &v, &res,
+                    pc)) {
+                return res;
+            }
             cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)v;
+            cpu->fprs |= UINT64_C(0x1);
         }
         return sparc64_step_ok(pc);
     }
+    if ((va & UINT64_C(3)) != UINT64_C(0)) {
+        return sparc64_trap(SPARC64_TRAP_STORE_MISALIGNED, pc, va);
+    }
+    if (nofault) {
+        return sparc64_trap(SPARC64_TRAP_STORE_ACCESS, pc, va);
+    }
     v = is_double ? cpu->fp.d[fp_pair(d->rd)]
                   : (uint64_t)cpu->fp.f[(d->rd & 31U) ^ 1U];
-    if (!sparc64_st_int(mem, mc, va, is_double ? 8U : 4U, little, v, &res,
-            pc)) {
+    if (is_double) {
+        uint64_t p0 = little ? (v & UINT64_C(0xFFFFFFFF)) : (v >> 32);
+        uint64_t p1 = little ? (v >> 32) : (v & UINT64_C(0xFFFFFFFF));
+        if (!sparc64_st_int(mem, mc, va, 4U, little, p0, &res, pc)) {
+            return res;
+        }
+        if (!sparc64_st_int(mem, mc, va + UINT64_C(4), 4U, little, p1, &res,
+                pc)) {
+            return res;
+        }
+    } else if (!sparc64_st_int(mem, mc, va, 4U, little, v, &res, pc)) {
         return res;
     }
     return sparc64_step_ok(pc);

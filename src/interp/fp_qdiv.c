@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "core/cpu.h"
+#include "interp/fp_commit.h"
 #include "interp/interp.h"
 
 #define QD_BIAS 16383
@@ -111,14 +112,7 @@ static int qd_rd_mode(const sparc64_cpu_t *cpu)
 static sparc64_step_result_t qd_commit(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned fresh)
 {
-    fresh &= 0x1FU;
-    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
-    cpu->fsr |= (uint64_t)fresh << 5;
-    if ((((cpu->fsr >> 23) & UINT64_C(0x1F)) & (cpu->fsr & UINT64_C(0x1F))) !=
-        UINT64_C(0)) {
-        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
-    }
-    return sparc64_step_ok(pc);
+    return sparc64_fp_commit(cpu, pc, d, fresh);
 }
 
 static unsigned qd_class(uint64_t hi, uint64_t lo)
@@ -221,11 +215,28 @@ static unsigned qd_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
     if (exp < QD_EMIN) {
         unsigned shift = (unsigned)(QD_EMIN - exp);
         if (shift >= 113U) {
+            /* Value is below one output ulp: keep exact GRS and round. */
+            unsigned gg = 0U;
+            unsigned rr = 0U;
+            unsigned ss = g | r | s;
+            if (shift == 113U) {
+                gg = (unsigned)((shi >> 48) & UINT64_C(1));
+                rr = (unsigned)((shi >> 47) & UINT64_C(1));
+                ss |= (unsigned)(((shi & UINT64_C(0xFFFFFFFFFFFF)) !=
+                    UINT64_C(0)) || (slo != UINT64_C(0))) ? 1U : 0U;
+            } else if (shift == 114U) {
+                rr = (unsigned)((shi >> 48) & UINT64_C(1));
+                ss |= (unsigned)(((shi & UINT64_C(0xFFFFFFFFFFFF)) !=
+                    UINT64_C(0)) || (slo != UINT64_C(0))) ? 1U : 0U;
+            } else {
+                ss |= (unsigned)(((shi != UINT64_C(0)) || (slo !=
+                    UINT64_C(0))) ? 1U : 0U);
+            }
             shi = UINT64_C(0);
             slo = UINT64_C(0);
-            g = 0U;
-            r = 0U;
-            s = 1U;
+            g = gg;
+            r = rr;
+            s = (ss != 0U) ? 1U : 0U;
         } else {
             unsigned g2 = qd_bit(shi, slo, shift - 1U);
             unsigned r2 =
@@ -248,9 +259,9 @@ static unsigned qd_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
     } else if (rm == FE_TOWARDZERO) {
         up = false;
     } else if (rm == FE_UPWARD) {
-        up = neg == 0U;
+        up = (neg == 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     } else {
-        up = neg != 0U;
+        up = (neg != 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     }
     if (up) {
         slo += UINT64_C(1);
@@ -288,7 +299,7 @@ static unsigned qd_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
         return 0x09U;
     }
     if (tiny || ((shi == UINT64_C(0)) && (slo == UINT64_C(0)))) {
-        *ohi = (uint64_t)neg << 63;
+        *ohi = ((uint64_t)neg << 63) | (shi & UINT64_C(0xFFFFFFFFFFFF));
         *olo = slo;
     } else {
         *ohi = ((uint64_t)neg << 63) |
@@ -366,6 +377,7 @@ static void qd_put(sparc64_cpu_t *cpu, unsigned qi, uint64_t hi, uint64_t lo)
 {
     cpu->fp.d[2U * qi] = hi;
     cpu->fp.d[2U * qi + 1U] = lo;
+    sparc64_fp_mark_dirty(cpu, (qi >= 8U) ? 1U : 0U);
 }
 
 static void qd_put_inf(sparc64_cpu_t *cpu, unsigned qi, unsigned neg)
@@ -378,6 +390,43 @@ static void qd_put_allones(sparc64_cpu_t *cpu, unsigned qi)
 {
     qd_put(cpu, qi, UINT64_C(0xFFFFFFFFFFFFFFFF),
         UINT64_C(0xFFFFFFFFFFFFFFFF));
+}
+
+/* Commit-first publish paths (R7-2): the shared helper runs before the
+ * destination publishes, so a trapped exception leaves dest/FCC/AEXC
+ * untouched; FPRS dirty bits ride inside qd_put. */
+static sparc64_step_result_t qd_publish(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, unsigned qd, uint64_t hi,
+    uint64_t lo)
+{
+    sparc64_step_result_t sr = qd_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    qd_put(cpu, qd, hi, lo);
+    return sr;
+}
+
+static sparc64_step_result_t qd_publish_inf(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, unsigned qd, unsigned neg)
+{
+    sparc64_step_result_t sr = qd_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    qd_put_inf(cpu, qd, neg);
+    return sr;
+}
+
+static sparc64_step_result_t qd_publish_ones(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, unsigned qd)
+{
+    sparc64_step_result_t sr = qd_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    qd_put_allones(cpu, qd);
+    return sr;
 }
 
 static void qd_div(const qd_unp_t *a, const qd_unp_t *b, unsigned *neg,
@@ -546,31 +595,27 @@ static sparc64_step_result_t qd_divide(sparc64_cpu_t *cpu, uint64_t pc,
         if (!qd_nan2(ahi, alo, bhi, blo, &ohi, &olo, &fl)) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
-        qd_put(cpu, qd, ohi, olo);
-        return qd_commit(cpu, pc, d, fl);
+        return qd_publish(cpu, pc, d, fl, qd, ohi, olo);
     }
     if ((ca == 0U && cb == 0U) || (ca == 3U && cb == 3U)) {
-        qd_put_allones(cpu, qd);
-        return qd_commit(cpu, pc, d, 0x10U);
-    }
-    if (cb == 0U) {
-        qd_put_inf(cpu, qd, aneg ^ bneg);
-        return qd_commit(cpu, pc, d, 0x02U);
+        return qd_publish_ones(cpu, pc, d, 0x10U, qd);
     }
     if (ca == 3U) {
-        qd_put_inf(cpu, qd, aneg ^ bneg);
-        return qd_commit(cpu, pc, d, 0U);
+        /* Infinite numerator (including inf/0): exact infinity, no flags. */
+        return qd_publish_inf(cpu, pc, d, 0U, qd, aneg ^ bneg);
+    }
+    if (cb == 0U) {
+        return qd_publish_inf(cpu, pc, d, 0x02U, qd, aneg ^ bneg);
     }
     if (ca == 0U || cb == 3U) {
-        qd_put(cpu, qd, ((uint64_t)(aneg ^ bneg) << 63), UINT64_C(0));
-        return qd_commit(cpu, pc, d, 0U);
+        return qd_publish(cpu, pc, d, 0U, qd,
+            ((uint64_t)(aneg ^ bneg) << 63), UINT64_C(0));
     }
     qd_unpack(ahi, alo, &ua);
     qd_unpack(bhi, blo, &ub);
     qd_div(&ua, &ub, &neg, &exp, &shi, &slo, &g, &r, &s);
     fl = qd_pack(neg, exp, shi, slo, g, r, s, rm, &ohi, &olo);
-    qd_put(cpu, qd, ohi, olo);
-    return qd_commit(cpu, pc, d, fl);
+    return qd_publish(cpu, pc, d, fl, qd, ohi, olo);
 }
 
 static void qd_isqrt(const uint32_t n[8], uint32_t r[4], uint32_t rem[4])
@@ -700,26 +745,21 @@ static sparc64_step_result_t qd_sqrt(sparc64_cpu_t *cpu, uint64_t pc,
         if (!qd_nan1(ahi, alo, &ohi, &olo, &fl)) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
-        qd_put(cpu, qd, ohi, olo);
-        return qd_commit(cpu, pc, d, fl);
+        return qd_publish(cpu, pc, d, fl, qd, ohi, olo);
     }
     if (aneg != 0U && ca != 0U) {
-        qd_put_allones(cpu, qd);
-        return qd_commit(cpu, pc, d, 0x10U);
+        return qd_publish_ones(cpu, pc, d, 0x10U, qd);
     }
     if (ca == 0U) {
-        qd_put(cpu, qd, ahi, alo);
-        return qd_commit(cpu, pc, d, 0U);
+        return qd_publish(cpu, pc, d, 0U, qd, ahi, alo);
     }
     if (ca == 3U) {
-        qd_put_inf(cpu, qd, 0U);
-        return qd_commit(cpu, pc, d, 0U);
+        return qd_publish_inf(cpu, pc, d, 0U, qd, 0U);
     }
     qd_unpack(ahi, alo, &ua);
     qd_sqrt_core(&ua, &neg, &exp, &shi, &slo, &g, &r, &s);
     fl = qd_pack(neg, exp, shi, slo, g, r, s, rm, &ohi, &olo);
-    qd_put(cpu, qd, ohi, olo);
-    return qd_commit(cpu, pc, d, fl);
+    return qd_publish(cpu, pc, d, fl, qd, ohi, olo);
 }
 
 sparc64_step_result_t sparc64_fp_qdiv(sparc64_cpu_t *cpu, uint64_t pc,

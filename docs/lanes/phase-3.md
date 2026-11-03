@@ -19,10 +19,11 @@ with `eq/lt/gt/un = 0/1/2/3`, `faligndata` splice
   integer-modeled in `interp_mem.c`. Do not change classification.
 - Curated C11 (`-std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror`),
   every `.c`/`.h`/`.S` `<= 900` lines, never emit `x18` in `.S`/emitters.
-- `qemu STQF quirk` (E05 finding 11): the oracle duplicates the high half
-  on `stq`. Our interpreter deliberately reproduces the quirk so the gate
-  (`bit-for-bit vs qemu`) holds; `test_p3` asserts true quad halves through
-  the `std`-pair and asserts the `stq` duplication observation-only.
+- `qemu STQF quirk` (E05 finding 11, corrected by S64-R7-8): the oracle
+  duplicates the high half on `stq`, but the register's contents are both
+  halves in order, so our interpreter stores true halves; `test_p3`
+  asserts true quad halves through the `std`-pair and observes `stq`
+  (observation-only, no check).
 
 ## Lane L3a — complete FPU/SIMD interpreter (owns `src/interp/fp.c`)
 
@@ -55,8 +56,9 @@ Scope (everything else keeps the loud `ILLEGAL` trap):
   `FE_INEXACT->NX`). `TEM != 0` with a trapped `cexc` takes the generic
   synchronous-trap path (same as `ILLEGAL` today); note it in the header.
 - `FPRS`: readable/writable state, no PEF trap (Phase 4 owns FP traps).
-- Keep: FP ld/st incl. `%asi` forms, LDDA/STDA lines, `0x30-0x37`,
-  VIS block ASIs `0xF0-0xF7`, `STQF` oracle-quirk duplication.
+- Keep: FP ld/st incl. `%asi` forms, `0x30-0x37`, VIS block ASIs
+  `0xF0-0xF7`, `STQF` true-halves stores (S64-R7-8); integer LDDA/STDA
+  classify `LOAD`/`STORE` and run in `interp_mem.c` (S64-R7-9).
 
 Acceptance (bounded, from the worktree root; scratch probe under `/tmp`,
 never committed): build an E05-style scratch FP probe with the cross
@@ -125,7 +127,7 @@ clobber only `%g1-%g3/%o0-%o4`, values snapshotted to BSS, never touch
 `%g6/%g7`, never `set`). Deterministic stdout, exit 0 iff all pass:
 - Scalar: `fadds/subs/muls/divs`, `fsmuld`, `faddd/subd/muld/divd`,
   `fsqrts/fqrtd`, `fmovs/fmovd`, `fmovq` + `faddq` (halves asserted via
-  `std`-pair; `stq` duplication asserted observation-only per the quirk).
+  `std`-pair; `stq` true halves observed observation-only, S64-R7-8).
 - `fcmps/fcmpd` + `FBcc` (`fbl/fbe/fbu/fbo/fbg`, `fcc1..3` selectors),
   `FMOVcc` (`se/sne` taken + skipped with `0xdeadbeef` preservation),
   `FMOVr` (`icc.Z`), `FMOVde`.

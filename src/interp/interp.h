@@ -203,9 +203,15 @@ bool sparc64_win_restore(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     void *mc, uint64_t sum, unsigned rd, sparc64_step_result_t *res,
     uint64_t pc);
 /* Flush-all (interp_win.c): mirror every outstanding window image into
- * its architectural stack slot (setjmp-trap helper, see above). */
+ * its architectural stack slot, including the live current window
+ * (setjmp/signal/thread snapshot helper, see above). */
 bool sparc64_win_flush_all(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     void *mc, sparc64_step_result_t *res, uint64_t pc);
+/* Flush-callers (interp_win.c): spill outstanding caller windows only,
+ * excluding the live current window (architectural FLUSHW helper). */
+bool sparc64_win_flush_callers(sparc64_cpu_t *cpu,
+    const sparc64_mem_ops_t *mem, void *mc, sparc64_step_result_t *res,
+    uint64_t pc);
 /* Invalidate-all (interp_win.c): drop every cached image (longjmp-trap
  * helper, see above). */
 void sparc64_win_invalidate_all(void);

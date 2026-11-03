@@ -171,6 +171,25 @@ check-r4: ## Build and run the Round-4 sysmem transaction test (S64-R4-10)
 		-o $(BUILD_DIR)/test_r4_sysmem_txn && \
 	./$(BUILD_DIR)/test_r4_sysmem_txn
 
+# ---- Round-7 remediation gate (S64-R7-1..35) --------------------------------
+check-r7: ## Build and run the Round-7 ISA interpreter regression tests
+	$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r7_interp.c \
+		src/interp/interp.c src/interp/decode.c src/interp/interp_win.c \
+		src/interp/interp_mem.c src/interp/fp.c src/interp/fp_commit.c \
+		src/interp/fp_ldst.c src/interp/fp_conv.c src/interp/fp_sd.c \
+		src/interp/fp_quad.c src/interp/fp_qdiv.c src/interp/fp_qconv.c \
+		src/interp/interp_cond.c \
+		-o $(BUILD_DIR)/test_r7_interp && \
+	./$(BUILD_DIR)/test_r7_interp && \
+	$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r7_interp_fp.c \
+		src/interp/interp.c src/interp/decode.c src/interp/interp_win.c \
+		src/interp/interp_mem.c src/interp/fp.c src/interp/fp_commit.c \
+		src/interp/fp_ldst.c src/interp/fp_conv.c src/interp/fp_sd.c \
+		src/interp/fp_quad.c src/interp/fp_qdiv.c src/interp/fp_qconv.c \
+		src/interp/interp_cond.c \
+		-o $(BUILD_DIR)/test_r7_interp_fp && \
+	./$(BUILD_DIR)/test_r7_interp_fp
+
 check-r3-darwin: ## Build and run the Round-3 Darwin backend test (S64-R3-4/5/6/7)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r3_darwin.c \
@@ -183,4 +202,4 @@ check-r3-darwin: ## Build and run the Round-3 Darwin backend test (S64-R3-4/5/6/
 		echo "check-r3-darwin: Darwin-only backend, pass"; \
 	fi
 
-test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin ## Host-side gates with -Werror (no cross toolchain needed)
+test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin check-r7 ## Host-side gates with -Werror (no cross toolchain needed)

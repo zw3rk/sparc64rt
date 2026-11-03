@@ -288,9 +288,9 @@ unsigned sparc64_sd_pack(unsigned neg, int exp, uint64_t sig, unsigned g,
     } else if (rm == FE_TOWARDZERO) {
         up = false;
     } else if (rm == FE_UPWARD) {
-        up = neg == 0U;
+        up = (neg == 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     } else {
-        up = neg != 0U;
+        up = (neg != 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     }
     if (up) {
         sig += UINT64_C(1);
@@ -356,10 +356,9 @@ static void sd_addsub(const sd_unp_t *a, const sd_unp_t *b, unsigned sub,
     unsigned hneg = aneg;
     unsigned lneg = bneg;
     __uint128_t hs;
-    __uint128_t ls = (__uint128_t)0;
-    unsigned st = 0U;
+    __uint128_t lsx = (__uint128_t)0;
+    unsigned s2 = 0U;
     unsigned d = 0U;
-    unsigned i;
     __uint128_t kept;
     if (b->exp > a->exp) {
         hi = b;
@@ -372,26 +371,33 @@ static void sd_addsub(const sd_unp_t *a, const sd_unp_t *b, unsigned sub,
         d = (unsigned)(hi->exp - lo->exp);
     }
     kept = (__uint128_t)lo->sig;
+    /* Align with three exact guard bits plus sticky: hs/lsx share the
+     * extended scale, so add/sub below are exact and rounding happens
+     * once in sd_pack. */
+    hs <<= 3;
     if (d >= 128U) {
-        st = (lo->sig != UINT64_C(0)) ? 1U : 0U;
+        s2 = (kept != (__uint128_t)0) ? 1U : 0U;
     } else {
-        for (i = 0U; i < d; i++) {
-            st |= (unsigned)(kept & (__uint128_t)1);
-            kept >>= 1;
-        }
-        ls = kept;
+        __uint128_t full = kept << 3;
+        __uint128_t mask = (d == 0U) ? (__uint128_t)0
+            : (((__uint128_t)1 << d) - (__uint128_t)1);
+        lsx = full >> d;
+        s2 = ((full & mask) != (__uint128_t)0) ? 1U : 0U;
     }
     *exp = hi->exp;
     if (hneg == lneg) {
-        __uint128_t sum = hs + ls;
-        if (((sum >> p) & (__uint128_t)1) != (__uint128_t)0) {
+        __uint128_t sum = hs + lsx;
+        *neg = hneg;
+        *exp = hi->exp;
+        if (((sum >> (p + 3U)) & (__uint128_t)1) != (__uint128_t)0) {
             *neg = hneg;
-            *sig = (uint64_t)(sum >> 1);
-            *g = (unsigned)(sum & (__uint128_t)1);
-            *r = 0U;
-            *s = st;
+            *sig = (uint64_t)(sum >> 4);
+            *g = (unsigned)((sum >> 3) & (__uint128_t)1);
+            *r = (unsigned)((sum >> 2) & (__uint128_t)1);
+            *s = ((((sum & (__uint128_t)7) != (__uint128_t)0) || (s2 != 0U))
+                ? 1U : 0U);
             *exp += 1;
-        } else if (sum == (__uint128_t)0 && st == 0U) {
+        } else if (sum == (__uint128_t)0 && s2 == 0U) {
             *neg = hneg;
             *sig = UINT64_C(0);
             *g = 0U;
@@ -399,14 +405,15 @@ static void sd_addsub(const sd_unp_t *a, const sd_unp_t *b, unsigned sub,
             *s = 0U;
         } else {
             *neg = hneg;
-            *sig = (uint64_t)sum;
-            *g = 0U;
-            *r = 0U;
-            *s = st;
+            *sig = (uint64_t)(sum >> 3);
+            *g = (unsigned)((sum >> 2) & (__uint128_t)1);
+            *r = (unsigned)((sum >> 1) & (__uint128_t)1);
+            *s = ((((sum & (__uint128_t)1) != (__uint128_t)0) || (s2 != 0U))
+                ? 1U : 0U);
         }
         return;
     }
-    if (hs == ls && st == 0U) {
+    if (hs == lsx && s2 == 0U) {
         *neg = (rd == 3) ? 1U : 0U;
         *sig = UINT64_C(0);
         *g = 0U;
@@ -414,30 +421,73 @@ static void sd_addsub(const sd_unp_t *a, const sd_unp_t *b, unsigned sub,
         *s = 0U;
         return;
     }
-    if (hs >= ls) {
-        __uint128_t diff = hs - ls;
-        unsigned bitlen = 128U - sd_clz128(diff);
-        unsigned k = (diff == (__uint128_t)0) ? 0U : p - bitlen;
+    if (hs == lsx) {
+        /* Equal extended significands with a dropped fraction below:
+         * tiny nonzero value, sign of the subtrahend side. */
+        *neg = lneg;
+        *sig = UINT64_C(0);
+        *g = 0U;
+        *r = 0U;
+        *s = 1U;
+        return;
+    }
+    if (hs > lsx) {
+        __uint128_t diff = hs - lsx;
+        unsigned bitlen;
+        unsigned k;
+        if (s2 != 0U) {
+            /* The truncated subtrahend fraction sits below diff's lsb:
+             * the true value is diff minus a positive fraction below
+             * one ulp, so borrow one ulp (sticky stays set). */
+            diff -= (__uint128_t)1;
+            if (diff == (__uint128_t)0) {
+                *exp = hi->exp;
+                *neg = hneg;
+                *sig = UINT64_C(0);
+                *g = 0U;
+                *r = 0U;
+                *s = 1U;
+                return;
+            }
+        }
+        bitlen = 128U - sd_clz128(diff);
+        k = (p + 3U) - bitlen;
         diff <<= k;
         *exp -= (int)k;
         *neg = hneg;
-        *sig = (uint64_t)diff;
-        *g = 0U;
-        *r = 0U;
-        *s = st;
+        *sig = (uint64_t)(diff >> 3);
+        *g = (unsigned)((diff >> 2) & (__uint128_t)1);
+        *r = (unsigned)((diff >> 1) & (__uint128_t)1);
+        *s = ((((diff & (__uint128_t)1) != (__uint128_t)0) || (s2 != 0U))
+            ? 1U : 0U);
         return;
     }
     {
-        __uint128_t diff = ls - hs;
-        unsigned bitlen = 128U - sd_clz128(diff);
-        unsigned k = p - bitlen;
+        __uint128_t diff = lsx - hs;
+        unsigned bitlen;
+        unsigned k;
+        if (s2 != 0U) {
+            diff -= (__uint128_t)1;
+            if (diff == (__uint128_t)0) {
+                *exp = hi->exp;
+                *neg = lneg;
+                *sig = UINT64_C(0);
+                *g = 0U;
+                *r = 0U;
+                *s = 1U;
+                return;
+            }
+        }
+        bitlen = 128U - sd_clz128(diff);
+        k = (p + 3U) - bitlen;
         diff <<= k;
         *exp -= (int)k;
         *neg = lneg;
-        *sig = (uint64_t)diff;
-        *g = 0U;
-        *r = 0U;
-        *s = st;
+        *sig = (uint64_t)(diff >> 3);
+        *g = (unsigned)((diff >> 2) & (__uint128_t)1);
+        *r = (unsigned)((diff >> 1) & (__uint128_t)1);
+        *s = ((((diff & (__uint128_t)1) != (__uint128_t)0) || (s2 != 0U))
+            ? 1U : 0U);
     }
 }
 
@@ -495,8 +545,10 @@ static void sd_store(sparc64_cpu_t *cpu, unsigned w, unsigned field,
 {
     if (w == 0U) {
         cpu->fp.f[(field & 31U) ^ 1U] = (uint32_t)v;
+        sparc64_fp_mark_dirty(cpu, 0U);
     } else {
         cpu->fp.d[sd_pair(field)] = v;
+        sparc64_fp_mark_dirty(cpu, (sd_pair(field) >= 16U) ? 1U : 0U);
     }
 }
 

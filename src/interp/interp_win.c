@@ -271,6 +271,30 @@ bool sparc64_win_flush_all(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
     return true;
 }
 
+/* Architectural FLUSHW (V9 A.21): spill outstanding caller windows to
+ * their [winsp + 2047] home slots, excluding the current window, which
+ * stays live in registers. Invalid images are skipped: their home slots
+ * are live stack space. Like the full snapshot, a flushed caller is no
+ * longer outstanding, so later underflow fills are idempotent. */
+bool sparc64_win_flush_callers(sparc64_cpu_t *cpu,
+    const sparc64_mem_ops_t *mem, void *mc, sparc64_step_result_t *res,
+    uint64_t pc)
+{
+    unsigned w;
+    for (w = 0U; w < SPARC64_NWINDOWS; w++) {
+        /* The current window is live, not outstanding: never spilled. */
+        if (w == cpu->cwp || !win_valid[w]) {
+            continue;
+        }
+        if (!win_spill_to(mem, mc, interp_winfile[w],
+                interp_winsp[w] + SPARC64_STACK_BIAS, res, pc)) {
+            return false;
+        }
+        win_valid[w] = false;
+    }
+    return true;
+}
+
 /* Drop every cached image (longjmp trap): the handler frames clobbered
  * winfile, so the subsequent unwind refills each reactivated window from
  * its flushed home slot instead of trusting the cache. */
@@ -503,6 +527,7 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         int64_t dvd = (int64_t)(((uint64_t)(uint32_t)cpu->y << 32) |
             (uint64_t)(uint32_t)a);
         int32_t dvs = (int32_t)(uint32_t)b;
+        int64_t q;
         if (dvs == 0) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
@@ -510,18 +535,23 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
             sparc64_wreg(cpu, d->rd, (uint64_t)(uint32_t)0x80000000U);
             return sparc64_step_ok(pc);
         }
-        sparc64_wreg(cpu, d->rd,
-            (uint64_t)(uint32_t)(uint64_t)(dvd / (int64_t)dvs));
+        q = dvd / (int64_t)dvs;
+        sparc64_wreg(cpu, d->rd, (uint64_t)(int64_t)(int32_t)q);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_UDIV: {
         uint64_t dvd = ((uint64_t)(uint32_t)cpu->y << 32) |
             (uint64_t)(uint32_t)a;
         uint32_t dvs = (uint32_t)b;
+        uint64_t q;
         if (dvs == 0U) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
-        sparc64_wreg(cpu, d->rd, (uint64_t)(uint32_t)(dvd / (uint64_t)dvs));
+        q = dvd / (uint64_t)dvs;
+        if (q > (uint64_t)UINT32_C(0xFFFFFFFF)) {
+            q = (uint64_t)UINT32_C(0xFFFFFFFF);
+        }
+        sparc64_wreg(cpu, d->rd, (uint64_t)(uint32_t)q);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_POPC:
@@ -597,7 +627,11 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
         q = dvd / (uint64_t)dvs;
-        r32 = (uint32_t)q;
+        if (q > (uint64_t)UINT32_C(0xFFFFFFFF)) {
+            r32 = UINT32_C(0xFFFFFFFF);
+        } else {
+            r32 = (uint32_t)q;
+        }
         icc = 0U;
         if ((r32 & UINT32_C(0x80000000)) != UINT32_C(0)) {
             icc |= 8U;
@@ -608,7 +642,14 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         if (q > (uint64_t)UINT32_C(0xFFFFFFFF)) {
             icc |= 2U;
         }
-        sparc64_cc_set(cpu, icc, icc);
+        xcc = 0U;
+        if ((q & (UINT64_C(1) << 63)) != UINT64_C(0)) {
+            xcc |= 8U;
+        }
+        if (q == UINT64_C(0)) {
+            xcc |= 4U;
+        }
+        sparc64_cc_set(cpu, icc, xcc);
         sparc64_wreg(cpu, d->rd, (uint64_t)r32);
         return sparc64_step_ok(pc);
     }
@@ -637,8 +678,15 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         if (q != (int64_t)(int32_t)r32) {
             icc |= 2U;
         }
-        sparc64_cc_set(cpu, icc, icc);
-        sparc64_wreg(cpu, d->rd, (uint64_t)r32);
+        xcc = 0U;
+        if (q < 0) {
+            xcc |= 8U;
+        }
+        if (q == 0) {
+            xcc |= 4U;
+        }
+        sparc64_cc_set(cpu, icc, xcc);
+        sparc64_wreg(cpu, d->rd, (uint64_t)(int64_t)(int32_t)r32);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_TADDCC:
@@ -659,9 +707,8 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         }
         if (tag) {
             icc |= 2U;
-            xcc |= 2U;
         }
-        if (tv && ((icc | xcc) & 2U) != 0U) {
+        if (tv && (icc & 2U) != 0U) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
         sparc64_cc_set(cpu, icc, xcc);
@@ -669,18 +716,22 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_MULSCC: {
-        /* Multiply step: 32-bit core (oracle shape verified by S1 probe
-         * before RC1). opnd selected by xcc N^V; Y shifts rs1 bit 0 into
-         * the top; rd takes old Y bit 0 plus the halved sum. */
-        unsigned xcc0 = sparc64_cc_xcc(cpu);
-        bool nv = ((xcc0 & 8U) != 0U) != ((xcc0 & 2U) != 0U);
+        /* Multiply step (V9 shift-then-add): shift rs1 right by one,
+         * shifting icc N^V into bit 31; Y takes rs1 bit 0 at the top;
+         * add rs2 iff old Y bit 0 is set; rd takes the 32-bit sum;
+         * ICC comes from the 33-bit add (N/Z result, V signed
+         * overflow, C carry-out). */
+        unsigned icc0 = sparc64_cc_icc(cpu);
+        bool nv = ((icc0 & 8U) != 0U) != ((icc0 & 2U) != 0U);
         uint32_t a32 = (uint32_t)a;
-        uint32_t opnd = nv ? (uint32_t)b : 0U;
-        uint64_t full = (uint64_t)a32 + (uint64_t)opnd;
-        uint32_t sum = (uint32_t)full;
-        bool v = ((int64_t)(int32_t)a32 + (int64_t)(int32_t)opnd) !=
-            (int64_t)(int32_t)sum;
         uint32_t yold = (uint32_t)cpu->y;
+        uint32_t shifted =
+            (a32 >> 1) | (nv ? UINT32_C(0x80000000) : UINT32_C(0));
+        uint32_t opnd = ((yold & 1U) != 0U) ? (uint32_t)b : 0U;
+        uint64_t full = (uint64_t)shifted + (uint64_t)opnd;
+        uint32_t sum = (uint32_t)full;
+        bool v = ((int64_t)(int32_t)shifted + (int64_t)(int32_t)opnd) !=
+            (int64_t)(int32_t)sum;
         unsigned ncc = 0U;
         cpu->y = (uint64_t)(((a32 & 1U) << 31) | (yold >> 1));
         if ((sum & UINT32_C(0x80000000)) != UINT32_C(0)) {
@@ -696,8 +747,7 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
             ncc |= 1U;
         }
         sparc64_cc_set(cpu, ncc, ncc);
-        sparc64_wreg(cpu, d->rd,
-            (uint64_t)(((yold & 1U) << 31) | (sum >> 1)));
+        sparc64_wreg(cpu, d->rd, (uint64_t)sum);
         return sparc64_step_ok(pc);
     }
     default:

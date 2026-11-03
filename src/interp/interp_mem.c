@@ -230,14 +230,20 @@ static bool cas_fallback(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
     }
     *old = cur;
     if (cur != expect) {
+        /* No store is needed, but writability is still required: a
+         * same-value store-back faults on read-only mappings. */
+        if (!sparc64_st_int(mem, mc, va, size, little, cur, res, pc)) {
+            return false;
+        }
         return true;
     }
     return sparc64_st_int(mem, mc, va, size, little, swap, res, pc);
 }
 
-/* LR/SC compare-and-swap loop through the host CAS substrate. The SC
- * consumes its reservation either way; a value mismatch skips the store.
- * Bounded retries: a live lock costs a trap, never a host hang. */
+/* LR/SC compare-and-swap loop through the host CAS substrate. A value
+ * mismatch issues a same-value SC: no observable store, but write
+ * permission is still validated before reporting success. Bounded
+ * retries: a live lock costs a trap, never a host hang. */
 static bool cas_link(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
     unsigned size, bool little, uint64_t expect, uint64_t swap, uint64_t *old,
     sparc64_step_result_t *res, uint64_t pc)
@@ -273,6 +279,20 @@ static bool cas_link(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
         cur = little ? swap_bytes(lr.old_value, size) : lr.old_value;
         *old = cur;
         if (cur != expect) {
+            req.op = SPARC64_ATOMIC_SC;
+            req.value = lr.old_value;
+            req.reservation_valid = true;
+            req.reservation = lr.reservation;
+            fault.address = va;
+            fault.reason = SPARC64_MEM_FAULT_NONE;
+            sc.old_value = UINT64_C(0);
+            sc.sc_success = false;
+            sc.reservation.binding_id = UINT64_C(0);
+            sc.reservation.write_epoch = UINT64_C(0);
+            if (!mem->atomic(mc, &req, &sc, &fault)) {
+                *res = sparc64_mem_trap(&fault, pc, true);
+                return false;
+            }
             return true;
         }
         req.op = SPARC64_ATOMIC_SC;
@@ -308,10 +328,22 @@ bool sparc64_cas(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
         return false;
     }
+    /* Natural alignment precedes either backend: the substrate reports
+     * misalignment as INTERNAL, which must never surface to the guest. */
+    if ((va & (uint64_t)(size - 1U)) != UINT64_C(0)) {
+        *res = sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
+        return false;
+    }
     if (mem == NULL) {
         *res = sparc64_trap(SPARC64_TRAP_LOAD_ACCESS, pc, va);
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
         return false;
+    }
+    /* CASA compares and swaps 32-bit quantities: discard the unused
+     * upper halves once, covering fallback, LR/SC loop, and callers. */
+    if (size == 4U) {
+        expect &= UINT64_C(0xFFFFFFFF);
+        swap &= UINT64_C(0xFFFFFFFF);
     }
     if (mem->atomic != NULL) {
         return cas_link(mem, mc, va, size, little, expect, swap, old, res,
@@ -363,6 +395,11 @@ bool sparc64_swap(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
         return false;
     }
+    /* Same ordering as sparc64_cas: architectural trap, never INTERNAL. */
+    if (size > 1U && (va & (uint64_t)(size - 1U)) != UINT64_C(0)) {
+        *res = sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
+        return false;
+    }
     if (mem == NULL) {
         *res = sparc64_trap(SPARC64_TRAP_LOAD_ACCESS, pc, va);
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
@@ -400,11 +437,67 @@ bool sparc64_swap(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
     return sparc64_st_int(mem, mc, va, size, little, swap, res, pc);
 }
 
+/* Resolve the effective ASI: the i == 1 form carries 0xFF plus regasi
+ * and reads the live %asi register (decode.c:468-474). */
+static uint8_t asi_resolve(const sparc64_cpu_t *cpu, const sparc64_dec_t *d)
+{
+    if (d->regasi != 0U) {
+        return (uint8_t)(cpu->asi & UINT64_C(0xFF));
+    }
+    return d->asi;
+}
+
+/* FSR software-writable fields (V9): cexc 4:0, aexc 9:5, fcc0 11:10,
+ * TEM 27:23, NS 28, RD 31:30; 64-bit form adds fcc1 33:32, fcc2 35:34,
+ * fcc3 37:36. ftt 14:12, qne 15, ver 19:17, and all reserved bits stay. */
+#define SPARC64_FSR32_WRITABLE_MASK UINT64_C(0xDF800FFF)
+#define SPARC64_FSR64_WRITABLE_MASK UINT64_C(0x3FDF800FFF)
+#define SPARC64_FSR_FTT_MASK UINT64_C(0x7000)
+
 /* Alternate-space ASI check (E03). Immediate ASIs 0x80/0x82 are
  * big-endian, 0x88/0x8a little-endian (bit 3). ASIs below 0x80 trap
  * privileged (qemu trap 0x37); the i == 1 %asi-register form and unknown
  * supervisor ASIs fault like the oracle's missing helper. Shared with the
  * FPU kernel, which resolves regasi into d.asi before calling. */
+static bool asi_is_nofault(uint8_t asi)
+{
+    return asi == SPARC64_ASI_PNF || asi == SPARC64_ASI_PNFL;
+}
+
+/* Eligible no-fault suppression: guest access faults only. */
+static bool nofault_hide(const sparc64_step_result_t *r)
+{
+    if (r->kind != SPARC64_STEP_TRAP ||
+        r->cause != SPARC64_TRAP_LOAD_ACCESS) {
+        return false;
+    }
+    switch (r->memory_reason) {
+    case SPARC64_MEM_FAULT_UNMAPPED:
+    case SPARC64_MEM_FAULT_PERMISSION:
+    case SPARC64_MEM_FAULT_RANGE:
+    case SPARC64_MEM_FAULT_BUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* No-fault integer piece: eligible access faults become zero. */
+static bool ld_nofault(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
+    unsigned size, bool sign_extend, bool little, bool nofault, uint64_t *out,
+    sparc64_step_result_t *res, uint64_t pc)
+{
+    if (sparc64_ld_int(mem, mc, va, size, sign_extend, little, out, res,
+            pc)) {
+        return true;
+    }
+    if (!nofault || !nofault_hide(res)) {
+        return false;
+    }
+    *out = UINT64_C(0);
+    return true;
+}
+
 bool sparc64_asi_check(uint64_t pc, const sparc64_dec_t *d, bool *little,
     sparc64_step_result_t *res)
 {
@@ -447,86 +540,111 @@ sparc64_step_result_t sparc64_exec_load(sparc64_cpu_t *cpu,
     bool alt = d->op3 >= SPARC64_OP3_LDA && d->op3 <= SPARC64_OP3_LDXA;
     uint64_t v = UINT64_C(0);
     sparc64_step_result_t res;
-    if (alt && !sparc64_asi_check(pc, d, &little, &res)) {
+    sparc64_dec_t dd = *d;
+    if (dd.regasi != 0U) {
+        dd.asi = asi_resolve(cpu, d);
+    }
+    bool nofault = alt && asi_is_nofault(dd.asi);
+    if (alt && !sparc64_asi_check(pc, &dd, &little, &res)) {
         return res;
     }
     switch (d->op3) {
     case SPARC64_OP3_LDUW:
     case SPARC64_OP3_LDA:
-        if (!sparc64_ld_int(mem, mc, va, 4U, false, little, &v, &res, pc)) {
+        if (!ld_nofault(mem, mc, va, 4U, false, little, nofault, &v, &res,
+                pc)) {
             return res;
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
     case SPARC64_OP3_LDUB:
     case SPARC64_OP3_LDUBA:
-        if (!sparc64_ld_int(mem, mc, va, 1U, false, little, &v, &res, pc)) {
+        if (!ld_nofault(mem, mc, va, 1U, false, little, nofault, &v, &res,
+                pc)) {
             return res;
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
     case SPARC64_OP3_LDUH:
     case SPARC64_OP3_LDUHA:
-        if (!sparc64_ld_int(mem, mc, va, 2U, false, little, &v, &res, pc)) {
+        if (!ld_nofault(mem, mc, va, 2U, false, little, nofault, &v, &res,
+                pc)) {
             return res;
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
     case SPARC64_OP3_LDD:
-    case SPARC64_OP3_LDDA:
-        if (!sparc64_ld_int(mem, mc, va, 4U, false, little, &v, &res, pc)) {
+    case SPARC64_OP3_LDDA: {
+        uint64_t hi = UINT64_C(0);
+        uint64_t lo = UINT64_C(0);
+        if ((va & UINT64_C(7)) != UINT64_C(0)) {
+            return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
+        }
+        if (!ld_nofault(mem, mc, va, 4U, false, little, nofault, &hi, &res,
+                pc)) {
             return res;
         }
-        sparc64_wreg(cpu, d->rd, v);
-        if (!sparc64_ld_int(mem, mc, va + UINT64_C(4), 4U, false, little, &v,
-                &res, pc)) {
+        if (!ld_nofault(mem, mc, va + UINT64_C(4), 4U, false, little,
+                nofault, &lo, &res, pc)) {
             return res;
         }
-        sparc64_wreg(cpu, d->rd + 1U, v);
+        sparc64_wreg(cpu, d->rd, hi);
+        sparc64_wreg(cpu, d->rd + 1U, lo);
         break;
+    }
     case SPARC64_OP3_LDSW:
     case SPARC64_OP3_LDSWA:
-        if (!sparc64_ld_int(mem, mc, va, 4U, true, little, &v, &res, pc)) {
+        if (!ld_nofault(mem, mc, va, 4U, true, little, nofault, &v, &res,
+                pc)) {
             return res;
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
     case SPARC64_OP3_LDSB:
     case SPARC64_OP3_LDSBA:
-        if (!sparc64_ld_int(mem, mc, va, 1U, true, little, &v, &res, pc)) {
+        if (!ld_nofault(mem, mc, va, 1U, true, little, nofault, &v, &res,
+                pc)) {
             return res;
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
     case SPARC64_OP3_LDSH:
     case SPARC64_OP3_LDSHA:
-        if (!sparc64_ld_int(mem, mc, va, 2U, true, little, &v, &res, pc)) {
+        if (!ld_nofault(mem, mc, va, 2U, true, little, nofault, &v, &res,
+                pc)) {
             return res;
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
     case SPARC64_OP3_LDX:
     case SPARC64_OP3_LDXA:
-        if (!sparc64_ld_int(mem, mc, va, 8U, false, little, &v, &res, pc)) {
+        if (!ld_nofault(mem, mc, va, 8U, false, little, nofault, &v, &res,
+                pc)) {
             return res;
         }
         sparc64_wreg(cpu, d->rd, v);
         break;
-    default: /* LDFSR (rd 0: low 32, upper zeroed) / LDXFSR (rd 1:
-        * full 64-bit, oracle-probed). Either form re-syncs the fcc
-        * shadow from the FSR fields. */
+    default: /* LDFSR (rd 0: low 32) / LDXFSR (rd 1: full 64-bit,
+        * oracle-probed). Only rd 0/1 are valid; read-only fields and,
+        * for the 32-bit form, the upper half (fcc1-3) are preserved.
+        * Either form re-syncs the fcc shadow from the FSR fields. */
+        if (d->rd != 0U && d->rd != 1U) {
+            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+        }
         if (d->rd == 1U) {
-            if (!sparc64_ld_int(mem, mc, va, 8U, false, little, &v, &res,
-                    pc)) {
+            if (!ld_nofault(mem, mc, va, 8U, false, little, nofault, &v,
+                    &res, pc)) {
                 return res;
             }
-            cpu->fsr = v;
+            cpu->fsr = (cpu->fsr & ~SPARC64_FSR64_WRITABLE_MASK) |
+                (v & SPARC64_FSR64_WRITABLE_MASK);
         } else {
-            if (!sparc64_ld_int(mem, mc, va, 4U, false, little, &v, &res,
-                    pc)) {
+            if (!ld_nofault(mem, mc, va, 4U, false, little, nofault, &v,
+                    &res, pc)) {
                 return res;
             }
-            cpu->fsr = v & UINT64_C(0xFFFFFFFF);
+            cpu->fsr = (cpu->fsr & ~SPARC64_FSR32_WRITABLE_MASK) |
+                (v & SPARC64_FSR32_WRITABLE_MASK);
         }
         cpu->fcc[0] = (uint32_t)((cpu->fsr >> 10) & UINT64_C(3));
         cpu->fcc[1] = (uint32_t)((cpu->fsr >> 32) & UINT64_C(3));
@@ -546,8 +664,15 @@ sparc64_step_result_t sparc64_exec_store(sparc64_cpu_t *cpu,
     bool alt = d->op3 >= SPARC64_OP3_STA && d->op3 <= SPARC64_OP3_STXA;
     uint64_t v = sparc64_rreg(cpu, d->rd);
     sparc64_step_result_t res;
-    if (alt && !sparc64_asi_check(pc, d, &little, &res)) {
+    sparc64_dec_t dd = *d;
+    if (dd.regasi != 0U) {
+        dd.asi = asi_resolve(cpu, d);
+    }
+    if (alt && !sparc64_asi_check(pc, &dd, &little, &res)) {
         return res;
+    }
+    if (alt && asi_is_nofault(dd.asi)) {
+        return sparc64_trap(SPARC64_TRAP_STORE_ACCESS, pc, va);
     }
     switch (d->op3) {
     case SPARC64_OP3_STW:
@@ -572,6 +697,9 @@ sparc64_step_result_t sparc64_exec_store(sparc64_cpu_t *cpu,
     case SPARC64_OP3_STDA: {
         uint64_t hi = sparc64_rreg(cpu, d->rd);
         uint64_t lo = sparc64_rreg(cpu, d->rd + 1U);
+        if ((va & UINT64_C(7)) != UINT64_C(0)) {
+            return sparc64_trap(SPARC64_TRAP_STORE_MISALIGNED, pc, va);
+        }
         if (!sparc64_st_int(mem, mc, va, 4U, little, hi, &res, pc)) {
             return res;
         }
@@ -588,18 +716,24 @@ sparc64_step_result_t sparc64_exec_store(sparc64_cpu_t *cpu,
         }
         break;
     default: /* STFSR (rd 0: low 32) / STXFSR (rd 1: full 64-bit,
-        * oracle-probed). */
+        * oracle-probed). Only rd 0/1 are valid. The store observes
+        * the pre-clear FSR; a successful store then clears FTT. */
+        if (d->rd != 0U && d->rd != 1U) {
+            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+        }
         if (d->rd == 1U) {
             if (!sparc64_st_int(mem, mc, va, 8U, little, cpu->fsr, &res,
                     pc)) {
                 return res;
             }
+            cpu->fsr &= ~SPARC64_FSR_FTT_MASK;
             break;
         }
         if (!sparc64_st_int(mem, mc, va, 4U, little,
                 cpu->fsr & UINT64_C(0xFFFFFFFF), &res, pc)) {
             return res;
         }
+        cpu->fsr &= ~SPARC64_FSR_FTT_MASK;
         break;
     }
     return sparc64_step_ok(pc);
@@ -622,14 +756,37 @@ sparc64_step_result_t sparc64_exec_atomic(sparc64_cpu_t *cpu,
         d->op3 == SPARC64_OP3_CASA || d->op3 == SPARC64_OP3_CASXA;
     uint64_t old = UINT64_C(0);
     sparc64_step_result_t res;
+    /* S64-R7-10: natural alignment precedes either atomic backend; the
+     * substrate reports misalignment as INTERNAL, which must never
+     * surface to the guest. */
+    if (d->op3 == SPARC64_OP3_CASA) {
+        if ((va & UINT64_C(3)) != UINT64_C(0)) {
+            return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
+        }
+    } else if (d->op3 == SPARC64_OP3_CASXA) {
+        if ((va & UINT64_C(7)) != UINT64_C(0)) {
+            return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
+        }
+    } else if (d->cls == (uint8_t)SPARC64_ICLS_SWAP) {
+        if ((va & UINT64_C(3)) != UINT64_C(0)) {
+            return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
+        }
+    }
     /* L4b: single-copy host-__atomic fast path on the shared mapping
-     * first; anything it declines (unmapped, page-crossing, misaligned,
+     * first; anything it declines (unmapped, page-crossing,
      * non-data ASI) falls through to the reservation path unchanged. */
     if (sparc64_threads_try_host_atomic(cpu, mc, pc, d, &res)) {
         return res;
     }
-    if (alt && !sparc64_asi_check(pc, d, &little, &res)) {
+    sparc64_dec_t dd = *d;
+    if (dd.regasi != 0U) {
+        dd.asi = asi_resolve(cpu, d);
+    }
+    if (alt && !sparc64_asi_check(pc, &dd, &little, &res)) {
         return res;
+    }
+    if (alt && asi_is_nofault(dd.asi)) {
+        return sparc64_trap(SPARC64_TRAP_STORE_ACCESS, pc, va);
     }
     if (d->cls == (uint8_t)SPARC64_ICLS_LDSTUB) {
         if (!sparc64_swap(mem, mc, va, 1U, little, UINT64_C(0xFF), &old, &res,

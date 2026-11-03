@@ -19,7 +19,13 @@ sparc64_step_result_t sparc64_fp_commit(sparc64_cpu_t *cpu, uint64_t pc,
     fresh &= 0x1FU;
     tem = (unsigned)((cpu->fsr >> 23) & UINT64_C(0x1F));
     if (((unsigned)fresh & tem) != 0U) {
-        cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
+        unsigned cexc = fresh;
+        if ((fresh & 0x08U) != 0U) {
+            cexc = 0x08U;
+        } else if ((fresh & 0x04U) != 0U) {
+            cexc = 0x04U;
+        }
+        cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)cexc;
         cpu->fsr = (cpu->fsr & ~(UINT64_C(7) << 14)) |
             (UINT64_C(1) << 14);
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);

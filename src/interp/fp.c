@@ -28,9 +28,11 @@
  * FPOP2 (op3 0x35): FCMPS 0x51, FCMPD 0x52, FCMPES 0x55, FCMPED 0x56
  * (fcc = rd&3); FMOVcc opf = (fcc<<6)|size with the FP condition in the
  * 5-bit rs1 field (N=0 NE=1 L=4 G=6 U=7 A=8 E=9 GE=11 LE=13 O=15, plus
- * LG=2 UL=3 ULE=5 UE=10 UGE=12 ULE=14 which GAS never emits); FMOVr
+ * LG=2 UL=3 UG=5 UE=10 UGE=12 ULE=14 which GAS never emits); FMOVr
  * opf = 0x100|size (%icc) / 0x180|size (%xcc) with the integer condition
- * in rs1 (all 16 Bicc numbers, evaluated by sparc64_eval_cond).
+ * in rs1 (all 16 Bicc numbers, evaluated by sparc64_eval_cond);
+ * register-conditioned FMOVR opf = (rcond<<5)|0x04|size tests integer
+ * rs1 (full 64-bit, rcond 1/2/3/5/6/7) with the FP source in rs2.
  * FCMPQ/FCMPEQ route to fp_qconv.c; anything else traps ILLEGAL.
  *
  * VIS (op3 0x36) routes to fp_ldst.c: FZERO 0x60 (double zero) /
@@ -58,7 +60,7 @@
  * bits raw (SNaN preserved, no flags). FCMP on SNaN sets NV with
  * fcc = 3; on QNaN fcc = 3 quietly. FCMPE* sets NV on any NaN.
  *
- * STQF deliberately duplicates the high double (qemu 7.2 STQF quirk).
+ * STQF stores both halves in order (fp_ldst.c).
  * Double/quad register fields: even = lower pair, odd = upper bank
  * (pair 16+(v>>1)); quad field mod 4 == 0 lower / == 1 upper bank,
  * anything else ILLEGAL. Single field s addresses fp.f[(s) ^ 1U]: the
@@ -77,6 +79,7 @@
 #include <string.h>
 
 #include "core/cpu.h"
+#include "interp/fp_commit.h"
 #include "interp/interp.h"
 
 /* Phase 3 cross-file entries (defined in fp_conv.c / fp_quad.c /
@@ -157,7 +160,13 @@ static sparc64_step_result_t fp_commit(sparc64_cpu_t *cpu, uint64_t pc,
     fresh &= 0x1FU;
     tem = (unsigned)((cpu->fsr >> 23) & UINT64_C(0x1F));
     if (((unsigned)fresh & tem) != 0U) {
-        cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
+        unsigned cexc = fresh;
+        if ((fresh & 0x08U) != 0U) {
+            cexc = 0x08U;
+        } else if ((fresh & 0x04U) != 0U) {
+            cexc = 0x04U;
+        }
+        cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)cexc;
         cpu->fsr = (cpu->fsr & ~(UINT64_C(7) << 14)) |
             (UINT64_C(1) << 14);
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
@@ -199,6 +208,7 @@ static sparc64_step_result_t fp_move_s(sparc64_cpu_t *cpu, uint64_t pc,
         return tr;
     }
     cpu->fp.f[(d->rd & 31U) ^ 1U] = a;
+    sparc64_fp_mark_dirty(cpu, 0U);
     return tr;
 }
 
@@ -217,6 +227,7 @@ static sparc64_step_result_t fp_move_d(sparc64_cpu_t *cpu, uint64_t pc,
         return tr;
     }
     cpu->fp.d[fp_pair(d->rd)] = a;
+    sparc64_fp_mark_dirty(cpu, (fp_pair(d->rd) >= 16U) ? 1U : 0U);
     return tr;
 }
 
@@ -321,48 +332,6 @@ static sparc64_step_result_t fp_cmp_d(sparc64_cpu_t *cpu, uint64_t pc,
     }
 }
 
-/* Floating-point condition test over an fcc value (0 equal, 1 less,
- * 2 greater, 3 unordered). Covers all 16 V9 FP conditions; GAS only
- * emits 10 of them for FMOVcc, the rest are available to hand-encoded
- * words with identical predicates. */
-static bool fp_cctest(unsigned cond, unsigned fcc)
-{
-    switch (cond) {
-    case 0U:
-        return false;
-    case 1U:
-        return fcc != 0U;
-    case 2U:
-        return (fcc == 1U) || (fcc == 2U);
-    case 3U:
-        return (fcc == 3U) || (fcc == 1U);
-    case 4U:
-        return fcc == 1U;
-    case 5U:
-        return fcc != 2U;
-    case 6U:
-        return fcc == 2U;
-    case 7U:
-        return fcc == 3U;
-    case 8U:
-        return true;
-    case 9U:
-        return fcc == 0U;
-    case 10U:
-        return (fcc == 3U) || (fcc == 0U);
-    case 11U:
-        return (fcc == 2U) || (fcc == 0U);
-    case 12U:
-        return fcc != 1U;
-    case 13U:
-        return (fcc == 0U) || (fcc == 1U);
-    case 14U:
-        return (fcc == 3U) || (fcc == 1U) || (fcc == 0U);
-    default:
-        return fcc != 3U;
-    }
-}
-
 /* Copy one quad register file slot (16 bytes) without touching FSR. */
 static void fp_copy_q(sparc64_cpu_t *cpu, unsigned dst, unsigned src)
 {
@@ -394,7 +363,7 @@ static sparc64_step_result_t fp_movcc(sparc64_cpu_t *cpu, uint64_t pc,
     if (cond > 15U) {
         return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
     }
-    if (!fp_cctest(cond, cpu->fcc[fcc])) {
+    if (!sparc64_eval_fcond(cond, cpu->fcc[fcc])) {
         return fp_commit(cpu, pc, d, 0U);
     }
     rs2 = d->raw & 31U;
@@ -407,9 +376,12 @@ static sparc64_step_result_t fp_movcc(sparc64_cpu_t *cpu, uint64_t pc,
     }
     {
         sparc64_step_result_t tr = fp_commit(cpu, pc, d, 0U);
+        unsigned upper;
         if (tr.kind != SPARC64_STEP_CONTINUE) {
             return tr;
         }
+        upper = (size == 3U) ? ((fp_qidx(d->rd) >= 8U) ? 1U : 0U)
+            : (size == 2U) ? ((fp_pair(d->rd) >= 16U) ? 1U : 0U) : 0U;
         if (size == 1U) {
             cpu->fp.f[(d->rd & 31U) ^ 1U] = cpu->fp.f[(rs2) ^ 1U];
         } else if (size == 2U) {
@@ -417,6 +389,7 @@ static sparc64_step_result_t fp_movcc(sparc64_cpu_t *cpu, uint64_t pc,
         } else {
             fp_copy_q(cpu, d->rd, rs2);
         }
+        sparc64_fp_mark_dirty(cpu, upper);
         return tr;
     }
 }
@@ -456,9 +429,12 @@ static sparc64_step_result_t fp_movr(sparc64_cpu_t *cpu, uint64_t pc,
     }
     {
         sparc64_step_result_t tr = fp_commit(cpu, pc, d, 0U);
+        unsigned upper;
         if (tr.kind != SPARC64_STEP_CONTINUE) {
             return tr;
         }
+        upper = (size == 3U) ? ((fp_qidx(d->rd) >= 8U) ? 1U : 0U)
+            : (size == 2U) ? ((fp_pair(d->rd) >= 16U) ? 1U : 0U) : 0U;
         if (size == 1U) {
             cpu->fp.f[(d->rd & 31U) ^ 1U] = cpu->fp.f[(rs2) ^ 1U];
         } else if (size == 2U) {
@@ -466,6 +442,52 @@ static sparc64_step_result_t fp_movr(sparc64_cpu_t *cpu, uint64_t pc,
         } else {
             fp_copy_q(cpu, d->rd, rs2);
         }
+        sparc64_fp_mark_dirty(cpu, upper);
+        return tr;
+    }
+}
+
+/* FMOVR (register-conditioned): opf = (rcond<<5)|0x04|size with the
+ * integer test register in rs1 (full 64-bit, %g0 reads 0) and the FP
+ * source in rs2. Operate instruction even when skipped: overwrites
+ * cexc, aexc sticky. */
+static sparc64_step_result_t fp_movr_reg(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d)
+{
+    unsigned size = d->opf & 3U;
+    unsigned rcond = (d->opf >> 5) & 7U;
+    unsigned rs2;
+    if (rcond != 1U && rcond != 2U && rcond != 3U && rcond != 5U &&
+        rcond != 6U && rcond != 7U) {
+        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+    }
+    if (!sparc64_eval_rcond(rcond, sparc64_rreg(cpu, d->rs1))) {
+        return fp_commit(cpu, pc, d, 0U);
+    }
+    rs2 = d->raw & 31U;
+    if (size == 3U) {
+        unsigned qd = fp_qidx(d->rd);
+        unsigned qs = fp_qidx(rs2);
+        if (qd > 15U || qs > 15U) {
+            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+        }
+    }
+    {
+        sparc64_step_result_t tr = fp_commit(cpu, pc, d, 0U);
+        unsigned upper;
+        if (tr.kind != SPARC64_STEP_CONTINUE) {
+            return tr;
+        }
+        upper = (size == 3U) ? ((fp_qidx(d->rd) >= 8U) ? 1U : 0U)
+            : (size == 2U) ? ((fp_pair(d->rd) >= 16U) ? 1U : 0U) : 0U;
+        if (size == 1U) {
+            cpu->fp.f[(d->rd & 31U) ^ 1U] = cpu->fp.f[(rs2) ^ 1U];
+        } else if (size == 2U) {
+            cpu->fp.d[fp_pair(d->rd)] = cpu->fp.d[fp_pair(rs2)];
+        } else {
+            fp_copy_q(cpu, d->rd, rs2);
+        }
+        sparc64_fp_mark_dirty(cpu, upper);
         return tr;
     }
 }
@@ -560,6 +582,10 @@ sparc64_step_result_t sparc64_exec_fpu(sparc64_ctx_t *cpu,
             (opf & 3U) <= 3U && ((opf >> 8) & 1U) == 0U) {
             return fp_movcc(cpu, pc, d);
         }
+        if ((opf & UINT32_C(0x11C)) == UINT32_C(0x004) &&
+            (opf & 3U) >= 1U && (opf & 3U) <= 3U) {
+            return fp_movr_reg(cpu, pc, d);
+        }
         if ((opf == (0x100U | (opf & 3U)) ||
                 opf == (0x180U | (opf & 3U))) && (opf & 3U) >= 1U &&
             (opf & 3U) <= 3U) {
@@ -570,7 +596,6 @@ sparc64_step_result_t sparc64_exec_fpu(sparc64_ctx_t *cpu,
     if (d->op3 == SPARC64_OP3_LDF || d->op3 == SPARC64_OP3_LDDF ||
         d->op3 == SPARC64_OP3_STF || d->op3 == SPARC64_OP3_STDF ||
         d->op3 == SPARC64_OP3_LDTW || d->op3 == SPARC64_OP3_STTW ||
-        d->op3 == SPARC64_OP3_LDDA || d->op3 == SPARC64_OP3_STDA ||
         d->op3 == SPARC64_OP3_LDFA || d->op3 == SPARC64_OP3_LDDFA ||
         d->op3 == SPARC64_OP3_STFA || d->op3 == SPARC64_OP3_STDFA) {
         return sparc64_fp_ldst(cpu, mem, mc, pc, d);

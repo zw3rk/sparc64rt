@@ -23,4 +23,19 @@
 sparc64_step_result_t sparc64_fp_commit(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned fresh);
 
+/* FPRS state bits (V9 5.1.6: FEF bit 2, DU bit 1, DL bit 0). */
+enum {
+    SPARC64_FPRS_DL = 1U,
+    SPARC64_FPRS_DU = 2U,
+    SPARC64_FPRS_FEF = 4U
+};
+
+/* Mark the bank holding a committed FP destination dirty (upper selects
+ * DU, otherwise DL). Call only after commit succeeds, beside the write. */
+static inline void sparc64_fp_mark_dirty(sparc64_cpu_t *cpu, unsigned upper)
+{
+    cpu->fprs |= (uint64_t)((upper != 0U) ? SPARC64_FPRS_DU :
+        SPARC64_FPRS_DL);
+}
+
 #endif /* SPARC64RT_INTERP_FP_COMMIT_H */

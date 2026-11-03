@@ -139,7 +139,10 @@ sparc64_step_result_t sparc64_exec_align(sparc64_cpu_t *cpu, uint64_t pc,
     uint64_t b = (d->is_imm != 0U) ? (uint64_t)d->imm
                                    : sparc64_rreg(cpu, d->rs2);
     uint64_t sum = a + b;
-    cpu->gsr = (cpu->gsr & ~(UINT64_C(7))) | (sum & UINT64_C(7));
+    uint64_t off = (d->opf == SPARC64_OPF_ALIGNADDRL)
+        ? ((UINT64_C(0) - sum) & UINT64_C(7))
+        : (sum & UINT64_C(7));
+    cpu->gsr = (cpu->gsr & ~(UINT64_C(7))) | off;
     sparc64_wreg(cpu, d->rd, sum & ~(UINT64_C(7)));
     return sparc64_step_ok(pc);
 }
@@ -150,7 +153,7 @@ sparc64_step_result_t sparc64_exec_priv(sparc64_cpu_t *cpu,
 {
     sparc64_step_result_t res;
     if (d->op3 == SPARC64_OP3_FLUSHW) {
-        if (!sparc64_win_flush_all(cpu, mem, mc, &res, pc)) {
+        if (!sparc64_win_flush_callers(cpu, mem, mc, &res, pc)) {
             return res;
         }
         cpu->canrestore = 0U;
@@ -225,132 +228,114 @@ static sparc64_step_result_t exec_single(sparc64_cpu_t *cpu,
     }
 }
 
-/* Delay-slot execution: fetches, decodes, and runs the single delay
- * instruction with cpu->pc already at delay_pc and cpu->npc already at
- * the outer CTI's post-delay target. A nested CTI takes over the
- * transfer; any stop result (trap or syscall) propagates with cpu->pc
- * and cpu->npc preserved so the caller/syscall handler sees the pending
- * transfer target in cpu->npc. */
-static bool exec_delay(sparc64_cpu_t *cpu, const sparc64_mem_ops_t *mem,
-    void *mc, uint64_t delay_pc, sparc64_step_result_t *res)
+/* True for CTI classes that carry a delay slot (R7-1 deferral test). */
+static bool is_cti_class(uint8_t cls)
 {
-    uint32_t raw;
-    sparc64_dec_t dd;
-    sparc64_step_result_t r;
-    if (!sparc64_fetch_word(mem, mc, delay_pc, &raw, res)) {
-        return false;
-    }
-    sparc64_classify_word(raw, &dd);
-    if (dd.cls == (uint8_t)SPARC64_ICLS_CALL ||
-        dd.cls == (uint8_t)SPARC64_ICLS_JMPL ||
-        dd.cls == (uint8_t)SPARC64_ICLS_RETURN ||
-        dd.cls == (uint8_t)SPARC64_ICLS_BICC ||
-        dd.cls == (uint8_t)SPARC64_ICLS_BPCC ||
-        dd.cls == (uint8_t)SPARC64_ICLS_BPR ||
-        dd.cls == (uint8_t)SPARC64_ICLS_FBR) {
-        *res = exec_cti(cpu, mem, mc, delay_pc, &dd);
-        return res->kind == SPARC64_STEP_CONTINUE;
-    }
-    if (dd.cls == (uint8_t)SPARC64_ICLS_TCC) {
-        /* A trap-condition in the delay slot evaluates normally: a false
-         * condition is a nop, a true one stops with cpu->pc/npc intact. */
-        r = exec_tcc(cpu, delay_pc, &dd);
-    } else {
-        r = exec_single(cpu, mem, mc, delay_pc, &dd);
-    }
-    if (r.kind != SPARC64_STEP_CONTINUE) {
-        *res = r;
-        return false;
-    }
-    cpu->pc = cpu->npc;
-    cpu->npc += 4U;
-    return true;
+    return cls == (uint8_t)SPARC64_ICLS_CALL ||
+        cls == (uint8_t)SPARC64_ICLS_JMPL ||
+        cls == (uint8_t)SPARC64_ICLS_RETURN ||
+        cls == (uint8_t)SPARC64_ICLS_BICC ||
+        cls == (uint8_t)SPARC64_ICLS_BPCC ||
+        cls == (uint8_t)SPARC64_ICLS_BPR ||
+        cls == (uint8_t)SPARC64_ICLS_FBR;
 }
 
 /* Control transfer at pc (cpu->npc == pc + 4): delay slot, annul, and
- * pc/npc update. Publishes (delay_pc, target) into (cpu->pc, cpu->npc)
- * before running the delay slot so a delay-slot syscall or trap sees
- * the pending branch destination in cpu->npc. */
+ * pc/npc update. Delayed transfers run through a bounded per-step state
+ * machine (R7-1): one CTI level plus its delay slot per dispatcher
+ * entry. A nested CTI in the delay slot is left published as
+ * (delay_pc, target) and the step returns; the dispatcher executes the
+ * nested transfer as its next entry, so host work per step stays O(1)
+ * and control returns to the dispatcher even when guest branches nest
+ * forever. Commit order matches the old recursion on every terminating
+ * chain: per-level effects (CALL %o7, JMPL rd, RETURN RESTORE) run
+ * before publishing (delay_pc, target) into (cpu->pc, cpu->npc), and a
+ * nested CTI's delay slot is the outer target. Publish precedes each
+ * delay slot so a delay-slot syscall/trap sees the pending destination
+ * in cpu->npc. */
 static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
     const sparc64_mem_ops_t *mem, void *mc, uint64_t pc, const sparc64_dec_t *d)
 {
     uint64_t npc = cpu->npc;
     uint64_t target;
+    uint64_t op2;
+    uint32_t delay_raw;
+    sparc64_dec_t dd;
     sparc64_step_result_t res;
     bool taken = true;
     if (d->cls == (uint8_t)SPARC64_ICLS_CALL) {
         target = pc + (uint64_t)d->disp; /* mod 2^64 */
         sparc64_wreg(cpu, SPARC64_O7, pc);
-        cpu->pc = npc;
-        cpu->npc = target;
-        if (!exec_delay(cpu, mem, mc, npc, &res)) {
-            return res;
-        }
-        return sparc64_step_ok(pc);
-    }
-    if (d->cls == (uint8_t)SPARC64_ICLS_RETURN) {
+    } else if (d->cls == (uint8_t)SPARC64_ICLS_RETURN) {
         /* V9 A.45: the target is computed in the old window, rd is not
          * written, and RESTORE %g0,%g0,%g0 runs before the delay slot
          * (a bare JMPL/retl without restore would leak the window). */
-        target = sparc64_rreg(cpu, d->rs1) +
-            ((d->is_imm != 0U) ? (uint64_t)d->imm
-                               : sparc64_rreg(cpu, d->rs2));
+        op2 = (d->is_imm != 0U) ? (uint64_t)d->imm
+                                : sparc64_rreg(cpu, d->rs2);
+        target = sparc64_rreg(cpu, d->rs1) + op2;
         if ((target & UINT64_C(3)) != UINT64_C(0)) {
-            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+            return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, target);
         }
         if (!sparc64_win_restore(cpu, mem, mc, UINT64_C(0), 0U, &res,
             pc)) {
             return res;
         }
-        cpu->pc = npc;
-        cpu->npc = target;
-        if (!exec_delay(cpu, mem, mc, npc, &res)) {
-            return res;
-        }
-        return sparc64_step_ok(pc);
-    }
-    if (d->cls == (uint8_t)SPARC64_ICLS_JMPL) {
-        target = sparc64_rreg(cpu, d->rs1) +
-            ((d->is_imm != 0U) ? (uint64_t)d->imm
-                               : sparc64_rreg(cpu, d->rs2));
+    } else if (d->cls == (uint8_t)SPARC64_ICLS_JMPL) {
+        op2 = (d->is_imm != 0U) ? (uint64_t)d->imm
+                                : sparc64_rreg(cpu, d->rs2);
+        target = sparc64_rreg(cpu, d->rs1) + op2;
         if ((target & UINT64_C(3)) != UINT64_C(0)) {
-            return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+            return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, target);
         }
         sparc64_wreg(cpu, d->rd, pc);
-        cpu->pc = npc;
-        cpu->npc = target;
-        if (!exec_delay(cpu, mem, mc, npc, &res)) {
-            return res;
-        }
-        return sparc64_step_ok(pc);
-    }
-    /* Branches: condition, target, annul (BA,a always skips, E02). */
-    if (d->cls == (uint8_t)SPARC64_ICLS_BICC) {
-        taken = sparc64_eval_cond(d->cond, sparc64_cc_icc(cpu));
-    } else if (d->cls == (uint8_t)SPARC64_ICLS_BPCC) {
-        unsigned nib = (d->cc == 2U) ? sparc64_cc_xcc(cpu)
-                                     : sparc64_cc_icc(cpu);
-        taken = sparc64_eval_cond(d->cond, nib);
-    } else if (d->cls == (uint8_t)SPARC64_ICLS_FBR) {
-        taken = sparc64_eval_fcond(d->cond, sparc64_read_fcc(cpu, d->cc));
     } else {
-        taken = sparc64_eval_rcond(d->cond, sparc64_rreg(cpu, d->rs1));
-    }
-    target = taken ? (pc + (uint64_t)d->disp) : (npc + 4U);
-    if (d->annul != 0U) {
-        bool skip = taken ? (d->cond == 8U &&
-                d->cls != (uint8_t)SPARC64_ICLS_BPR) : true;
-        if (skip) {
-            cpu->pc = target;
-            cpu->npc = target + 4U;
-            return sparc64_step_ok(pc);
+        /* Branches: condition, target, annul (BA,a always skips, E02). */
+        if (d->cls == (uint8_t)SPARC64_ICLS_BICC) {
+            taken = sparc64_eval_cond(d->cond, sparc64_cc_icc(cpu));
+        } else if (d->cls == (uint8_t)SPARC64_ICLS_BPCC) {
+            unsigned nib = (d->cc == 2U) ? sparc64_cc_xcc(cpu)
+                                         : sparc64_cc_icc(cpu);
+            taken = sparc64_eval_cond(d->cond, nib);
+        } else if (d->cls == (uint8_t)SPARC64_ICLS_FBR) {
+            taken = sparc64_eval_fcond(d->cond, sparc64_read_fcc(cpu, d->cc));
+        } else {
+            taken = sparc64_eval_rcond(d->cond, sparc64_rreg(cpu, d->rs1));
+        }
+        target = taken ? (pc + (uint64_t)d->disp) : (npc + 4U);
+        if (d->annul != 0U) {
+            bool skip = taken ? (d->cond == 8U &&
+                    d->cls != (uint8_t)SPARC64_ICLS_BPR) : true;
+            if (skip) {
+                cpu->pc = target;
+                cpu->npc = target + 4U;
+                return sparc64_step_ok(pc);
+            }
         }
     }
     cpu->pc = npc;
     cpu->npc = target;
-    if (!exec_delay(cpu, mem, mc, npc, &res)) {
+    if (!sparc64_fetch_word(mem, mc, npc, &delay_raw, &res)) {
         return res;
     }
+    sparc64_classify_word(delay_raw, &dd);
+    if (is_cti_class(dd.cls)) {
+        /* Nested CTI in the delay slot: (npc, target) stays published
+         * and this entry ends here. The dispatcher fetches the nested
+         * transfer at npc next, with its delay slot at target. */
+        return sparc64_step_ok(pc);
+    }
+    if (dd.cls == (uint8_t)SPARC64_ICLS_TCC) {
+        /* A trap-condition in the delay slot evaluates normally: a false
+         * condition is a nop, a true one stops with cpu->pc/npc intact. */
+        res = exec_tcc(cpu, npc, &dd);
+    } else {
+        res = exec_single(cpu, mem, mc, npc, &dd);
+    }
+    if (res.kind != SPARC64_STEP_CONTINUE) {
+        return res;
+    }
+    cpu->pc = cpu->npc;
+    cpu->npc += 4U;
     return sparc64_step_ok(pc);
 }
 
@@ -365,9 +350,10 @@ static sparc64_step_result_t exec_tcc(sparc64_cpu_t *cpu, uint64_t pc,
     if (!sparc64_eval_cond(d->cond, nib)) {
         return sparc64_step_ok(pc);
     }
-    trapno = (d->is_imm != 0U) ? (uint64_t)d->imm
-                               : (sparc64_rreg(cpu, d->rs1) +
-            sparc64_rreg(cpu, d->rs2));
+    trapno = (sparc64_rreg(cpu, d->rs1) +
+        ((d->is_imm != 0U) ? (uint64_t)d->imm
+                           : sparc64_rreg(cpu, d->rs2))) &
+        UINT64_C(0x7F);
     /* Linux user traps: 0x6d syscall gate, 0x6e setjmp, 0x6f longjmp.
      * tval carries the trap number; the engine re-reads the ta word, so
      * interp, DBT, and difftest share one dispatch without frozen-header
@@ -430,6 +416,8 @@ sparc64_step_result_t sparc64_step_with_insn(sparc64_cpu_t *cpu,
     sparc64_step_result_t res;
     sparc64_insn_t in;
     uint64_t pc;
+    uint64_t entry_npc;
+    bool published;
     if (cpu == NULL) {
         res.kind = SPARC64_STEP_INTERNAL;
         res.cause = SPARC64_TRAP_INST_ACCESS;
@@ -441,6 +429,7 @@ sparc64_step_result_t sparc64_step_with_insn(sparc64_cpu_t *cpu,
     }
     cpu->r[0] = UINT64_C(0);
     pc = cpu->pc;
+    entry_npc = cpu->npc;
     res = sparc64_decode(cpu, memory, context, &in);
     if (res.kind != SPARC64_STEP_CONTINUE) {
         if (executed != NULL) {
@@ -479,11 +468,16 @@ sparc64_step_result_t sparc64_step_with_insn(sparc64_cpu_t *cpu,
         }
         break;
     }
-    if (res.kind == SPARC64_STEP_TRAP &&
-        (cpu->pc != res.pc || cpu->npc == UINT64_C(0))) {
-        /* Trap context is precise: TPC names the faulting instruction;
-         * preserve cpu->npc when exec_cti or dbt_delay_continuation
-         * already published the pending branch destination. */
+    published = (cpu->pc != pc) || (cpu->npc != entry_npc);
+    if (res.kind == SPARC64_STEP_TRAP && !published &&
+        cpu->pc != res.pc) {
+        /* Trap context is precise: TPC names the faulting instruction.
+         * When the faulting path already published pc/npc (exec_cti
+         * publishes delay_pc/target before the delay slot, as does
+         * dbt_delay_continuation), the pending destination in cpu->npc
+         * is kept. Publication is tracked against the entry snapshot,
+         * never by treating a guest address (including zero) as an
+         * initialization sentinel. */
         cpu->pc = res.pc;
         cpu->npc = res.pc + 4U;
     }

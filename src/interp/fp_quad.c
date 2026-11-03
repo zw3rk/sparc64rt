@@ -1,27 +1,16 @@
-/*
- * src/interp/fp_quad.c — Phase 3 quad-precision (binary128) interpreter.
- *
+/* src/interp/fp_quad.c — quad-precision (binary128) FADDQ/FSUBQ/FMULQ/FDMULQ.
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Soft binary128 for FADDQ/FSUBQ/FMULQ and FDMULQ, entered from the
- * fp.c dispatcher (sparc64_fp_quad). FDIVQ/FSQRTQ live in fp_qdiv.c,
- * the rest of the quad set in fp_qconv.c. No host float128 is used:
- * integer bit-manipulation with correct rounding for the active
- * FSR.RD, verified against the qemu-sparc64 oracle. NaN rules mirror
- * single/double (SNaN quiets with NV, QNaN larger payload wins,
- * invalid yields all-ones). Quad slots go through d[2*i]/d[2*i+1].
- */
+ * SPDX-License-Identifier: Apache-2.0 */
 
 #include <fenv.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "core/cpu.h"
+#include "interp/fp_commit.h"
 #include "interp/interp.h"
 
-/* Division/sqrt entry (defined in fp_qdiv.c); declared here so no
- * shared header changes are needed. */
+/* FDIVQ/FSQRTQ entry (defined in fp_qdiv.c). */
 sparc64_step_result_t sparc64_fp_qdiv(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d);
 
@@ -95,46 +84,7 @@ static unsigned qq_bit(uint64_t hi, uint64_t lo, unsigned i)
     return (unsigned)((hi >> (i - 64U)) & UINT64_C(1));
 }
 
-/* Right shift with jamming: dropped bits fold into guard/round/sticky. */
-static void qq_shr_grs(uint64_t *hi, uint64_t *lo, unsigned k, unsigned *g,
-    unsigned *r, unsigned *s)
-{
-    unsigned gg = 0U;
-    unsigned rr = 0U;
-    unsigned ss = 0U;
-    unsigned i;
-    if (k == 0U) {
-        *g = 0U;
-        *r = 0U;
-        *s = 0U;
-        return;
-    }
-    if (k >= 128U) {
-        *g = 0U;
-        *r = 0U;
-        *s = ((*hi | *lo) != UINT64_C(0)) ? 1U : 0U;
-        *hi = UINT64_C(0);
-        *lo = UINT64_C(0);
-        return;
-    }
-    for (i = 0U; i < k; i++) {
-        unsigned b = qq_bit(*hi, *lo, i);
-        if (i == k - 1U) {
-            gg = b;
-        } else if (k >= 2U && i == k - 2U) {
-            rr = b;
-        } else {
-            ss |= b;
-        }
-    }
-    qq_shr(hi, lo, k);
-    *g = gg;
-    *r = rr;
-    *s = (ss != 0U) ? 1U : 0U;
-}
-
-/* Quad pair index (mirrors fp.c): field mod 4 == 0 lower, == 1 upper
- * bank, else 16 (invalid). */
+/* Quad pair index: mod4 0 lower, 1 upper bank, else 16 (invalid). */
 static unsigned qq_qidx(unsigned w)
 {
     unsigned m = w & 3U;
@@ -167,18 +117,10 @@ static int qq_rd_mode(const sparc64_cpu_t *cpu)
 static sparc64_step_result_t qq_commit(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned fresh)
 {
-    fresh &= 0x1FU;
-    cpu->fsr = (cpu->fsr & ~UINT64_C(0x1F)) | (uint64_t)fresh;
-    cpu->fsr |= (uint64_t)fresh << 5;
-    if ((((cpu->fsr >> 23) & UINT64_C(0x1F)) & (cpu->fsr & UINT64_C(0x1F))) !=
-        UINT64_C(0)) {
-        return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
-    }
-    return sparc64_step_ok(pc);
+    return sparc64_fp_commit(cpu, pc, d, fresh);
 }
 
-/* Classify a quad value: 0 zero, 2 finite nonzero, 3 infinity,
- * 4 quiet NaN, 5 signaling NaN. */
+/* Quad class: 0 zero, 2 finite, 3 inf, 4 QNaN, 5 SNaN. */
 static unsigned qq_class(uint64_t hi, uint64_t lo)
 {
     unsigned rawexp = (unsigned)((hi >> 48) & UINT64_C(0x7FFF));
@@ -196,7 +138,7 @@ static unsigned qq_class(uint64_t hi, uint64_t lo)
     return 2U;
 }
 
-/* Compare quad payloads (fraction only): 1 when a >= b. */
+/* Quad payload compare (fraction only): 1 when a >= b. */
 static bool qq_payload_ge(uint64_t ahi, uint64_t alo, uint64_t bhi,
     uint64_t blo)
 {
@@ -208,8 +150,7 @@ static bool qq_payload_ge(uint64_t ahi, uint64_t alo, uint64_t bhi,
     return alo >= blo;
 }
 
-/* Unpacked finite nonzero quad: value = sig * 2^(exp-112) with the
- * hidden bit at bit 112 (shi bit 48). */
+/* Unpacked quad: sig * 2^(exp-112), hidden bit shi:48. */
 typedef struct {
     unsigned neg;
     int exp;
@@ -247,9 +188,7 @@ static void qq_unpack(uint64_t hi, uint64_t lo, qq_unp_t *q)
     }
 }
 
-/* Round and pack a normalized 113-bit significand (hidden bit ~112,
- * value < 2^114) with guard/round/sticky into binary128. Returns fresh
- * cexc flags; handles subnormals, overflow, overflow, and the active RD. */
+/* Round/pack 113-bit sig with GRS into binary128; returns cexc. */
 static unsigned qq_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
     unsigned g, unsigned r, unsigned s, int rm, uint64_t *ohi,
     uint64_t *olo)
@@ -286,11 +225,28 @@ static unsigned qq_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
     if (exp < Q_EMIN) {
         unsigned shift = (unsigned)(Q_EMIN - exp);
         if (shift >= 113U) {
+            /* Value is below one output ulp: keep exact GRS and round. */
+            unsigned gg = 0U;
+            unsigned rr = 0U;
+            unsigned ss = g | r | s;
+            if (shift == 113U) {
+                gg = (unsigned)((shi >> 48) & UINT64_C(1));
+                rr = (unsigned)((shi >> 47) & UINT64_C(1));
+                ss |= (unsigned)(((shi & UINT64_C(0x7FFFFFFFFFFF)) !=
+                    UINT64_C(0)) || (slo != UINT64_C(0))) ? 1U : 0U;
+            } else if (shift == 114U) {
+                rr = (unsigned)((shi >> 48) & UINT64_C(1));
+                ss |= (unsigned)(((shi & UINT64_C(0xFFFFFFFFFFFF)) !=
+                    UINT64_C(0)) || (slo != UINT64_C(0))) ? 1U : 0U;
+            } else {
+                ss |= (unsigned)(((shi != UINT64_C(0)) || (slo !=
+                    UINT64_C(0))) ? 1U : 0U);
+            }
             shi = UINT64_C(0);
             slo = UINT64_C(0);
-            g = 0U;
-            r = 0U;
-            s = 1U;
+            g = gg;
+            r = rr;
+            s = (ss != 0U) ? 1U : 0U;
         } else {
             unsigned g2 = qq_bit(shi, slo, shift - 1U);
             unsigned r2 =
@@ -313,9 +269,9 @@ static unsigned qq_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
     } else if (rm == FE_TOWARDZERO) {
         up = false;
     } else if (rm == FE_UPWARD) {
-        up = neg == 0U;
+        up = (neg == 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     } else {
-        up = neg != 0U;
+        up = (neg != 0U) && ((g != 0U) || (r != 0U) || (s != 0U));
     }
     if (up) {
         slo += UINT64_C(1);
@@ -354,7 +310,7 @@ static unsigned qq_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
         return 0x09U;
     }
     if (tiny || ((shi == UINT64_C(0)) && (slo == UINT64_C(0)))) {
-        *ohi = (uint64_t)neg << 63;
+        *ohi = ((uint64_t)neg << 63) | (shi & UINT64_C(0xFFFFFFFFFFFF));
         *olo = slo;
     } else {
         *ohi = ((uint64_t)neg << 63) |
@@ -365,21 +321,16 @@ static unsigned qq_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
     return (tiny && inexact ? 0x04U : 0U) | (inexact ? 0x01U : 0U);
 }
 
-/* Compare 128-bit magnitudes: -1/0/1. */
-static int qq_cmp128(uint64_t ahi, uint64_t alo, uint64_t bhi, uint64_t blo)
+/* 128-bit bit-length; caller guarantees nonzero. */
+static unsigned qq_bitlen128(__uint128_t v)
 {
-    if (ahi != bhi) {
-        return (ahi < bhi) ? -1 : 1;
+    if ((v >> 64) != (__uint128_t)0) {
+        return 128U - qq_clz64((uint64_t)(v >> 64));
     }
-    if (alo != blo) {
-        return (alo < blo) ? -1 : 1;
-    }
-    return 0;
+    return 64U - qq_clz64((uint64_t)v);
 }
 
-/* Add/subtract finite nonzero unpacked values. sub flips the second
- * sign. Outputs (neg, exp, sig, g/r/s) for qq_pack; iszero reports an
- * exact zero (caller picks the sign per rounding mode). */
+/* Add/sub unpacked values; sub flips sign; outputs for qq_pack. */
 static void qq_addsub(const qq_unp_t *a, const qq_unp_t *b, unsigned sub,
     unsigned *neg, int *exp, uint64_t *shi, uint64_t *slo, unsigned *g,
     unsigned *r, unsigned *s, bool *iszero)
@@ -392,12 +343,11 @@ static void qq_addsub(const qq_unp_t *a, const qq_unp_t *b, unsigned sub,
     uint64_t alo = a->slo;
     uint64_t bhi = b->shi;
     uint64_t blo = b->slo;
-    uint64_t t;
-    unsigned gg = 0U;
-    unsigned rr = 0U;
-    unsigned ss = 0U;
-    int cmp;
-    bool carry;
+    __uint128_t hi128;
+    __uint128_t lo128;
+    __uint128_t lsx = (__uint128_t)0;
+    unsigned s2 = 0U;
+    unsigned d = 0U;
     if (aexp < bexp) {
         aneg = b->neg ^ (sub & 1U);
         bneg = a->neg;
@@ -408,58 +358,129 @@ static void qq_addsub(const qq_unp_t *a, const qq_unp_t *b, unsigned sub,
         bhi = a->shi;
         blo = a->slo;
     }
-    qq_shr_grs(&bhi, &blo, (unsigned)(aexp - bexp), &gg, &rr, &ss);
+    hi128 = ((__uint128_t)ahi << 64) | (__uint128_t)alo;
+    lo128 = ((__uint128_t)bhi << 64) | (__uint128_t)blo;
+    d = (unsigned)(aexp - bexp);
+    /* Align with three exact guard bits plus sticky: the extended pair
+     * keeps every dropped bit, so add/sub below are exact and rounding
+     * happens once in qq_pack. */
+    hi128 <<= 3;
+    if (d >= 128U) {
+        s2 = (lo128 != (__uint128_t)0) ? 1U : 0U;
+    } else {
+        __uint128_t full = lo128 << 3;
+        __uint128_t mask = (d == 0U) ? (__uint128_t)0
+            : (((__uint128_t)1 << d) - (__uint128_t)1);
+        lsx = full >> d;
+        s2 = ((full & mask) != (__uint128_t)0) ? 1U : 0U;
+    }
     if (aneg == bneg) {
-        *slo = alo + blo;
-        carry = (*slo < alo);
-        *shi = ahi + bhi + (carry ? UINT64_C(1) : UINT64_C(0));
-        carry = ((*shi < ahi) || ((*shi == ahi) && carry)) ? true : false;
+        __uint128_t sum = hi128 + lsx;
         *neg = aneg;
         *exp = aexp;
         *iszero = false;
-        if (carry) {
-            unsigned ng = (unsigned)(*slo & UINT64_C(1));
-            qq_shr(shi, slo, 1U);
-            ss = rr | ss;
-            rr = gg;
-            gg = ng;
+        if (((sum >> 116U) & (__uint128_t)1) != (__uint128_t)0) {
+            *slo = (uint64_t)(sum >> 4);
+            *shi = (uint64_t)(sum >> 68);
+            *g = (unsigned)((sum >> 3) & (__uint128_t)1);
+            *r = (unsigned)((sum >> 2) & (__uint128_t)1);
+            *s = ((((sum & (__uint128_t)7) != (__uint128_t)0) || (s2 != 0U))
+                ? 1U : 0U);
             *exp += 1;
+        } else {
+            *slo = (uint64_t)(sum >> 3);
+            *shi = (uint64_t)(sum >> 67);
+            *g = (unsigned)((sum >> 2) & (__uint128_t)1);
+            *r = (unsigned)((sum >> 1) & (__uint128_t)1);
+            *s = ((((sum & (__uint128_t)1) != (__uint128_t)0) || (s2 != 0U))
+                ? 1U : 0U);
         }
+    } else if ((hi128 == lsx) && (s2 == 0U)) {
+        *neg = 0U;
+        *exp = 0;
+        *shi = UINT64_C(0);
+        *slo = UINT64_C(0);
+        *iszero = true;
+        *g = 0U;
+        *r = 0U;
+        *s = 0U;
+    } else if (hi128 == lsx) {
+        /* Equal extended significands with a dropped fraction below:
+         * tiny nonzero value, sign of the subtrahend side. */
+        *neg = bneg;
+        *exp = aexp;
+        *shi = UINT64_C(0);
+        *slo = UINT64_C(0);
+        *iszero = false;
+        *g = 0U;
+        *r = 0U;
+        *s = 1U;
+    } else if (hi128 > lsx) {
+        __uint128_t diff = hi128 - lsx;
+        unsigned bitlen;
+        unsigned k;
+        if (s2 != 0U) {
+            /* Borrow one ulp for the truncated subtrahend fraction
+             * below diff's lsb (sticky stays set). */
+            diff -= (__uint128_t)1;
+            if (diff == (__uint128_t)0) {
+                *exp = aexp;
+                *neg = aneg;
+                *shi = UINT64_C(0);
+                *slo = UINT64_C(0);
+                *iszero = false;
+                *g = 0U;
+                *r = 0U;
+                *s = 1U;
+                return;
+            }
+        }
+        bitlen = qq_bitlen128(diff);
+        k = 116U - bitlen;
+        diff <<= k;
+        *exp = aexp - (int)k;
+        *neg = aneg;
+        *slo = (uint64_t)(diff >> 3);
+        *shi = (uint64_t)(diff >> 67);
+        *g = (unsigned)((diff >> 2) & (__uint128_t)1);
+        *r = (unsigned)((diff >> 1) & (__uint128_t)1);
+        *s = ((((diff & (__uint128_t)1) != (__uint128_t)0) || (s2 != 0U))
+            ? 1U : 0U);
+        *iszero = false;
     } else {
-        if (aexp > bexp) {
-            cmp = 1;
-        } else {
-            cmp = qq_cmp128(ahi, alo, bhi, blo);
+        __uint128_t diff = lsx - hi128;
+        unsigned bitlen;
+        unsigned k;
+        if (s2 != 0U) {
+            diff -= (__uint128_t)1;
+            if (diff == (__uint128_t)0) {
+                *exp = aexp;
+                *neg = bneg;
+                *shi = UINT64_C(0);
+                *slo = UINT64_C(0);
+                *iszero = false;
+                *g = 0U;
+                *r = 0U;
+                *s = 1U;
+                return;
+            }
         }
-        if (cmp == 0) {
-            *neg = 0U;
-            *exp = 0;
-            *shi = UINT64_C(0);
-            *slo = UINT64_C(0);
-            *iszero = true;
-        } else if (cmp > 0) {
-            t = alo - blo;
-            *shi = ahi - bhi - ((t > alo) ? UINT64_C(1) : UINT64_C(0));
-            *slo = t;
-            *neg = aneg;
-            *exp = aexp;
-            *iszero = false;
-        } else {
-            t = blo - alo;
-            *shi = bhi - ahi - ((t > blo) ? UINT64_C(1) : UINT64_C(0));
-            *slo = t;
-            *neg = bneg;
-            *exp = aexp;
-            *iszero = false;
-        }
+        bitlen = qq_bitlen128(diff);
+        k = 116U - bitlen;
+        diff <<= k;
+        *exp = aexp - (int)k;
+        *neg = bneg;
+        *slo = (uint64_t)(diff >> 3);
+        *shi = (uint64_t)(diff >> 67);
+        *g = (unsigned)((diff >> 2) & (__uint128_t)1);
+        *r = (unsigned)((diff >> 1) & (__uint128_t)1);
+        *s = ((((diff & (__uint128_t)1) != (__uint128_t)0) || (s2 != 0U))
+            ? 1U : 0U);
+        *iszero = false;
     }
-    *g = gg;
-    *r = rr;
-    *s = ss;
 }
 
-/* Multiply finite nonzero unpacked values: 113x113-bit product through
- * 32-bit limbs, top 113 bits plus guard/round/sticky. */
+/* Multiply unpacked values: 113x113-bit product, top bits + GRS. */
 static void qq_mul(const qq_unp_t *a, const qq_unp_t *b, unsigned *neg,
     int *exp, uint64_t *shi, uint64_t *slo, unsigned *g, unsigned *r,
     unsigned *s)
@@ -537,9 +558,7 @@ static void qq_mul(const qq_unp_t *a, const qq_unp_t *b, unsigned *neg,
     *s = ss;
 }
 
-/* Binary quad NaN propagation: SNaN wins over QNaN and sets NV;
- * otherwise the larger payload wins (tie: rs1). The winner is
- * returned quieted when signaling. */
+/* Quad NaN: SNaN wins (NV), else larger payload (tie rs1). */
 static bool qq_nan2(uint64_t ahi, uint64_t alo, uint64_t bhi, uint64_t blo,
     uint64_t *ohi, uint64_t *olo, unsigned *nv)
 {
@@ -589,6 +608,7 @@ static void qq_put(sparc64_cpu_t *cpu, unsigned qi, uint64_t hi, uint64_t lo)
 {
     cpu->fp.d[2U * qi] = hi;
     cpu->fp.d[2U * qi + 1U] = lo;
+    sparc64_fp_mark_dirty(cpu, (qi >= 8U) ? 1U : 0U);
 }
 
 static void qq_put_inf(sparc64_cpu_t *cpu, unsigned qi, unsigned neg)
@@ -603,8 +623,42 @@ static void qq_put_allones(sparc64_cpu_t *cpu, unsigned qi)
         UINT64_C(0xFFFFFFFFFFFFFFFF));
 }
 
-/* Quad operate: 0 add, 1 sub, 2 mul, 3 div, with full IEEE pre-screen
- * (NaN, infinities, zeros) ahead of the integer cores. */
+/* Commit-first publish (R7-2): trap leaves dest/FCC/AEXC untouched. */
+static sparc64_step_result_t qq_publish(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, unsigned qd, uint64_t hi,
+    uint64_t lo)
+{
+    sparc64_step_result_t sr = qq_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    qq_put(cpu, qd, hi, lo);
+    return sr;
+}
+
+static sparc64_step_result_t qq_publish_inf(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, unsigned qd, unsigned neg)
+{
+    sparc64_step_result_t sr = qq_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    qq_put_inf(cpu, qd, neg);
+    return sr;
+}
+
+static sparc64_step_result_t qq_publish_ones(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d, unsigned fresh, unsigned qd)
+{
+    sparc64_step_result_t sr = qq_commit(cpu, pc, d, fresh);
+    if (sr.kind != SPARC64_STEP_CONTINUE) {
+        return sr;
+    }
+    qq_put_allones(cpu, qd);
+    return sr;
+}
+
+/* Quad operate: 0 add, 1 sub, 2 mul, with IEEE pre-screen. */
 static sparc64_step_result_t qq_arith(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d, unsigned op)
 {
@@ -647,41 +701,34 @@ static sparc64_step_result_t qq_arith(sparc64_cpu_t *cpu, uint64_t pc,
         if (!qq_nan2(ahi, alo, bhi, blo, &ohi, &olo, &fl)) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
-        qq_put(cpu, qd, ohi, olo);
-        return qq_commit(cpu, pc, d, fl);
+        return qq_publish(cpu, pc, d, fl, qd, ohi, olo);
     }
     if (op <= 1U) {
         unsigned eff = bneg ^ (op & 1U);
         if (ca == 3U && cb == 3U) {
             if (aneg == eff) {
-                qq_put_inf(cpu, qd, aneg);
-                return qq_commit(cpu, pc, d, 0U);
+                return qq_publish_inf(cpu, pc, d, 0U, qd, aneg);
             }
-            qq_put_allones(cpu, qd);
-            return qq_commit(cpu, pc, d, 0x10U);
+            return qq_publish_ones(cpu, pc, d, 0x10U, qd);
         }
         if (ca == 3U) {
-            qq_put_inf(cpu, qd, aneg);
-            return qq_commit(cpu, pc, d, 0U);
+            return qq_publish_inf(cpu, pc, d, 0U, qd, aneg);
         }
         if (cb == 3U) {
-            qq_put_inf(cpu, qd, eff);
-            return qq_commit(cpu, pc, d, 0U);
+            return qq_publish_inf(cpu, pc, d, 0U, qd, eff);
         }
         if (ca == 0U && cb == 0U) {
-            qq_put(cpu, qd, (rm == FE_DOWNWARD) ? UINT64_C(0x8000000000000000)
-                                                : UINT64_C(0),
+            unsigned zn = (aneg == eff) ? aneg
+                : ((rm == FE_DOWNWARD) ? 1U : 0U);
+            return qq_publish(cpu, pc, d, 0U, qd, (uint64_t)zn << 63,
                 UINT64_C(0));
-            return qq_commit(cpu, pc, d, 0U);
         }
         if (ca == 0U) {
-            qq_put(cpu, qd, (op == 0U) ? bhi : bhi ^ UINT64_C(0x8000000000000000),
-                blo);
-            return qq_commit(cpu, pc, d, 0U);
+            return qq_publish(cpu, pc, d, 0U, qd,
+                (op == 0U) ? bhi : bhi ^ UINT64_C(0x8000000000000000), blo);
         }
         if (cb == 0U) {
-            qq_put(cpu, qd, ahi, alo);
-            return qq_commit(cpu, pc, d, 0U);
+            return qq_publish(cpu, pc, d, 0U, qd, ahi, alo);
         }
         qq_unpack(ahi, alo, &ua);
         qq_unpack(bhi, blo, &ub);
@@ -692,17 +739,14 @@ static sparc64_step_result_t qq_arith(sparc64_cpu_t *cpu, uint64_t pc,
         }
     } else if (op == 2U) {
         if ((ca == 3U && cb == 0U) || (cb == 3U && ca == 0U)) {
-            qq_put_allones(cpu, qd);
-            return qq_commit(cpu, pc, d, 0x10U);
+            return qq_publish_ones(cpu, pc, d, 0x10U, qd);
         }
         if (ca == 3U || cb == 3U) {
-            qq_put_inf(cpu, qd, aneg ^ bneg);
-            return qq_commit(cpu, pc, d, 0U);
+            return qq_publish_inf(cpu, pc, d, 0U, qd, aneg ^ bneg);
         }
         if (ca == 0U || cb == 0U) {
-            qq_put(cpu, qd,
+            return qq_publish(cpu, pc, d, 0U, qd,
                 ((uint64_t)(aneg ^ bneg) << 63), UINT64_C(0));
-            return qq_commit(cpu, pc, d, 0U);
         }
         qq_unpack(ahi, alo, &ua);
         qq_unpack(bhi, blo, &ub);
@@ -711,8 +755,7 @@ static sparc64_step_result_t qq_arith(sparc64_cpu_t *cpu, uint64_t pc,
         return sparc64_fp_qdiv(cpu, pc, d);
     }
     fl = qq_pack(neg, exp, shi, slo, g, r, s, rm, &ohi, &olo);
-    qq_put(cpu, qd, ohi, olo);
-    return qq_commit(cpu, pc, d, fl);
+    return qq_publish(cpu, pc, d, fl, qd, ohi, olo);
 }
 
 /* Unpack a finite nonzero double into 113-bit quad scale (exact). */
@@ -736,8 +779,7 @@ static void qq_unpack_d(uint64_t v, qq_unp_t *q)
     }
 }
 
-/* Classify a double value: 0 zero, 2 finite nonzero, 3 infinity,
- * 4 quiet NaN, 5 signaling NaN. */
+/* Double class: 0 zero, 2 finite, 3 inf, 4 QNaN, 5 SNaN. */
 static unsigned qq_dclass(uint64_t v)
 {
     unsigned rawexp = (unsigned)((v >> 52) & UINT64_C(0x7FF));
@@ -754,8 +796,7 @@ static unsigned qq_dclass(uint64_t v)
     return 2U;
 }
 
-/* FDMULQ: double * double -> quad. The 106-bit product is always
- * exact; only NaN and inf*0 need handling (invalid -> all-ones). */
+/* FDMULQ: double * double -> quad (exact; NaN/inf*0 invalid). */
 static sparc64_step_result_t qq_fdmulq(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
@@ -822,27 +863,23 @@ static sparc64_step_result_t qq_fdmulq(sparc64_cpu_t *cpu, uint64_t pc,
             ohi |= (w & UINT64_C(0x000FFFFFFFFFFFFF)) >> 4;
             olo = (w & UINT64_C(0x000FFFFFFFFFFFFF)) << 60;
         }
-        qq_put(cpu, qd, ohi, olo);
-        return qq_commit(cpu, pc, d, fl);
+        return qq_publish(cpu, pc, d, fl, qd, ohi, olo);
     }
     if ((ca == 3U && cb == 0U) || (cb == 3U && ca == 0U)) {
-        qq_put_allones(cpu, qd);
-        return qq_commit(cpu, pc, d, 0x10U);
+        return qq_publish_ones(cpu, pc, d, 0x10U, qd);
     }
     if (ca == 3U || cb == 3U) {
-        qq_put_inf(cpu, qd, aneg ^ bneg);
-        return qq_commit(cpu, pc, d, 0U);
+        return qq_publish_inf(cpu, pc, d, 0U, qd, aneg ^ bneg);
     }
     if (ca == 0U || cb == 0U) {
-        qq_put(cpu, qd, ((uint64_t)(aneg ^ bneg) << 63), UINT64_C(0));
-        return qq_commit(cpu, pc, d, 0U);
+        return qq_publish(cpu, pc, d, 0U, qd,
+            ((uint64_t)(aneg ^ bneg) << 63), UINT64_C(0));
     }
     qq_unpack_d(a, &ua);
     qq_unpack_d(b, &ub);
     qq_mul(&ua, &ub, &neg, &exp, &shi, &slo, &g, &r, &s);
     fl = qq_pack(neg, exp, shi, slo, g, r, s, rm, &ohi, &olo);
-    qq_put(cpu, qd, ohi, olo);
-    return qq_commit(cpu, pc, d, fl);
+    return qq_publish(cpu, pc, d, fl, qd, ohi, olo);
 }
 
 sparc64_step_result_t sparc64_fp_quad(sparc64_cpu_t *cpu, uint64_t pc,
