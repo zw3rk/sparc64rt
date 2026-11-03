@@ -43,6 +43,7 @@ static int64_t libret(long r) { return r < 0L ? neg_errno() : (int64_t)r; }
 /* ---- Linux UAPI -> Darwin translation (values verified on host) ---- */
 #define RT_LINUX_AT_FDCWD (-100)
 #define RT_LINUX_AT_SYMLINK_NOFOLLOW 0x100
+#define RT_LINUX_AT_EACCESS 0x200
 static int darwin_dirfd(int d) { return d == RT_LINUX_AT_FDCWD ? AT_FDCWD : d; }
 static int darwin_atflag(int f) {
     if ((f & ~RT_LINUX_AT_SYMLINK_NOFOLLOW) != 0) { return -1; }
@@ -552,9 +553,12 @@ int64_t rt_host_linkat(int olddirfd, const char *oldpath, int newdirfd, const ch
     return libret(linkat(darwin_dirfd(olddirfd), oldpath, darwin_dirfd(newdirfd), newpath, at));
 }
 int64_t rt_host_faccessat2(int dirfd, const char *path, int mode, int flags) {
+    int at;
     if (path == NULL) { return -22; }
-    if (flags != 0 && flags != RT_LINUX_AT_SYMLINK_NOFOLLOW) { return -22; }
-    return libret(faccessat(darwin_dirfd(dirfd), path, mode, 0));
+    if ((flags & ~(RT_LINUX_AT_SYMLINK_NOFOLLOW | RT_LINUX_AT_EACCESS)) != 0) { return -22; }
+    at = ((flags & RT_LINUX_AT_SYMLINK_NOFOLLOW) != 0 ? AT_SYMLINK_NOFOLLOW : 0) |
+        ((flags & RT_LINUX_AT_EACCESS) != 0 ? AT_EACCESS : 0);
+    return libret(faccessat(darwin_dirfd(dirfd), path, mode, at));
 }
 int64_t rt_host_fchmodat(int dirfd, const char *path, uint32_t mode, int flags) {
     int at; if (path == NULL) { return -22; }

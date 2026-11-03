@@ -14,11 +14,23 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+/* macOS <sys/signal.h> (reached via <stdlib.h>) #defines sa_handler and
+ * sa_sigaction over the frozen guest sparc64_sigaction_t field names
+ * (same pattern as src/os/syscalls_ext.c); drop them here (this TU
+ * only, which never uses the host struct sigaction). */
+#ifdef sa_handler
+#undef sa_handler
+#endif
+#ifdef sa_sigaction
+#undef sa_sigaction
+#endif
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -37,6 +49,8 @@
 #endif
 
 #include "core/cpu.h"
+#include "os/guest_proc.h"
+#include "os/host_contract_interp.h"
 #include "os/sigframe_sparc64rt.h"
 #include "os/syscalls_ext.h"
 #include "os/syscalls_min.h"
@@ -125,10 +139,40 @@ static long store_stat64(const sparc64_syscall_mem_t *mem, uint64_t va,
 }
 
 static long sys_stat_path(const sparc64_syscall_mem_t *mem, const char *path,
-    int dirfd, int nofollow, uint64_t buf_va, int is64)
+    int dirfd, int host_flags, uint64_t buf_va, int is64)
 {
     struct stat h;
-    if (fstatat(dirfd, path, &h, nofollow ? AT_SYMLINK_NOFOLLOW : 0) != 0) {
+    /* S64-R12-6: /proc/self/exe stats the guest load path; any other
+     * proc-self path outside the synthetic set never reaches the
+     * host translator's proc tree. */
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        const char *exe = sparc64_guest_proc_exec_path(mem->context);
+        if (exe == NULL) {
+            return -ENOENT;
+        }
+        path = exe;
+    } else if (strcmp(path, "/proc/self") == 0 ||
+            strncmp(path, "/proc/self/", 11U) == 0) {
+        if (!sparc64_guest_proc_handles(path)) {
+            return -ENOENT;
+        }
+    }
+    /* S64-R12-5: absolute guest paths try SPARC64RT_SYSROOT first
+     * (qemu -L); ENOENT/ENOTDIR falls back to the raw path. */
+    if (path[0] == '/') {
+        char joined[L2A_PATH_MAX];
+        if (sparc64_interp_resolve(path, getenv("SPARC64RT_SYSROOT"),
+                joined, sizeof(joined)) == 0) {
+            if (fstatat(dirfd, joined, &h, host_flags) == 0) {
+                return is64 ? store_stat64(mem, buf_va, &h) :
+                    store_stat(mem, buf_va, &h);
+            }
+            if (errno != ENOENT && errno != ENOTDIR) {
+                return -(long)errno;
+            }
+        }
+    }
+    if (fstatat(dirfd, path, &h, host_flags) != 0) {
         return -(long)errno;
     }
     return is64 ? store_stat64(mem, buf_va, &h) : store_stat(mem, buf_va, &h);
@@ -159,7 +203,8 @@ long sparc64_l2a_lstat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     char path[L2A_PATH_MAX];
     long rc = l2a_copy_cstring(mem, path_va, path, (uint64_t)L2A_PATH_MAX);
     (void)ctx;
-    return (rc != 0) ? rc : sys_stat_path(mem, path, AT_FDCWD, 1, buf_va, 0);
+    return (rc != 0) ? rc :
+        sys_stat_path(mem, path, AT_FDCWD, AT_SYMLINK_NOFOLLOW, buf_va, 0);
 }
 
 long sparc64_l2a_fstat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
@@ -184,7 +229,8 @@ long sparc64_l2a_lstat64(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     char path[L2A_PATH_MAX];
     long rc = l2a_copy_cstring(mem, path_va, path, (uint64_t)L2A_PATH_MAX);
     (void)ctx;
-    return (rc != 0) ? rc : sys_stat_path(mem, path, AT_FDCWD, 1, buf_va, 1);
+    return (rc != 0) ? rc :
+        sys_stat_path(mem, path, AT_FDCWD, AT_SYMLINK_NOFOLLOW, buf_va, 1);
 }
 
 long sparc64_l2a_fstat64(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
@@ -224,8 +270,18 @@ long sparc64_l2a_fstatat64(sparc64_ctx_t *ctx,
     }
 #endif
     host_dirfd = ((int64_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd;
-    return sys_stat_path(mem, path, host_dirfd,
-        (host_flags & AT_SYMLINK_NOFOLLOW) != 0, buf_va, 1);
+#ifndef AT_EMPTY_PATH
+    /* S64-R12-3: hosts without AT_EMPTY_PATH serve an empty path with
+     * EMPTY_PATH as fstat(dirfd). */
+    if ((flags & (uint64_t)SP_AT_EMPTY_PATH) != 0U && path[0] == '\0') {
+        struct stat h;
+        if (fstat(host_dirfd, &h) != 0) {
+            return -(long)errno;
+        }
+        return store_stat64(mem, buf_va, &h);
+    }
+#endif
+    return sys_stat_path(mem, path, host_dirfd, host_flags, buf_va, 1);
 }
 
 /* statx: guest is the asm-generic 256 B layout; host via raw SYS_statx. */

@@ -146,10 +146,10 @@ uint64_t sparc64_host_errno_to_guest(long host_errno)
     case EROFS: return 30U;
     case EPIPE: return 32U;
     case ERANGE: return 34U;
-    case ENAMETOOLONG: return 36U;
+    case ENAMETOOLONG: return 63U;
     case ENOSYS: return 90U;
-    case ELOOP: return 40U;
-    case EOVERFLOW: return 75U;
+    case ELOOP: return 62U;
+    case EOVERFLOW: return 92U;
     default: break;
     }
     return (uint64_t)host_errno;

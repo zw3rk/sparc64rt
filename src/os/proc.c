@@ -841,17 +841,14 @@ long sparc64_proc_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
         flags != (uint64_t)PROC_O_CLOEXEC) {
         return -EINVAL;
     }
+    if (oldfd == newfd) {
+        return -EINVAL;
+    }
 #if defined(__linux__)
     r = dup3((int)oldfd, (int)newfd,
         (flags != UINT64_C(0)) ? O_CLOEXEC : 0);
     return (r < 0) ? -(long)errno : (long)r;
 #else
-    if (oldfd == newfd) {
-        if (fcntl((int)oldfd, F_GETFD) < 0) {
-            return -(long)errno;
-        }
-        return (long)newfd;
-    }
     r = dup2((int)oldfd, (int)newfd);
     if (r < 0) {
         return -(long)errno;

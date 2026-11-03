@@ -199,10 +199,15 @@ long sparc64_l2a_openat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         return rc;
     }
     /* Phase 5 L5a: /proc/self files are synthetic (exe/maps/cmdline/
-     * stat/auxv); anything else falls through to the host. */
+     * stat/auxv); other proc-self paths are -ENOENT, never the host
+     * translator's proc tree (S64-R12-6). */
     if (sparc64_guest_proc_handles(path)) {
         return sparc64_guest_proc_openat(mem->context, mem, path,
             host_flags);
+    }
+    if (strcmp(path, "/proc/self") == 0 ||
+            strncmp(path, "/proc/self/", 11U) == 0) {
+        return -ENOENT;
     }
     host_dirfd = ((int64_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd;
     /* Absolute guest paths try SPARC64RT_SYSROOT first (qemu -L). */
@@ -600,9 +605,7 @@ static long sys_clock_get(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     default: return -EINVAL;
     }
     if (is_res == 0 && tp_va == 0U) {
-        if (l2a_range_ok(tp_va, 16U) != 0) {
-            return -EFAULT;
-        }
+        return -EFAULT;
     } else if (tp_va != 0U) {
         if (l2a_range_ok(tp_va, 16U) != 0) {
             return -EFAULT;
