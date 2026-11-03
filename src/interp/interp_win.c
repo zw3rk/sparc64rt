@@ -531,12 +531,19 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         if (dvs == 0) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
+        /* V9 SDIV saturates: +2^63 included, it exceeds INT32_MAX. */
         if (dvd == INT64_MIN && dvs == -1) {
-            sparc64_wreg(cpu, d->rd, (uint64_t)(uint32_t)0x80000000U);
+            sparc64_wreg(cpu, d->rd, (uint64_t)UINT32_C(0x7FFFFFFF));
             return sparc64_step_ok(pc);
         }
         q = dvd / (int64_t)dvs;
-        sparc64_wreg(cpu, d->rd, (uint64_t)(int64_t)(int32_t)q);
+        if (q > (int64_t)INT32_MAX) {
+            sparc64_wreg(cpu, d->rd, (uint64_t)UINT32_C(0x7FFFFFFF));
+        } else if (q < (int64_t)INT32_MIN) {
+            sparc64_wreg(cpu, d->rd, (uint64_t)(int64_t)INT32_MIN);
+        } else {
+            sparc64_wreg(cpu, d->rd, (uint64_t)(int64_t)(int32_t)q);
+        }
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_UDIV: {
@@ -642,11 +649,13 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         if (q > (uint64_t)UINT32_C(0xFFFFFFFF)) {
             icc |= 2U;
         }
+        /* V9 A.10: xcc reads r[rd], the zero-extended saturated word,
+         * so N (bit 63) is always 0 here. */
         xcc = 0U;
-        if ((q & (UINT64_C(1) << 63)) != UINT64_C(0)) {
+        if ((((uint64_t)r32 >> 63) & UINT64_C(1)) != UINT64_C(0)) {
             xcc |= 8U;
         }
-        if (q == UINT64_C(0)) {
+        if (r32 == 0U) {
             xcc |= 4U;
         }
         sparc64_cc_set(cpu, icc, xcc);
@@ -658,16 +667,26 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
             (uint64_t)(uint32_t)a);
         int32_t dvs = (int32_t)(uint32_t)b;
         int64_t q;
+        int64_t sq;
         if (dvs == 0) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
+        /* V9 SDIVcc saturates like SDIV (+2^63 included); both cc
+         * nibbles read the saturated result. */
         if (dvd == INT64_MIN && dvs == -1) {
-            sparc64_cc_set(cpu, 8U | 2U, 8U | 2U);
-            sparc64_wreg(cpu, d->rd, (uint64_t)(uint32_t)0x80000000U);
+            sparc64_cc_set(cpu, 2U, 0U);
+            sparc64_wreg(cpu, d->rd, (uint64_t)UINT32_C(0x7FFFFFFF));
             return sparc64_step_ok(pc);
         }
         q = dvd / (int64_t)dvs;
-        r32 = (uint32_t)(uint64_t)q;
+        if (q > (int64_t)INT32_MAX) {
+            sq = (int64_t)INT32_MAX;
+        } else if (q < (int64_t)INT32_MIN) {
+            sq = (int64_t)INT32_MIN;
+        } else {
+            sq = q;
+        }
+        r32 = (uint32_t)(uint64_t)sq;
         icc = 0U;
         if ((r32 & UINT32_C(0x80000000)) != UINT32_C(0)) {
             icc |= 8U;
@@ -675,18 +694,18 @@ sparc64_step_result_t sparc64_exec_alu(sparc64_cpu_t *cpu, uint64_t pc,
         if (r32 == 0U) {
             icc |= 4U;
         }
-        if (q != (int64_t)(int32_t)r32) {
+        if (q != sq) {
             icc |= 2U;
         }
         xcc = 0U;
-        if (q < 0) {
+        if (sq < 0) {
             xcc |= 8U;
         }
-        if (q == 0) {
+        if (sq == 0) {
             xcc |= 4U;
         }
         sparc64_cc_set(cpu, icc, xcc);
-        sparc64_wreg(cpu, d->rd, (uint64_t)(int64_t)(int32_t)r32);
+        sparc64_wreg(cpu, d->rd, (uint64_t)sq);
         return sparc64_step_ok(pc);
     }
     case SPARC64_OP3_TADDCC:

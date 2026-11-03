@@ -772,12 +772,9 @@ sparc64_step_result_t sparc64_exec_atomic(sparc64_cpu_t *cpu,
             return sparc64_trap(SPARC64_TRAP_LOAD_MISALIGNED, pc, va);
         }
     }
-    /* L4b: single-copy host-__atomic fast path on the shared mapping
-     * first; anything it declines (unmapped, page-crossing,
-     * non-data ASI) falls through to the reservation path unchanged. */
-    if (sparc64_threads_try_host_atomic(cpu, mc, pc, d, &res)) {
-        return res;
-    }
+    /* S64-R7-24 follow-up: ASI validation (including the no-fault
+     * rejection) precedes the host fast path, so a no-fault atomic
+     * never reaches it. */
     sparc64_dec_t dd = *d;
     if (dd.regasi != 0U) {
         dd.asi = asi_resolve(cpu, d);
@@ -787,6 +784,12 @@ sparc64_step_result_t sparc64_exec_atomic(sparc64_cpu_t *cpu,
     }
     if (alt && asi_is_nofault(dd.asi)) {
         return sparc64_trap(SPARC64_TRAP_STORE_ACCESS, pc, va);
+    }
+    /* L4b: single-copy host-__atomic fast path on the shared mapping;
+     * anything it declines (unmapped, page-crossing, non-data ASI)
+     * falls through to the reservation path unchanged. */
+    if (sparc64_threads_try_host_atomic(cpu, mc, pc, d, &res)) {
+        return res;
     }
     if (d->cls == (uint8_t)SPARC64_ICLS_LDSTUB) {
         if (!sparc64_swap(mem, mc, va, 1U, little, UINT64_C(0xFF), &old, &res,

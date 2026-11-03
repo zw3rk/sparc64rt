@@ -840,12 +840,12 @@ bool sparc64_threads_try_host_atomic(sparc64_cpu_t *cpu, void *mc,
     default:
         return false;
     }
+    /* No-fault ASIs never take the host fast path: exec_atomic rejects
+     * them first, and this stays declined even if reached directly. */
     asi = d->asi;
-    if (asi == (unsigned)SPARC64_ASI_P ||
-        asi == (unsigned)SPARC64_ASI_PNF) {
+    if (asi == (unsigned)SPARC64_ASI_P) {
         little = 0;
-    } else if (asi == (unsigned)SPARC64_ASI_PL ||
-        asi == (unsigned)SPARC64_ASI_PNFL) {
+    } else if (asi == (unsigned)SPARC64_ASI_PL) {
         little = 1;
     } else {
         return false;

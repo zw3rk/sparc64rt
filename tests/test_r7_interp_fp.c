@@ -271,6 +271,28 @@ static void t_r7_32_dtoi(void)
     R7_CHECK(res.kind == SPARC64_STEP_CONTINUE);
     R7_CHECK(cpu.fp.f[3] == UINT32_C(0x80000000));
     R7_CHECK((cpu.fsr & UINT64_C(0x1F)) == UINT64_C(0));
+    /* Quad -2147483648.5 truncates to INT32_MIN with NX alone. */
+    sparc64_cpu_init(&cpu, R7_CODE);
+    cpu.fp.d[4] = UINT64_C(0xC01E000000010000);
+    cpu.fp.d[5] = UINT64_C(0);
+    cpu.fp.f[3] = UINT32_C(0);
+    r7_poke32(R7_CODE, r7_fpop(0x34U, 2U, 0U, 0x0D3U, 8U));
+    r7_poke32(R7_CODE + 4U, 0x01000000U);
+    res = r7_step(&cpu, R7_CODE, &r7_ops);
+    R7_CHECK(res.kind == SPARC64_STEP_CONTINUE);
+    R7_CHECK(cpu.fp.f[3] == UINT32_C(0x80000000));
+    R7_CHECK((cpu.fsr & UINT64_C(0x1F)) == UINT64_C(0x01));
+    /* Quad -(2^63 + 0.5) truncates to INT64_MIN with NX alone. */
+    sparc64_cpu_init(&cpu, R7_CODE);
+    cpu.fp.d[4] = UINT64_C(0xC03E000000000000);
+    cpu.fp.d[5] = UINT64_C(0x0001000000000000);
+    cpu.fp.d[1] = UINT64_C(0);
+    r7_poke32(R7_CODE, r7_fpop(0x34U, 2U, 0U, 0x083U, 8U));
+    r7_poke32(R7_CODE + 4U, 0x01000000U);
+    res = r7_step(&cpu, R7_CODE, &r7_ops);
+    R7_CHECK(res.kind == SPARC64_STEP_CONTINUE);
+    R7_CHECK(cpu.fp.d[1] == UINT64_C(0x8000000000000000));
+    R7_CHECK((cpu.fsr & UINT64_C(0x1F)) == UINT64_C(0x01));
 }
 
 static void t_r7_6_fqtos(void)

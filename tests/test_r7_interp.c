@@ -27,7 +27,9 @@ sparc64_tlb_entry_t sparc64_dbt_tlb[SPARC64_TLB_SIZE]
     __attribute__((aligned(32)));
 
 /* The host-atomic fast path is out of scope here: decline everything so
- * the generic CAS/SWAP substrates (the R7-10/27/28 fix sites) run. */
+ * the generic CAS/SWAP substrates (the R7-10/27/28 fix sites) run. The
+ * call counter proves exec_atomic ordering (S64-R7-24 follow-up). */
+static unsigned long r7_host_atomic_calls;
 bool sparc64_threads_try_host_atomic(sparc64_cpu_t *cpu, void *mc,
     uint64_t pc, const sparc64_dec_t *d, sparc64_step_result_t *out)
 {
@@ -36,6 +38,7 @@ bool sparc64_threads_try_host_atomic(sparc64_cpu_t *cpu, void *mc,
     (void)pc;
     (void)d;
     (void)out;
+    r7_host_atomic_calls++;
     return false;
 }
 
@@ -319,6 +322,25 @@ static void t_r7_11_tagged(void)
     R7_CHECK(cpu.ccr == UINT64_C(0x02));
 }
 
+static void r7_div_case(unsigned op3, uint64_t y, uint64_t a, uint32_t simm,
+    uint64_t want_rd, uint64_t want_ccr, int want_cc)
+{
+    sparc64_cpu_t cpu;
+    sparc64_step_result_t res;
+    memset(r7_mem, 0, sizeof(r7_mem));
+    sparc64_cpu_init(&cpu, R7_CODE);
+    cpu.y = y;
+    cpu.r[8] = a;
+    r7_poke32(R7_CODE, r7_f3(op3, 10U, 8U, 1U, simm));
+    r7_poke32(R7_CODE + 4U, 0x01000000U);
+    res = r7_step(&cpu, R7_CODE, &r7_ops);
+    R7_CHECK(res.kind == SPARC64_STEP_CONTINUE);
+    R7_CHECK(cpu.r[10] == want_rd);
+    if (want_cc != 0) {
+        R7_CHECK(cpu.ccr == want_ccr);
+    }
+}
+
 static void t_r7_13_div(void)
 {
     /* S64-R7-13: UDIV saturates, SDIV sign-extends, cc nibbles split. */
@@ -361,6 +383,15 @@ static void t_r7_13_div(void)
     R7_CHECK(res.kind == SPARC64_STEP_CONTINUE);
     R7_CHECK(cpu.r[10] == UINT64_C(0xFFFFFFFFFFFFFFFF));
     R7_CHECK(cpu.ccr == UINT64_C(0x88));
+    /* Follow-up: SDIV saturates; cc reads the saturated rd. New defect
+     * 1: UDIVcc xcc.N is r[rd]<63> (0), not the raw quotient<63>. */
+    r7_div_case(0x0FU, 1U, 0U, 1U, 0x7FFFFFFFU, 0U, 0);
+    r7_div_case(0x0FU, 0xFFFFFFFFU, 0U, 1U, 0xFFFFFFFF80000000U, 0U, 0);
+    r7_div_case(0x0FU, 0x80000000U, 0U, 0x1FFFU, 0x7FFFFFFFU, 0U, 0);
+    r7_div_case(0x1FU, 1U, 0U, 1U, 0x7FFFFFFFU, 0x02U, 1);
+    r7_div_case(0x1FU, 0xFFFFFFFFU, 0U, 1U, 0xFFFFFFFF80000000U, 0x8AU, 1);
+    r7_div_case(0x1FU, 0x80000000U, 0U, 0x1FFFU, 0x7FFFFFFFU, 0x02U, 1);
+    r7_div_case(0x1EU, 0x80000000U, 0U, 1U, 0xFFFFFFFFU, 0x0AU, 1);
 }
 
 static void t_r7_14_mulscc(void)
@@ -540,6 +571,21 @@ static void t_r7_24_nofault(void)
     R7_CHECK(res.kind == SPARC64_STEP_TRAP);
     R7_CHECK(res.cause == SPARC64_TRAP_STORE_ACCESS);
     R7_CHECK(r7_peek32(R7_DATA) == 0x00000000U);
+    /* Follow-up: a no-fault CASA traps before the host fast path. */
+    r7_host_atomic_calls = 0UL;
+    sparc64_cpu_init(&cpu, R7_CODE);
+    cpu.r[8] = R7_DATA;
+    cpu.r[9] = UINT64_C(1);
+    cpu.r[10] = UINT64_C(5);
+    r7_poke32(R7_DATA, 0x00000001U);
+    r7_poke32(R7_CODE, r7_f3m(0x3CU, 10U, 8U, 0U, 0x1049U));
+    r7_poke32(R7_CODE + 4U, 0x01000000U);
+    res = r7_step(&cpu, R7_CODE, &r7_ops);
+    R7_CHECK(res.kind == SPARC64_STEP_TRAP);
+    R7_CHECK(res.cause == SPARC64_TRAP_STORE_ACCESS);
+    R7_CHECK(r7_host_atomic_calls == 0UL);
+    R7_CHECK(cpu.r[10] == UINT64_C(5));
+    R7_CHECK(r7_peek32(R7_DATA) == 0x00000001U);
 }
 
 static void t_r7_25_ldd(void)
@@ -617,8 +663,10 @@ static void t_r7_28_casa32(void)
         r7_poke32(R7_DATA, 0x00000001U);
         r7_poke32(R7_CODE, r7_f3m(0x3CU, 10U, 8U, 0U, 0x1009U));
         r7_poke32(R7_CODE + 4U, 0x01000000U);
+        r7_host_atomic_calls = 0UL;
         res = r7_step(&cpu, R7_CODE, ops);
         R7_CHECK(res.kind == SPARC64_STEP_CONTINUE);
+        R7_CHECK(r7_host_atomic_calls == 1UL);
         R7_CHECK(r7_peek32(R7_DATA) == 0x00000005U);
         R7_CHECK(cpu.r[10] == UINT64_C(1));
     }

@@ -607,14 +607,21 @@ static sparc64_step_result_t qc_qtoi(sparc64_cpu_t *cpu, uint64_t pc,
             : UINT64_C(0x7FFFFFFFFFFFFFFF));
     }
     if (exp == (int)limit) {
-        /* Only the exact negative endpoint -2^limit is representable. */
+        /* Truncation toward zero keeps -2^limit whenever the integer
+         * part is exactly 2^limit (top `limit` fraction bits clear);
+         * a nonzero fraction then sets NX alone (S64-R7-32). */
         uint64_t fh = ahi & UINT64_C(0xFFFFFFFFFFFF);
-        if ((neg != 0U) && (fh == UINT64_C(0)) && (alo == UINT64_C(0))) {
-            if (bits == 32U) {
-                return qc_publish_i32(cpu, pc, d, 0U,
-                    UINT32_C(0x80000000));
-            }
-            return qc_publish_i64(cpu, pc, d, 0U,
+        if ((neg != 0U) && (bits == 32U) &&
+            ((fh >> 17) == UINT64_C(0))) {
+            bool inx = ((fh & UINT64_C(0x1FFFF)) != UINT64_C(0)) ||
+                (alo != UINT64_C(0));
+            return qc_publish_i32(cpu, pc, d, inx ? 0x01U : 0U,
+                UINT32_C(0x80000000));
+        }
+        if ((neg != 0U) && (bits != 32U) && (fh == UINT64_C(0)) &&
+            ((alo >> 49) == UINT64_C(0))) {
+            bool inx = alo != UINT64_C(0);
+            return qc_publish_i64(cpu, pc, d, inx ? 0x01U : 0U,
                 UINT64_C(0x8000000000000000));
         }
         if (bits == 32U) {
