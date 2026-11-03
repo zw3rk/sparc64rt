@@ -89,11 +89,6 @@
 #define SP_FUTEX_WAIT 0U
 #define SP_FUTEX_WAKE 1U
 
-/* SPARC rt_sigprocmask how values (NOT the generic 0/1/2). */
-#define SP_SIG_BLOCK 1U
-#define SP_SIG_UNBLOCK 2U
-#define SP_SIG_SETMASK 4U
-
 /* SP_AT_* live in syscalls_ext.h (shared with syscalls_dirent.c). */
 
 #define SP_CLOCK_REALTIME 0U
@@ -240,9 +235,14 @@ long sparc64_l2a_getgid(void) { return (long)getgid(); }
 static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t fd, uint64_t iov_va, uint64_t iovcnt, int is_write)
 {
+    struct l2a_iov_entry {
+        uint64_t base;
+        uint64_t len;
+    };
     uint64_t total = 0;
     uint64_t i = 0;
     uint8_t *buf = NULL;
+    struct l2a_iov_entry *vec = NULL;
     uint64_t off = 0;
     ssize_t got;
     (void)ctx;
@@ -258,48 +258,57 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     if (l2a_range_ok(iov_va, iovcnt * 16U) != 0) {
         return -EFAULT;
     }
+    vec = (struct l2a_iov_entry *)malloc((size_t)iovcnt *
+        sizeof(struct l2a_iov_entry));
+    if (vec == NULL) {
+        return -ENOMEM;
+    }
     for (i = 0U; i < iovcnt; i++) {
         uint8_t e[16];
         uint64_t len;
         uint64_t base;
         if (!mem->read(mem->context, iov_va + i * 16U, e,
                 (uint64_t)sizeof(e))) {
+            free(vec);
             return -EFAULT;
         }
         base = l2a_get_be64(e);
         len = l2a_get_be64(e + 8);
         if (l2a_range_ok(base, len) != 0) {
+            free(vec);
             return -EFAULT;
         }
         if (len > UINT64_C(0) && total > UINT64_MAX - len) {
+            free(vec);
             return -EINVAL;
         }
         total += len;
+        vec[i].base = base;
+        vec[i].len = len;
     }
     if (total == 0U) {
+        free(vec);
         return 0;
     }
     if (total > (uint64_t)SIZE_MAX) {
+        free(vec);
         return -EINVAL;
     }
     buf = (uint8_t *)malloc((size_t)total);
     if (buf == NULL) {
+        free(vec);
         return -ENOMEM;
     }
     if (is_write) {
         for (i = 0U; i < iovcnt; i++) {
-            uint8_t e[16];
-            uint64_t base = 0;
-            uint64_t len = 0;
-            (void)mem->read(mem->context, iov_va + i * 16U, e,
-                (uint64_t)sizeof(e));
-            base = l2a_get_be64(e);
-            len = l2a_get_be64(e + 8);
+            uint64_t base = vec[i].base;
+            uint64_t len = vec[i].len;
             if (len == 0U) {
                 continue;
             }
             if (!mem->read(mem->context, base, buf + off, len)) {
                 free(buf);
+                free(vec);
                 return -EFAULT;
             }
             off += len;
@@ -309,6 +318,7 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
          * table + truncate dispatch exist. */
         got = write((int)fd, buf, (size_t)total);
         free(buf);
+        free(vec);
         if (got < 0) {
             return -(long)errno;
         }
@@ -317,22 +327,19 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     got = read((int)fd, buf, (size_t)total);
     if (got < 0) {
         free(buf);
+        free(vec);
         return -(long)errno;
     }
     if (got == 0) {
         free(buf);
+        free(vec);
         return 0;
     }
     off = 0;
     for (i = 0U; i < iovcnt && off < (uint64_t)got; i++) {
-        uint8_t e[16];
-        uint64_t base = 0;
-        uint64_t len = 0;
+        uint64_t base = vec[i].base;
+        uint64_t len = vec[i].len;
         uint64_t want;
-        (void)mem->read(mem->context, iov_va + i * 16U, e,
-            (uint64_t)sizeof(e));
-        base = l2a_get_be64(e);
-        len = l2a_get_be64(e + 8);
         if (len == 0U) {
             continue;
         }
@@ -343,11 +350,13 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
         if (!mem->prepare_write(mem->context, base, want) ||
             !mem->write(mem->context, base, buf + off, want)) {
             free(buf);
+            free(vec);
             return (off != 0U) ? (long)off : -EFAULT;
         }
         off += want;
     }
     free(buf);
+    free(vec);
     return (long)off;
 }
 
