@@ -651,6 +651,10 @@ long sparc64_guest_proc_readlinkat(void *guest,
     if (sparc64_guest_proc_handles(path)) {
         return -EINVAL; /* Synthetic regular files, not links. */
     }
+    if (strcmp(path, "/proc/self") == 0 ||
+            strncmp(path, "/proc/self/", 11U) == 0) {
+        return -ENOENT;
+    }
     if (bufsz == 0U) {
         return 0;
     }
