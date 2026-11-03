@@ -65,15 +65,15 @@
 /* Guest robust-list head size (glibc robust_head, 24 bytes). */
 #define THR_ROBUST_LEN 24U
 
-/* Max guest threads (slot 0 is the main thread). */
-#define THR_MAX_THREADS 64U
+/* Table capacity lives in os/threads.h (shared with threads_fork.c). */
 
 /* First guest tid handed to spawned threads (real pids never reach it). */
 #define THR_FIRST_TID 0x40000000UL
 
 static pthread_mutex_t thr_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t thr_big_lock = PTHREAD_MUTEX_INITIALIZER;
-static sparc64_thread_t thr_table[THR_MAX_THREADS];
+/* Exported to threads_fork.c (declared in os/threads.h). */
+sparc64_thread_t thr_table[THR_MAX_THREADS];
 static int thr_booted = 0;
 static int thr_engine = 0;
 static const sparc64_syscall_mem_t *thr_ops = NULL;
@@ -91,7 +91,7 @@ static void thr_grow_stack(void *mc)
 {
     guest_state_t *g = (guest_state_t *)mc;
     /* Same top the loader uses in guest_stack.c (top tasks page). */
-    uint64_t stack_top = SPARC64_TASK_SIZE - SPARC64_PAGE_SIZE;
+    uint64_t stack_top = SPARC64_TASK_SIZE - UINT64_C(8192);
     uint64_t want_base;
     uint64_t size;
     uint64_t hole = UINT64_C(0);

@@ -15,8 +15,11 @@
 #include <stdint.h>
 
 #include "core/cpu.h"
+#include "dbt/dbt.h"
+#include "dbt/mem_sites.h"
 #include "os/guest_run_priv.h"
 #include "os/mem_space.h"
+#include "vm/vm64.h"
 
 /* File-range COW promotion (guest_run_sysmem_file.c): mirrors the
  * substrate's private_cow promotion in the per-chunk registry states. */
@@ -75,6 +78,14 @@ static bool guest_mem_write(void *context, uint64_t address,
      * COW_CLEAN chunks (covers interp, DBT slow-path, and difftest;
      * the DBT fast path never reaches file pages). */
     sysmem_file_note_write(g, address, (uint64_t)size);
+    /* S64-R9-3: a store onto a code-bearing page must evict the
+     * writable Soft-TLB tags, invalidate overlapping DBT blocks, and
+     * bump the code generation (mapping paths do all three). */
+    sparc64_tlb_evict_writes(address, (uint64_t)size);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, address, (uint64_t)size);
+    }
+    vm64_code_epoch_bump();
     return true;
 }
 
@@ -97,6 +108,14 @@ static bool guest_mem_atomic(void *context,
         (request->op != SPARC64_ATOMIC_SC || result->sc_success)) {
         sysmem_file_note_write(g, request->address,
             (uint64_t)request->width);
+        /* S64-R9-3: mutating atomics are stores for SMC purposes. */
+        sparc64_tlb_evict_writes(request->address,
+            (uint64_t)request->width);
+        if (g->dbt != NULL) {
+            sparc64_dbt_invalidate(g->dbt, request->address,
+                (uint64_t)request->width);
+        }
+        vm64_code_epoch_bump();
     }
     return true;
 }

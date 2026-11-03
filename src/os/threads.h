@@ -43,6 +43,11 @@
 #define SPARC64_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
 #define SPARC64_CLONE_CHILD_SETTID UINT64_C(0x1000000)
 
+/* Table capacity (slot 0 is the main thread). Moved here from
+ * threads.c so the fork-child reset in threads_fork.c shares the
+ * bound; storage still lives in threads.c. */
+#define THR_MAX_THREADS 64U
+
 /* One guest thread. ctx_ref points at the live context (the main thread's
  * runner-owned ctx, or ctx below for spawned threads); engine selects the
  * run loop the thread entry uses. */
@@ -66,6 +71,16 @@ struct sparc64_thread {
  * Called by the engine loops before any guest code runs. */
 void sparc64_threads_boot(const sparc64_syscall_mem_t *ops, int engine,
     sparc64_ctx_t *main_ctx);
+
+/* Table storage (threads.c). The fork-child reset below is the only
+ * cross-TU writer. */
+extern sparc64_thread_t thr_table[THR_MAX_THREADS];
+
+/* Fork-child reset (threads_fork.c; proc.c calls this on the child leg
+ * of fork/vfork/clone-noVM): drops every slot except the calling
+ * context so ghost parent threads do not linger as used/running in
+ * the child. space_ctx re-homes the survivor when it had no slot. */
+void sparc64_threads_note_fork_child(sparc64_ctx_t *ctx, void *space_ctx);
 
 /* Big guest lock: serializes interp/DBT execution (shared winfile and
  * shared space metadata). Held across whole engine runs; dropped only

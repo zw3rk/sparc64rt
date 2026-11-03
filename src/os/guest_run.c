@@ -208,8 +208,14 @@ static long sysmem_brk(void *context, uint64_t addr)
                                false)) {
             return (long)g->brk_cur;
         }
+        /* S64-R9-2: growth maps fresh heap backings; drop Soft-TLB
+         * coverage of the delta next to the DBT flush below. */
+        sparc64_tlb_invalidate_gva(cur, target - cur);
     } else if (target < cur) {
         (void)sparc64_space_unmap(&g->space, target, cur - target);
+        /* S64-R9-2: shrink frees heap backings while live Soft-TLB
+         * entries still carry addends at the freed bytes. */
+        sparc64_tlb_invalidate_gva(target, cur - target);
     }
     g->brk_cur = addr;
     if (g->dbt != NULL && target != cur) {

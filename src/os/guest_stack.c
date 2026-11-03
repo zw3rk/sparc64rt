@@ -30,7 +30,7 @@
 #include "os/mem_space.h"
 
 /* ---- Stack ABI constants (SPARC Linux, arch/sparc) ---------------------- */
-#define GUEST_STACK_TOP UINT64_C(0x7ffffffff000)
+#define GUEST_STACK_TOP UINT64_C(0x7fffffffe000)
 #define GUEST_STACK_MAX UINT64_C(0x800000)
 #define GUEST_MAX_ENVC 512U
 #define GUEST_MAX_STRING_BYTES ((uint64_t)131072)

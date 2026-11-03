@@ -86,6 +86,11 @@
 extern long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     uint64_t old_size, uint64_t new_size, unsigned flags,
     uint64_t new_addr);
+/* Guest madvise(75) lives in src/os/guest_run_sysmem.c next to the
+ * other VM syscalls; the advice stays 64-bit so no high bit is lost
+ * before validation (S64-R9-6). */
+extern long sparc64_sysmem_madvise(void *context, uint64_t addr,
+    uint64_t len, uint64_t advice);
 
 /* Process-wide dispatch tally for --stats (Phase 6, L6a). Guest
  * execution is serialized under the big lock, but blocking syscalls
@@ -622,19 +627,37 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         ret = mem->do_brk(mem->context, o0);
         break;
     case (long)SPARC64__NR_mmap:
-        ret = mem->do_mmap(mem->context, o0, o1, (unsigned)o2,
-                           (unsigned)o3, (int)o4, o5);
+        /* S64-R9-7: the full 64-bit prot/flags validate before the
+         * narrowing cast; a high bit is -EINVAL, never truncation. */
+        if ((o2 & UINT64_C(0xffffffff00000000)) != UINT64_C(0) ||
+            (o3 & UINT64_C(0xffffffff00000000)) != UINT64_C(0)) {
+            ret = -EINVAL;
+        } else {
+            ret = mem->do_mmap(mem->context, o0, o1, (unsigned)o2,
+                               (unsigned)o3, (int)o4, o5);
+        }
         break;
     case (long)SPARC64__NR_munmap:
         ret = mem->do_munmap(mem->context, o0, o1);
         break;
     case (long)SPARC64__NR_mprotect:
-        ret = mem->do_mprotect(mem->context, o0, o1, (unsigned)o2);
+        if ((o2 & UINT64_C(0xffffffff00000000)) != UINT64_C(0)) {
+            ret = -EINVAL;
+        } else {
+            ret = mem->do_mprotect(mem->context, o0, o1, (unsigned)o2);
+        }
+        break;
+    case (long)SPARC64__NR_madvise:
+        ret = sparc64_sysmem_madvise(mem->context, o0, o1, o2);
         break;
     /* Lane A2: mremap(250), truncate(129/77), ftruncate(130/84). */
     case (long)SPARC64__NR_mremap:
-        ret = sparc64_sysmem_mremap(mem->context, o0, o1, o2,
-            (unsigned)o3, o4);
+        if ((o3 & UINT64_C(0xffffffff00000000)) != UINT64_C(0)) {
+            ret = -EINVAL;
+        } else {
+            ret = sparc64_sysmem_mremap(mem->context, o0, o1, o2,
+                (unsigned)o3, o4);
+        }
         break;
     case (long)SPARC64__NR_truncate:
     case (long)SPARC64__NR_truncate64:

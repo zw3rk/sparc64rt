@@ -49,6 +49,19 @@
 #define SYSMEM_MAP_PRIVATE 0x02U
 #define SYSMEM_MAP_FIXED 0x10U
 #define SYSMEM_MAP_ANONYMOUS 0x20U
+/* SPARC Linux mmap flag values (arch/sparc asm/mman.h) accepted
+ * alongside the four above; anything else is -EINVAL (S64-R9-5). */
+#define SYSMEM_MAP_NORESERVE 0x40U
+#define SYSMEM_MAP_DENYWRITE 0x0800U
+#define SYSMEM_MAP_EXECUTABLE 0x1000U
+#define SYSMEM_MAP_POPULATE 0x8000U
+#define SYSMEM_MAP_STACK 0x20000U
+#define SYSMEM_MAP_FIXED_NOREPLACE 0x100000U
+#define SYSMEM_MAP_KNOWN \
+    (SYSMEM_MAP_SHARED | SYSMEM_MAP_PRIVATE | SYSMEM_MAP_FIXED | \
+     SYSMEM_MAP_ANONYMOUS | SYSMEM_MAP_FIXED_NOREPLACE | \
+     SYSMEM_MAP_NORESERVE | SYSMEM_MAP_DENYWRITE | \
+     SYSMEM_MAP_EXECUTABLE | SYSMEM_MAP_POPULATE | SYSMEM_MAP_STACK)
 /* Linux mremap(2) flags (asm-generic, same on SPARC). */
 #define SYSMEM_MREMAP_MAYMOVE 1u
 #define SYSMEM_MREMAP_FIXED 2u
@@ -89,6 +102,14 @@ bool sparc64_sysmem_write(void *context, uint64_t va, const void *host,
     /* RC-U4 #5: syscall copyout (read/recv into guest buffers) dirties
      * file pages exactly like guest stores do. */
     sysmem_file_note_write(g, va, len);
+    /* S64-R9-3: copyout onto a code-bearing page is SMC like any
+     * store: evict writable Soft-TLB tags, invalidate DBT blocks,
+     * and bump the code generation. */
+    sparc64_tlb_evict_writes(va, len);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, va, len);
+    }
+    vm64_code_epoch_bump();
     return true;
 }
 
@@ -141,6 +162,10 @@ static long sysmem_space_op(void *ctx)
         return -EINVAL;
     }
 }
+
+/* Free-span probe (defined next to mremap below): true when no page in
+ * [base, base + len) is mapped. Needed by the mmap NOREPLACE arm. */
+static bool sysmem_span_free(guest_state_t *g, uint64_t base, uint64_t len);
 
 /* Resolve the mapping base: MAP_FIXED uses addr verbatim, otherwise the
  * first hole at/above addr (falling back to MMAP_BASE below the stack). */
@@ -234,6 +259,10 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
          (SYSMEM_MAP_PRIVATE | SYSMEM_MAP_SHARED))) {
         return -EINVAL;
     }
+    /* S64-R9-5: unknown MAP_* bits are -EINVAL, not silent hints. */
+    if ((flags & ~SYSMEM_MAP_KNOWN) != 0U) {
+        return -EINVAL;
+    }
     if ((flags & SYSMEM_MAP_ANONYMOUS) == 0U) {
         /* File-backed: pread probe validates fd readability. */
         uint8_t probe;
@@ -242,7 +271,20 @@ long sparc64_sysmem_mmap(void *context, uint64_t addr, uint64_t len,
             return -(long)errno;
         }
     }
-    {
+    if ((flags & SYSMEM_MAP_FIXED_NOREPLACE) != 0U) {
+        /* S64-R9-5: FIXED_NOREPLACE pins addr like FIXED but reports
+         * -EEXIST when the span is occupied, never hinting elsewhere. */
+        if ((addr & SYSMEM_PAGE_MASK) != 0U || addr == 0U ||
+            addr >= SPARC64_TASK_SIZE ||
+            size > SPARC64_TASK_SIZE - addr) {
+            return -EINVAL;
+        }
+        if (!sysmem_span_free(g, addr, size)) {
+            return -EEXIST;
+        }
+        base = addr;
+        flags |= SYSMEM_MAP_FIXED;
+    } else {
         long rc = sysmem_resolve_base(g, addr, size, flags, &base);
         if (rc != 0) {
             return rc;
@@ -581,6 +623,10 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     old_len = sysmem_align_up(old_size, GUEST_PAGE_SIZE);
     new_len = sysmem_align_up(new_size, GUEST_PAGE_SIZE);
     if (new_len == old_len && (flags & SYSMEM_MREMAP_FIXED) == 0U) {
+        /* S64-R9-4: the shortcut still needs a mapped source. */
+        if (!sysmem_span_perms(g, old_addr, old_len, &perms)) {
+            return -EFAULT;
+        }
         return (long)old_addr;
     }
     if ((flags & SYSMEM_MREMAP_FIXED) != 0U) {
@@ -778,5 +824,77 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
     sysmem_file_snapshot_discard(snap, snap_cap);
     (void)vm64_stxn_commit(dest, new_len);
     return (long)dest;
+}
+
+/* Guest madvise(75) on the 8 KiB ABI granule (S64-R9-6): 8 KiB-aligned
+ * addr (-EINVAL), zero length succeeds, benign advices validate and
+ * return 0, DONTNEED zeroes (with COW promotion) and runs the SMC
+ * sequence, unknown advices are -EINVAL, holes are -ENOMEM. */
+#define SYSMEM_MADV_NORMAL 0U
+#define SYSMEM_MADV_RANDOM 1U
+#define SYSMEM_MADV_SEQUENTIAL 2U
+#define SYSMEM_MADV_WILLNEED 3U
+#define SYSMEM_MADV_DONTNEED 4U
+#define SYSMEM_MADV_DONTFORK 10U
+long sparc64_sysmem_madvise(void *context, uint64_t addr, uint64_t len,
+    uint64_t advice)
+{
+    guest_state_t *g = (guest_state_t *)context;
+    uint64_t size;
+    uint64_t off;
+    unsigned perms = 7U;
+    if (g == NULL) {
+        return -EFAULT;
+    }
+    if ((addr & (GUEST_PAGE_SIZE - UINT64_C(1))) != UINT64_C(0)) {
+        return -EINVAL;
+    }
+    if (len == 0U) {
+        return 0;
+    }
+    switch (advice) {
+    case (uint64_t)SYSMEM_MADV_NORMAL:
+    case (uint64_t)SYSMEM_MADV_RANDOM:
+    case (uint64_t)SYSMEM_MADV_SEQUENTIAL:
+    case (uint64_t)SYSMEM_MADV_WILLNEED:
+    case (uint64_t)SYSMEM_MADV_DONTNEED:
+    case (uint64_t)SYSMEM_MADV_DONTFORK:
+        break;
+    default:
+        return -EINVAL;
+    }
+    if (addr >= SPARC64_TASK_SIZE || len > SPARC64_TASK_SIZE - addr) {
+        return -ENOMEM;
+    }
+    size = sysmem_align_up(len, GUEST_PAGE_SIZE);
+    if (size == 0U || size > SPARC64_TASK_SIZE - addr) {
+        return -ENOMEM;
+    }
+    if (!sysmem_span_perms(g, addr, size, &perms)) {
+        return -ENOMEM;
+    }
+    if (advice != (uint64_t)SYSMEM_MADV_DONTNEED) {
+        return 0;
+    }
+    if ((perms & (unsigned)SPARC64_MEM_WRITE) != 0U) {
+        uint8_t zeros[512] = { 0 };
+        for (off = 0U; off < size; off += (uint64_t)sizeof(zeros)) {
+            uint64_t chunk = size - off;
+            if (chunk > (uint64_t)sizeof(zeros)) {
+                chunk = (uint64_t)sizeof(zeros);
+            }
+            if (!sparc64_space_write(&g->space, addr + off, zeros,
+                    (size_t)chunk)) {
+                return -ENOMEM;
+            }
+        }
+        sysmem_file_note_write(g, addr, size);
+    }
+    sparc64_tlb_evict_writes(addr, size);
+    if (g->dbt != NULL) {
+        sparc64_dbt_invalidate(g->dbt, addr, size);
+    }
+    vm64_code_epoch_bump();
+    return 0;
 }
 

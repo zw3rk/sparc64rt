@@ -40,6 +40,7 @@
 #include "dbt/mem_sites.h"
 #include "os/sync_sig.h"
 #include "os/syscalls_ext.h"
+#include "os/threads.h"
 
 /* Exposed by the translator runtime (musl/static libc): build_stack
  * consumes it for the initial environment, and execve swaps it for the
@@ -152,6 +153,10 @@ static long proc_do_fork(sparc64_ctx_t *ctx,
          * Misses re-resolve against the child's (initially shared)
          * mappings, so this is pure correctness, not a slow path. */
         sparc64_tlb_init();
+        /* S64-R9-8: host fork cloned only the calling thread; reset
+         * every other thread slot so ghost parent threads do not
+         * linger as used/running in the child. */
+        sparc64_threads_note_fork_child(ctx, mem->context);
         ctx->r[SPARC64_O1] = UINT64_C(1);
         if ((set_flags & (uint64_t)PROC_CLONE_CHILD_SETTID) != UINT64_C(0) &&
             child_tid_va != UINT64_C(0)) {
