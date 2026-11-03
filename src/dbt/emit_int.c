@@ -436,6 +436,7 @@ static bool e_emit_wrasr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         sb_ldst_imm(b, false, true, ES0, ECTX, SPARC64_CTX_CCR_OFFSET);
         break;
     case SPARC64_ASR_ASI:
+        sb_ubfm(b, false, ES1, ES1, 0U, 7U);
         sb_ldst_imm(b, false, false, ES1, ECTX, E_OFF_ASI);
         break;
     case SPARC64_ASR_FPRS:
@@ -460,7 +461,12 @@ static bool e_emit_align(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     sb_ldst_imm(b, true, true, ES2, ECTX, E_OFF_GSR);
     sb_ubfm(b, true, ES2, ES2, 3U, 63U);
     sb_ubfm(b, true, ES2, ES2, 61U, 60U);
-    sb_ubfm(b, false, ES1, ES0, 0U, 2U);
+    if (d->opf == SPARC64_OPF_ALIGNADDRL) {
+        sb_sub_reg(b, true, false, ES1, 31U, ES0);
+        sb_ubfm(b, false, ES1, ES1, 0U, 2U);
+    } else {
+        sb_ubfm(b, false, ES1, ES0, 0U, 2U);
+    }
     sb_orr_reg(b, true, ES2, ES2, ES1);
     sb_ldst_imm(b, false, true, ES2, ECTX, E_OFF_GSR);
     sb_ubfm(b, true, ES0, ES0, 3U, 63U);
@@ -671,9 +677,10 @@ static bool e_emit_alu(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         return e_emit_alu_helper(ec, d);
     case SPARC64_OP3_ADDCC:
     case SPARC64_OP3_SUBCC:
+        return e_emit_addsubcc(ec, d);
     case SPARC64_OP3_ADDXCC:
     case SPARC64_OP3_SUBXCC:
-        return e_emit_addsubcc(ec, d);
+        return e_emit_alu_helper(ec, d);
     case SPARC64_OP3_ANDCC:
     case SPARC64_OP3_ORCC:
     case SPARC64_OP3_XORCC:

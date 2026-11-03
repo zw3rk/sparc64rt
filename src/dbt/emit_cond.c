@@ -467,7 +467,10 @@ bool sparc64_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         e_exit_imm(b, ec->pc + 4U, SPARC64_EXIT_BRANCH);
     }
     if (d->is_imm != 0U) {
-        sb_mov_imm64(b, ES0, (uint64_t)d->imm);
+        e_ld64(b, ES0, d->rs1);
+        sb_mov_imm64(b, ES1, (uint64_t)d->imm);
+        sb_add_reg(b, true, false, ES0, ES0, ES1);
+        sb_ubfm(b, true, ES0, ES0, 0U, 6U);
     } else {
         e_ld64(b, ES0, d->rs1);
         e_src2(b, ES1, d);

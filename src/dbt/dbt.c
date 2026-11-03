@@ -601,7 +601,7 @@ sparc64_step_result_t sparc64_dbt_step_one(sparc64_dbt_t *dbt,
     dbt->arena_used = 0U;
     code = dbt_emit_range(dbt, mem, mc, pc, pc + span);
     if (code == NULL || !dbt_publish(dbt)) return sparc64_step(ctx, mem, mc);
-    return dbt_enter_block(ctx, mem, mc, dbt, code, false);
+    return dbt_enter_block(ctx, mem, mc, dbt, code, true);
 }
 
 static const sparc64_dbt_block_t *dbt_lookup(

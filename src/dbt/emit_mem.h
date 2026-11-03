@@ -73,7 +73,8 @@
 
 /* Memory op: packA carries op3 | rd<<8 | rs1<<16 | rs2<<24 | is_imm<<29,
  * raw is the instruction word (trap tval), packB carries the low 32 bits
- * of the sign-extended immediate plus the ASI at bits 32..39. */
+ * of the sign-extended immediate plus the ASI at bits 32..39 and the
+ * regasi flag at bit 40. */
 static inline uint32_t s64_jrt_mem(sparc64_ctx_t *ctx,
     const sparc64_mem_ops_t *mem, void *mc, uint64_t pc, uint32_t pack_a,
     uint32_t raw, uint64_t pack_b)
@@ -90,6 +91,7 @@ static inline uint32_t s64_jrt_mem(sparc64_ctx_t *ctx,
     d.cond = 0U;
     d.cc = 0U;
     d.asi = (uint8_t)((pack_b >> 32) & 0xffU);
+    d.regasi = (uint8_t)((pack_b >> 40) & 1U);
     d.annul = 0U;
     d.pred = 0U;
     d.is_imm = (uint8_t)((pack_a >> 29) & 1U);
@@ -183,7 +185,8 @@ static inline size_t e_call_mem(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         ((d->rs1 & 31U) << 16) | ((d->rs2 & 31U) << 24) |
         ((d->is_imm & 1U) << 29);
     uint64_t pack_b = ((uint64_t)(uint32_t)d->imm) |
-        ((uint64_t)d->asi << 32);
+        ((uint64_t)d->asi << 32) |
+        ((uint64_t)(d->regasi & 1U) << 40);
     e_arg_ctx(b);
     sb_mov_imm64(b, 1U, (uint64_t)(uintptr_t)ec->mem);
     sb_mov_imm64(b, 2U, (uint64_t)(uintptr_t)ec->mc);
