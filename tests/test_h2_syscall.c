@@ -45,6 +45,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,6 +76,18 @@ static void check(const char *label, int ok)
 
 static const char payload[] = "sparc64-h2-syscall\n";
 
+static uint32_t statx_get_be32(const unsigned char *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint64_t statx_get_be64(const unsigned char *p)
+{
+    return ((uint64_t)statx_get_be32(p) << 32) |
+        (uint64_t)statx_get_be32(p + 4);
+}
+
 static void test_file_rw(void)
 {
     int fd;
@@ -84,6 +97,11 @@ static void test_file_rw(void)
     struct iovec wi;
     struct iovec ri;
     struct stat st;
+    struct {
+        uint64_t canary_before;
+        unsigned char data[256];
+        uint64_t canary_after;
+    } statx_buf;
 
     fd = open("/tmp/h2_syscall_t.txt", O_CREAT | O_TRUNC | O_RDWR, 0600);
     if (fd < 0) {
@@ -167,8 +185,17 @@ static void test_file_rw(void)
         R_OK, 0) == 0 &&
         faccessat(AT_FDCWD, "/tmp/h2_no_such_file_xyz", F_OK, 0) != 0 &&
         errno == ENOENT);
+    statx_buf.canary_before = UINT64_C(0x5a5a5a5aa5a5a5a5);
+    statx_buf.canary_after = UINT64_C(0xa5a5a5a55a5a5a5a);
+    memset(statx_buf.data, 0, sizeof(statx_buf.data));
     check("STATX", syscall(SYS_statx, AT_FDCWD,
-        "/tmp/h2_syscall_t.txt", 0, STATX_SIZE, &st) == 0);
+        "/tmp/h2_syscall_t.txt", 0, STATX_SIZE,
+        statx_buf.data) == 0 &&
+        statx_buf.canary_before == UINT64_C(0x5a5a5a5aa5a5a5a5) &&
+        statx_buf.canary_after == UINT64_C(0xa5a5a5a55a5a5a5a) &&
+        (statx_get_be32(statx_buf.data) & (uint32_t)STATX_SIZE) != 0U &&
+        statx_get_be64(statx_buf.data + 40) ==
+        (uint64_t)(sizeof(payload) - 1U));
     check("MISSING", stat("/tmp/h2_no_such_file_xyz", &st) != 0 &&
         errno == ENOENT);
 }

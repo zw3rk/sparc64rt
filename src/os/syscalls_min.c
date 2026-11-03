@@ -109,7 +109,7 @@ static void note_dispatched(void)
  * overrides them; ENOSYS is 90 on SPARC (E02), not asm-generic 38. Only
  * errnos this layer can produce are listed; anything else falls back to
  * the raw value, which is correct on the Linux host. */
-static uint64_t sparc_errno_from_host(long host_errno)
+uint64_t sparc64_host_errno_to_guest(long host_errno)
 {
     switch (host_errno) {
     case EPERM: return 1U;
@@ -160,10 +160,10 @@ static long host_ret(ssize_t n)
 /* Commit one handler result to %o0/ccr following the frozen dual-carry
  * convention: negative host errno fails with both carries set, anything
  * else succeeds with both carries clear (N/Z/V preserved either way). */
-static void sparc64_commit(sparc64_ctx_t *ctx, long ret)
+void sparc64_commit_sysret(sparc64_ctx_t *ctx, long ret)
 {
     if (ret < 0L) {
-        ctx->r[SPARC64_O0] = sparc_errno_from_host(-ret);
+        ctx->r[SPARC64_O0] = sparc64_host_errno_to_guest(-ret);
         ctx->ccr |= SPARC64_CCR_ICC_C | SPARC64_CCR_XCC_C;
     } else {
         ctx->r[SPARC64_O0] = (uint64_t)ret;
@@ -689,7 +689,7 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
     /* 64-bit guest addresses never collide with the kernel -4095..-1
      * error window, so a plain sign check commits correctly for mmap/brk
      * addresses and ordinary values alike (no 32-bit window needed). */
-    sparc64_commit(ctx, ret);
+    sparc64_commit_sysret(ctx, ret);
     ctx->pc = ctx->npc;
     ctx->npc += 4U;
     ctx->syscalls_executed++;

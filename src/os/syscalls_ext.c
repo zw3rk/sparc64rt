@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -54,6 +55,8 @@
 
 /* SPARC open flags (arch/sparc fcntl.h, shared 32/64-bit); low 2 access
  * bits match the host. */
+#define SP_O_FASYNC 0x0040U
+#define SP_O_ASYNC SP_O_FASYNC
 #define SP_O_APPEND 0x0008U
 #define SP_O_CREAT 0x0200U
 #define SP_O_TRUNC 0x0400U
@@ -104,11 +107,10 @@
 #define L2A_IOV_MAX 1024U
 #define L2A_CHUNK 4096U
 
-/* Blocked mask is file-static (single-threaded); delivery stays Phase
- * 1/4 machinery in src/os/sync_sig.c. */
-static uint64_t l2a_blocked = UINT64_C(0);
-
-/* SPARC O_* -> host O_*. Unknown bits are EINVAL; O_DSYNC maps to O_SYNC. */
+/* SPARC O_* -> host O_*. Unknown bits are EINVAL; O_DSYNC maps to O_SYNC.
+ * Composite multi-bit flags (TMPFILE, NDELAY, SYNC) use full mask equality
+ * and are ordered before their single-bit subsets so SP_O_DIRECTORY alone
+ * never sets O_TMPFILE and lone 0x0004 maps to O_NONBLOCK accurately. */
 static long open_flags_to_host(uint64_t guest, int *host_out)
 {
     uint64_t rest = guest & ~3U;
@@ -118,9 +120,14 @@ static long open_flags_to_host(uint64_t guest, int *host_out)
         uint64_t guest;
         int host;
     } map[] = {
+#ifdef O_TMPFILE
+        { SP_O_TMPFILE, O_TMPFILE },
+#endif
+        { SP_O_NDELAY, O_NONBLOCK },
+        { 0x0004U, O_NONBLOCK },
         { SP_O_APPEND, O_APPEND }, { SP_O_CREAT, O_CREAT },
         { SP_O_TRUNC, O_TRUNC }, { SP_O_EXCL, O_EXCL },
-        { SP_O_NONBLOCK, O_NONBLOCK }, { SP_O_NDELAY, O_NONBLOCK },
+        { SP_O_NONBLOCK, O_NONBLOCK },
         { SP_O_NOCTTY, O_NOCTTY }, { SP_O_DIRECTORY, O_DIRECTORY },
         { SP_O_NOFOLLOW, O_NOFOLLOW }, { SP_O_CLOEXEC, O_CLOEXEC },
 #ifdef O_LARGEFILE
@@ -135,20 +142,24 @@ static long open_flags_to_host(uint64_t guest, int *host_out)
 #ifdef O_PATH
         { SP_O_PATH, O_PATH },
 #endif
-#ifdef O_TMPFILE
-        { SP_O_TMPFILE, O_TMPFILE },
-#endif
     };
-    if ((rest & (SP_O_SYNC | SP_O_DSYNC)) != 0U) {
+    if ((rest & SP_O_SYNC) == SP_O_SYNC) {
 #ifdef O_SYNC
         h |= O_SYNC;
-        rest &= ~(uint64_t)(SP_O_SYNC | SP_O_DSYNC);
+        rest &= ~(uint64_t)SP_O_SYNC;
+#else
+        return -EINVAL;
+#endif
+    } else if ((rest & SP_O_DSYNC) == SP_O_DSYNC) {
+#ifdef O_SYNC
+        h |= O_SYNC;
+        rest &= ~(uint64_t)SP_O_DSYNC;
 #else
         return -EINVAL;
 #endif
     }
     for (i = 0U; i < sizeof(map) / sizeof(map[0]); i++) {
-        if ((rest & map[i].guest) != 0U) {
+        if ((rest & map[i].guest) == map[i].guest) {
             h |= map[i].host;
             rest &= ~map[i].guest;
         }
@@ -222,14 +233,18 @@ long sparc64_l2a_getuid(void) { return (long)getuid(); }
 long sparc64_l2a_getgid(void) { return (long)getgid(); }
 
 /* readv/writev over guest iovec chains ({BE u64 base, BE u64 len}).
- * Guest pages move through a fixed bounce chunk; a short count ends the
- * walk and partial progress reads as the result, like sys_read/write. */
+ * All entries are validated first, the bytes are staged into a single
+ * contiguous host buffer, and exactly one host read/write call runs so
+ * pipe atomicity holds and a partial readv never blocks for more data.
+ * Short counts scatter back to the guest and read as the result. */
 static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t fd, uint64_t iov_va, uint64_t iovcnt, int is_write)
 {
-    uint8_t chunk[L2A_CHUNK];
     uint64_t total = 0;
     uint64_t i = 0;
+    uint8_t *buf = NULL;
+    uint64_t off = 0;
+    ssize_t got;
     (void)ctx;
     if (iovcnt > (uint64_t)L2A_IOV_MAX) {
         return -EINVAL;
@@ -237,66 +252,103 @@ static long sys_rwvec(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     if (iovcnt == 0U) {
         return 0;
     }
+    if (iovcnt > UINT64_C(0) && iovcnt > UINT64_MAX / 16U) {
+        return -EINVAL;
+    }
     if (l2a_range_ok(iov_va, iovcnt * 16U) != 0) {
         return -EFAULT;
     }
     for (i = 0U; i < iovcnt; i++) {
         uint8_t e[16];
-        uint64_t base;
         uint64_t len;
-        uint64_t done = 0;
-        if (!mem->read(mem->context, iov_va + i * 16U, e, (uint64_t)sizeof(e))) {
-            return (total != 0U) ? (long)total : -EFAULT;
+        uint64_t base;
+        if (!mem->read(mem->context, iov_va + i * 16U, e,
+                (uint64_t)sizeof(e))) {
+            return -EFAULT;
         }
         base = l2a_get_be64(e);
         len = l2a_get_be64(e + 8);
         if (l2a_range_ok(base, len) != 0) {
-            return (total != 0U) ? (long)total : -EFAULT;
+            return -EFAULT;
         }
-        while (done < len) {
-            uint64_t want = len - done;
-            ssize_t got;
-            if (want > (uint64_t)sizeof(chunk)) {
-                want = (uint64_t)sizeof(chunk);
-            }
-            if (is_write) {
-                if (!mem->read(mem->context, base + done, chunk, want)) {
-                    return (total != 0U) ? (long)total : -EFAULT;
-                }
-                /* S2 hook point: host op runs first (Step 3); the
-                 * coordinator lands vm_file_commit_resize here (Step 4)
-                 * once the family table + truncate dispatch exist. */
-                got = write((int)fd, chunk, (size_t)want);
-                if (got <= 0) {
-                    if (got == 0) {
-                        return (long)total;
-                    }
-                    return (total != 0U) ? (long)total : -(long)errno;
-                }
-            } else {
-                if (!mem->prepare_write(mem->context, base + done, want)) {
-                    return (total != 0U) ? (long)total : -EFAULT;
-                }
-                got = read((int)fd, chunk, (size_t)want);
-                if (got < 0) {
-                    return (total != 0U) ? (long)total : -(long)errno;
-                }
-                if (got == 0) {
-                    return (long)total;
-                }
-                if (!mem->write(mem->context, base + done, chunk,
-                        (uint64_t)got)) {
-                    return (total != 0U) ? (long)total : -EFAULT;
-                }
-            }
-            done += (uint64_t)got;
-            total += (uint64_t)got;
-            if ((uint64_t)got < want) {
-                return (long)total;
-            }
+        if (len > UINT64_C(0) && total > UINT64_MAX - len) {
+            return -EINVAL;
         }
+        total += len;
     }
-    return (long)total;
+    if (total == 0U) {
+        return 0;
+    }
+    if (total > (uint64_t)SIZE_MAX) {
+        return -EINVAL;
+    }
+    buf = (uint8_t *)malloc((size_t)total);
+    if (buf == NULL) {
+        return -ENOMEM;
+    }
+    if (is_write) {
+        for (i = 0U; i < iovcnt; i++) {
+            uint8_t e[16];
+            uint64_t base = 0;
+            uint64_t len = 0;
+            (void)mem->read(mem->context, iov_va + i * 16U, e,
+                (uint64_t)sizeof(e));
+            base = l2a_get_be64(e);
+            len = l2a_get_be64(e + 8);
+            if (len == 0U) {
+                continue;
+            }
+            if (!mem->read(mem->context, base, buf + off, len)) {
+                free(buf);
+                return -EFAULT;
+            }
+            off += len;
+        }
+        /* S2 hook point: host op runs first (Step 3); the coordinator
+         * lands vm_file_commit_resize here (Step 4) once the family
+         * table + truncate dispatch exist. */
+        got = write((int)fd, buf, (size_t)total);
+        free(buf);
+        if (got < 0) {
+            return -(long)errno;
+        }
+        return (long)got;
+    }
+    got = read((int)fd, buf, (size_t)total);
+    if (got < 0) {
+        free(buf);
+        return -(long)errno;
+    }
+    if (got == 0) {
+        free(buf);
+        return 0;
+    }
+    off = 0;
+    for (i = 0U; i < iovcnt && off < (uint64_t)got; i++) {
+        uint8_t e[16];
+        uint64_t base = 0;
+        uint64_t len = 0;
+        uint64_t want;
+        (void)mem->read(mem->context, iov_va + i * 16U, e,
+            (uint64_t)sizeof(e));
+        base = l2a_get_be64(e);
+        len = l2a_get_be64(e + 8);
+        if (len == 0U) {
+            continue;
+        }
+        want = len;
+        if (want > (uint64_t)got - off) {
+            want = (uint64_t)got - off;
+        }
+        if (!mem->prepare_write(mem->context, base, want) ||
+            !mem->write(mem->context, base, buf + off, want)) {
+            free(buf);
+            return (off != 0U) ? (long)off : -EFAULT;
+        }
+        off += want;
+    }
+    free(buf);
+    return (long)off;
 }
 
 long sparc64_l2a_readv(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
@@ -325,6 +377,21 @@ static long flags_host_to_guest(int host)
         g |= (uint64_t)SP_O_SYNC;
     }
 #endif
+#ifdef O_ASYNC
+    if ((host & O_ASYNC) != 0) {
+        g |= (uint64_t)SP_O_ASYNC;
+    }
+#endif
+#ifdef O_DIRECT
+    if ((host & O_DIRECT) != 0) {
+        g |= (uint64_t)SP_O_DIRECT;
+    }
+#endif
+#ifdef O_NOATIME
+    if ((host & O_NOATIME) != 0) {
+        g |= (uint64_t)SP_O_NOATIME;
+    }
+#endif
     return (long)g;
 }
 
@@ -345,14 +412,53 @@ long sparc64_l2a_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         return (rc < 0) ? -(long)errno : flags_host_to_guest(rc);
     case SP_F_SETFL: {
         int host = 0;
-        if ((arg & ~((uint64_t)SP_O_NONBLOCK | (uint64_t)SP_O_APPEND)) != 0U) {
-            return -EINVAL; /* only O_NONBLOCK|O_APPEND are settable */
-        }
-        if ((arg & (uint64_t)SP_O_APPEND) != 0U) {
+        uint64_t rest = arg;
+        /* Linux fcntl(F_SETFL) ignores the access mode and the
+         * creation/status bits; only the mutable status flags are
+         * translated below. */
+        rest &= ~(uint64_t)3U;
+        rest &= ~((uint64_t)SP_O_CREAT | (uint64_t)SP_O_TRUNC |
+            (uint64_t)SP_O_EXCL | (uint64_t)SP_O_NOCTTY |
+            (uint64_t)SP_O_LARGEFILE | (uint64_t)SP_O_DIRECTORY |
+            (uint64_t)SP_O_NOFOLLOW | (uint64_t)SP_O_CLOEXEC |
+            (uint64_t)SP_O_SYNC | (uint64_t)SP_O_DSYNC);
+        if ((rest & (uint64_t)SP_O_APPEND) != 0U) {
             host |= O_APPEND;
+            rest &= ~(uint64_t)SP_O_APPEND;
         }
-        if ((arg & (uint64_t)SP_O_NONBLOCK) != 0U) {
+        if (((rest & (uint64_t)SP_O_NDELAY) == (uint64_t)SP_O_NDELAY) ||
+            ((rest & (uint64_t)SP_O_NONBLOCK) != 0U ||
+            ((rest & (uint64_t)0x0004U) != 0U)) {
             host |= O_NONBLOCK;
+            rest &= ~((uint64_t)SP_O_NDELAY | (uint64_t)SP_O_NONBLOCK |
+                (uint64_t)0x0004U);
+        }
+        if ((rest & (uint64_t)SP_O_ASYNC) != 0U) {
+#ifdef O_ASYNC
+            host |= O_ASYNC;
+#else
+            return -EINVAL;
+#endif
+            rest &= ~(uint64_t)SP_O_ASYNC;
+        }
+        if ((rest & (uint64_t)SP_O_DIRECT) != 0U) {
+#ifdef O_DIRECT
+            host |= O_DIRECT;
+#else
+            return -EINVAL;
+#endif
+            rest &= ~(uint64_t)SP_O_DIRECT;
+        }
+        if ((rest & (uint64_t)SP_O_NOATIME) != 0U) {
+#ifdef O_NOATIME
+            host |= O_NOATIME;
+#else
+            return -EINVAL;
+#endif
+            rest &= ~(uint64_t)SP_O_NOATIME;
+        }
+        if (rest != 0U) {
+            return -EINVAL;
         }
         return (fcntl((int)fd, F_SETFL, host) != 0) ? -(long)errno : 0;
     }
@@ -537,42 +643,6 @@ long sparc64_l2a_futex(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     (void)timeout_va;
     return -ENOSYS;
 #endif
-}
-
-/* rt_sigprocmask bookkeeping only; delivery stays Phase 1/4 machinery. */
-long sparc64_l2a_rt_sigprocmask(sparc64_ctx_t *ctx,
-    const sparc64_syscall_mem_t *mem, uint64_t how, uint64_t set_va,
-    uint64_t oset_va, uint64_t sigsetsize)
-{
-    uint8_t old[8];
-    (void)ctx;
-    if (sigsetsize != 8U) {
-        return -EINVAL;
-    }
-    l2a_put_be64(old, l2a_blocked);
-    if (set_va != 0U) {
-        uint8_t raw[8];
-        uint64_t next;
-        if (l2a_range_ok(set_va, (uint64_t)sizeof(raw)) != 0) {
-            return -EFAULT;
-        }
-        if (!mem->read(mem->context, set_va, raw, (uint64_t)sizeof(raw))) {
-            return -EFAULT;
-        }
-        next = l2a_get_be64(raw);
-        switch (how) {
-        case SP_SIG_BLOCK: l2a_blocked |= next; break;
-        case SP_SIG_UNBLOCK: l2a_blocked &= ~next; break;
-        case SP_SIG_SETMASK: l2a_blocked = next; break;
-        default: return -EINVAL;
-        }
-    } else if (how != (uint64_t)SP_SIG_BLOCK &&
-        how != (uint64_t)SP_SIG_UNBLOCK &&
-        how != (uint64_t)SP_SIG_SETMASK) {
-        return -EINVAL;
-    }
-    return (oset_va != 0U) ?
-        l2a_store_buf(mem, oset_va, old, (uint64_t)sizeof(old)) : 0;
 }
 
 /* TCGETS answers as an isatty query (no termios copy: the sparc layout

@@ -81,6 +81,16 @@ static uint64_t align_up(uint64_t v, uint64_t a)
     return (v + (a - UINT64_C(1))) & ~(a - UINT64_C(1));
 }
 
+/* Checked u64 addition: nonzero on overflow, sum in *out otherwise. */
+static int add_u64_checked(uint64_t a, uint64_t b, uint64_t *out)
+{
+    if (b > UINT64_MAX - a) {
+        return 1;
+    }
+    *out = a + b;
+    return 0;
+}
+
 /* ---- Big-endian readers/writers (guest is BE, host may be LE) ---------- */
 static uint16_t rd16be(const uint8_t *p)
 {
@@ -265,7 +275,9 @@ static int load_ehdr(int fd, guest_image_t *img, uint64_t *bias)
         return -LOAD_BAD;
     }
     *bias = (type == (uint16_t)GUEST_ET_DYN) ? GUEST_DYN_BIAS : 0U;
-    img->entry = rd64be(ehdr + 24) + *bias;
+    if (add_u64_checked(rd64be(ehdr + 24), *bias, &img->entry) != 0) {
+        return -LOAD_BAD;
+    }
     img->phoff = rd64be(ehdr + 32);
     return 0;
 }
@@ -304,6 +316,18 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
     uint64_t phdr_va = 0;
     uint32_t i;
     uint32_t n = 0;
+    {
+        uint64_t table_bytes = (uint64_t)phnum * (uint64_t)GUEST_PHDR_SIZE;
+        uint64_t table_end = 0;
+        if (phnum != 0U && table_bytes / (uint64_t)phnum !=
+            (uint64_t)GUEST_PHDR_SIZE) {
+            return -LOAD_BAD;
+        }
+        if (add_u64_checked(phoff, table_bytes, &table_end) != 0) {
+            return -LOAD_BAD;
+        }
+        (void)table_end;
+    }
     for (i = 0; i < phnum; i++) {
         uint8_t phdr[GUEST_PHDR_SIZE];
         uint64_t moved = 0;
@@ -315,7 +339,12 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
         uint64_t end;
         unsigned perms = 0U;
         uint32_t p_type;
-        if (read_at(fd, phoff + (uint64_t)i * GUEST_PHDR_SIZE, phdr,
+        uint64_t phdr_off = 0;
+        if (add_u64_checked(phoff, (uint64_t)i * (uint64_t)GUEST_PHDR_SIZE,
+                &phdr_off) != 0) {
+            return -LOAD_BAD;
+        }
+        if (read_at(fd, phdr_off, phdr,
                     sizeof(phdr), &moved) != 0 ||
             moved != (uint64_t)sizeof(phdr)) {
             return -LOAD_IO;
@@ -346,12 +375,34 @@ static int load_segments(int fd, guest_state_t *g, uint64_t bias,
             continue;
         }
         p_flags = rd32be(phdr + 4);
-        p_vaddr = rd64be(phdr + 16) + bias;
         p_filesz = rd64be(phdr + 32);
         p_memsz = rd64be(phdr + 40);
-        if (rd64be(phdr + 8) <= file_phoff &&
-            file_phoff < rd64be(phdr + 8) + p_filesz) {
-            phdr_va = p_vaddr + (file_phoff - rd64be(phdr + 8));
+        {
+            uint64_t file_vaddr = rd64be(phdr + 16);
+            uint64_t file_off = rd64be(phdr + 8);
+            uint64_t off_end = 0;
+            uint64_t vaddr_filesz = 0;
+            uint64_t vaddr_memsz = 0;
+            if (add_u64_checked(file_vaddr, bias, &p_vaddr) != 0) {
+                return -LOAD_BAD;
+            }
+            if (p_filesz != 0U &&
+                add_u64_checked(file_off, p_filesz, &off_end) != 0) {
+                return -LOAD_BAD;
+            }
+            if (add_u64_checked(p_vaddr, p_filesz, &vaddr_filesz) != 0 ||
+                add_u64_checked(p_vaddr, p_memsz, &vaddr_memsz) != 0) {
+                return -LOAD_BAD;
+            }
+            (void)vaddr_filesz;
+            (void)vaddr_memsz;
+            if (p_filesz != 0U && file_off <= file_phoff &&
+                file_phoff < off_end) {
+                uint64_t delta = file_phoff - file_off;
+                if (add_u64_checked(p_vaddr, delta, &phdr_va) != 0) {
+                    return -LOAD_BAD;
+                }
+            }
         }
         perms = ((p_flags & GUEST_PF_R) != 0U ? SPARC64_MEM_READ : 0U) |
                 ((p_flags & GUEST_PF_W) != 0U ? SPARC64_MEM_WRITE : 0U) |

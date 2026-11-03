@@ -7,9 +7,11 @@
  *
  * Endianness: integer bytes on the guest are big-endian; little-endian
  * alternate-space ASIs (bit 3 set: 0x88/0x8a) byte-swap around a single
- * canonical integer value. Multi-byte accesses are emulated byte-wise, so
- * unaligned loads/stores never fault (kernel-fixup parity); only an
- * unmapped/protected byte or a resource failure stops the step.
+ * canonical integer value. Raw byte helpers (sparc64_mem_read/write)
+ * never trap on alignment and emulate multi-byte spans byte-wise; ISA
+ * integer/FP load/store helpers (sparc64_ld_int/st_int and FP lanes)
+ * enforce SPARC V9 natural-alignment traps before touching memory.
+ * Only an unmapped/protected byte or a resource failure stops the step.
  */
 
 #include "interp/interp_mem.h"

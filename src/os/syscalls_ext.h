@@ -8,7 +8,7 @@
  * src/os/syscalls_ext.c: stat/stat64/statx/lstat (+fstat/fstat64/
  * lstat64/fstatat64 siblings static glibc needs), readv/writev, openat,
  * fcntl/fcntl64, clock_gettime/clock_getres/gettimeofday, getrandom,
- * futex (single-threaded WAIT/WAKE via the host futex), rt_sigprocmask,
+ * futex (single-threaded WAIT/WAKE via the host futex),
  * ioctl (TCGETS/TIOCGWINSZ only, ENOTTY otherwise), and
  * getpid/getuid/getgid. Handlers return host-style results (>= 0 value,
  * negative host errno); the dual-carry commit in src/os/syscalls_min.c
@@ -237,11 +237,6 @@ long sparc64_l2a_getrandom(sparc64_ctx_t *ctx,
  * spuriously when no timeout is given; WAKE wakes nobody and returns 0. */
 long sparc64_l2a_futex(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t uaddr, uint64_t op, uint64_t val, uint64_t timeout_va);
-
-/* Blocked-mask bookkeeping (single u64, 8-byte BE guest sigset). */
-long sparc64_l2a_rt_sigprocmask(sparc64_ctx_t *ctx,
-    const sparc64_syscall_mem_t *mem, uint64_t how, uint64_t set_va,
-    uint64_t oset_va, uint64_t sigsetsize);
 
 /* TCGETS answers as an isatty query, TIOCGWINSZ fills the BE winsize,
  * everything else is -ENOTTY. */

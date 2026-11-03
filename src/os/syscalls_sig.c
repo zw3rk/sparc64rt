@@ -42,55 +42,12 @@
 #include "os/syscalls_min.h"
 #include "os/syscalls_sig.h"
 
-/* Dual-carry commit for handlers that finish inside this file (same
- * frozen convention as syscalls_min.c: negative host errno fails with
- * both carries set, anything else succeeds with both clear). */
-static void sig_commit(sparc64_ctx_t *ctx, long ret)
-{
-    if (ret < 0L) {
-        uint64_t code;
-        switch (-ret) {
-        case EPERM: code = 1U; break;
-        case ENOENT: code = 2U; break;
-        case ESRCH: code = 3U; break;
-        case EINTR: code = 4U; break;
-        case EIO: code = 5U; break;
-        case EBADF: code = 9U; break;
-        case EAGAIN: code = 11U; break;
-        case ENOMEM: code = 12U; break;
-        case EACCES: code = 13U; break;
-        case EFAULT: code = 14U; break;
-        case EEXIST: code = 17U; break;
-        case ENODEV: code = 19U; break;
-        case ENOTDIR: code = 20U; break;
-        case EINVAL: code = 22U; break;
-        case ENFILE: code = 23U; break;
-        case EMFILE: code = 24U; break;
-        case ENOTTY: code = 25U; break;
-        case EFBIG: code = 27U; break;
-        case ENOSPC: code = 28U; break;
-        case ESPIPE: code = 29U; break;
-        case EROFS: code = 30U; break;
-        case EPIPE: code = 32U; break;
-        case ERANGE: code = 34U; break;
-        case ENAMETOOLONG: code = 36U; break;
-        case ENOSYS: code = 90U; break;
-        case EOVERFLOW: code = 75U; break;
-        default: code = (uint64_t)(-ret); break;
-        }
-        ctx->r[SPARC64_O0] = code;
-        ctx->ccr |= SPARC64_CCR_ICC_C | SPARC64_CCR_XCC_C;
-    } else {
-        ctx->r[SPARC64_O0] = (uint64_t)ret;
-        ctx->ccr &= ~(SPARC64_CCR_ICC_C | SPARC64_CCR_XCC_C);
-    }
-}
-
 /* Commit success and advance past the trapping ta (delivery captures
- * the post-syscall pc/npc as tpc/tnpc). */
+ * the post-syscall pc/npc as tpc/tnpc). Uses the shared dual-carry
+ * commit from src/os/syscalls_min.c. */
 static void sig_commit_advance(sparc64_ctx_t *ctx, long ret)
 {
-    sig_commit(ctx, ret);
+    sparc64_commit_sysret(ctx, ret);
     ctx->pc = ctx->npc;
     ctx->npc += 4U;
 }

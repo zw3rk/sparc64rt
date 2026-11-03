@@ -259,7 +259,7 @@ struct l2a_host_statx {
 
 static void put_statx_ts(uint8_t *b, uint64_t off, int64_t sec, uint64_t nsec)
 {
-    l2a_put_be64(b + off, (sec < 0) ? 0U : (uint64_t)sec);
+    l2a_put_be64(b + off, (uint64_t)sec);
     l2a_put_be32(b + off + 8U, (uint32_t)nsec);
     l2a_put_be32(b + off + 12U, 0U);
 }

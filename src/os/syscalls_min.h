@@ -57,6 +57,17 @@ const char *sparc64_syscall_name(long nr);
  * every sparc64_handle_syscall dispatch (all engines, all threads). */
 unsigned long long sparc64_syscalls_dispatched(void);
 
+/* Host errno -> SPARC guest errno (asm-generic numbers except where
+ * arch/sparc overrides; ENOSYS is 90 on SPARC). Shared by
+ * src/os/syscalls_min.c and src/os/syscalls_sig.c. */
+uint64_t sparc64_host_errno_to_guest(long host_errno);
+
+/* Commit one handler result to %o0/ccr following the frozen dual-carry
+ * convention: negative host errno fails with both carries set, anything
+ * else succeeds with both carries clear (N/Z/V preserved). Shared by
+ * src/os/syscalls_min.c and src/os/syscalls_sig.c. */
+void sparc64_commit_sysret(sparc64_ctx_t *ctx, long ret);
+
 /* Dispatch the syscall in %g1 (args %o0..%o5), commit the SPARC64 carry
  * convention (E02/SPEC section 2.2: success clears both icc.C and xcc.C,
  * error sets both, other CCR bits preserved; %o0 carries the value or
