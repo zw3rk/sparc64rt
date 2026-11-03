@@ -372,6 +372,11 @@ static long thr_futex_wait(sparc64_ctx_t *ctx,
             return 0;
         }
     }
+    /* S64-R4-9: validate relative WAIT before the deadline. */
+    if (rel != 0 && ts != NULL && (ts->tv_sec < 0 ||
+        ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)) {
+        return -EINVAL;
+    }
     if (rel != 0 && ts != NULL &&
         clock_gettime(CLOCK_MONOTONIC, &dl) == 0) {
         have_dl = 1;

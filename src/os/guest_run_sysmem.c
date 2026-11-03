@@ -750,6 +750,12 @@ long sparc64_sysmem_mremap(void *context, uint64_t old_addr,
             }
             if (space_ok) {
                 sysmem_file_restore(snap, snap_cap);
+                /* S64-R4-3 residual: the restored snapshot still
+                 * covers the excised destination, which is now
+                 * unmapped (head moved back, tail dropped). */
+                if (dest != old_addr) {
+                    sysmem_file_drop_map(g, dest, new_len);
+                }
             } else {
                 sysmem_file_snapshot_discard(snap, snap_cap);
             }
