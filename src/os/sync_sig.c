@@ -473,7 +473,11 @@ int sparc64_sync_sig_queue(sparc64_ctx_t *ctx,
         return 0;
     }
     handler = sync_handler[(unsigned)signo];
-    if (handler == UINT64_C(0) || handler == UINT64_C(1)) {
+    if (handler == UINT64_C(1)) {
+        sync_resolve(ctx)->pending &= ~sig_mask_bit(signo);
+        return 0;
+    }
+    if (handler == UINT64_C(0)) {
         return -1;
     }
     if ((sync_resolve(ctx)->blocked & sig_mask_bit(signo)) !=
@@ -671,8 +675,11 @@ int sparc64_sync_sig_deliver_pending(sparc64_ctx_t *ctx,
         if ((deliverable & sig_mask_bit(signo)) == UINT64_C(0)) {
             continue;
         }
-        if (sync_handler[(unsigned)signo] == UINT64_C(0) ||
-            sync_handler[(unsigned)signo] == UINT64_C(1)) {
+        if (sync_handler[(unsigned)signo] == UINT64_C(1)) {
+            st->pending &= ~sig_mask_bit(signo);
+            continue;
+        }
+        if (sync_handler[(unsigned)signo] == UINT64_C(0)) {
             return -1;
         }
         return sparc64_sync_sig_deliver(ctx, mem, signo,
