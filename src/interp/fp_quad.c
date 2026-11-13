@@ -8,6 +8,7 @@
 
 #include "core/cpu.h"
 #include "interp/fp_commit.h"
+#include "interp/fp_qcommon.h"
 #include "interp/interp.h"
 
 /* FDIVQ/FSQRTQ entry (defined in fp_qdiv.c). */
@@ -120,35 +121,9 @@ static sparc64_step_result_t qq_commit(sparc64_cpu_t *cpu, uint64_t pc,
     return sparc64_fp_commit(cpu, pc, d, fresh);
 }
 
-/* Quad class: 0 zero, 2 finite, 3 inf, 4 QNaN, 5 SNaN. */
-static unsigned qq_class(uint64_t hi, uint64_t lo)
-{
-    unsigned rawexp = (unsigned)((hi >> 48) & UINT64_C(0x7FFF));
-    bool frac = ((hi & UINT64_C(0xFFFFFFFFFFFF)) != UINT64_C(0)) ||
-        (lo != UINT64_C(0));
-    if (rawexp == 0x7FFFU) {
-        if (!frac) {
-            return 3U;
-        }
-        return ((hi & UINT64_C(0x0000800000000000)) != UINT64_C(0)) ? 4U : 5U;
-    }
-    if (rawexp == 0U && !frac) {
-        return 0U;
-    }
-    return 2U;
-}
-
-/* Quad payload compare (fraction only): 1 when a >= b. */
-static bool qq_payload_ge(uint64_t ahi, uint64_t alo, uint64_t bhi,
-    uint64_t blo)
-{
-    uint64_t af = ahi & UINT64_C(0xFFFFFFFFFFFF);
-    uint64_t bf = bhi & UINT64_C(0xFFFFFFFFFFFF);
-    if (af != bf) {
-        return af > bf;
-    }
-    return alo >= blo;
-}
+/* Quad class/payload/NaN live in interp/fp_qcommon.h (S64-R13-5/6):
+ * qq_class -> sparc64_quad_class, qq_payload_ge ->
+ * sparc64_quad_payload_ge, qq_nan2 -> sparc64_quad_nan2. */
 
 /* Unpacked quad: sig * 2^(exp-112), hidden bit shi:48. */
 typedef struct {
@@ -228,25 +203,14 @@ static unsigned qq_pack(unsigned neg, int exp, uint64_t shi, uint64_t slo,
             /* Value is below one output ulp: keep exact GRS and round. */
             unsigned gg = 0U;
             unsigned rr = 0U;
-            unsigned ss = g | r | s;
-            if (shift == 113U) {
-                gg = (unsigned)((shi >> 48) & UINT64_C(1));
-                rr = (unsigned)((shi >> 47) & UINT64_C(1));
-                ss |= (unsigned)(((shi & UINT64_C(0x7FFFFFFFFFFF)) !=
-                    UINT64_C(0)) || (slo != UINT64_C(0))) ? 1U : 0U;
-            } else if (shift == 114U) {
-                rr = (unsigned)((shi >> 48) & UINT64_C(1));
-                ss |= (unsigned)(((shi & UINT64_C(0xFFFFFFFFFFFF)) !=
-                    UINT64_C(0)) || (slo != UINT64_C(0))) ? 1U : 0U;
-            } else {
-                ss |= (unsigned)(((shi != UINT64_C(0)) || (slo !=
-                    UINT64_C(0))) ? 1U : 0U);
-            }
+            unsigned ss = 0U;
+            sparc64_quad_grs_trunc(shi, slo, g, r, s, shift, &gg,
+                &rr, &ss);
             shi = UINT64_C(0);
             slo = UINT64_C(0);
             g = gg;
             r = rr;
-            s = (ss != 0U) ? 1U : 0U;
+            s = ss;
         } else {
             unsigned g2 = qq_bit(shi, slo, shift - 1U);
             unsigned r2 =
@@ -558,44 +522,7 @@ static void qq_mul(const qq_unp_t *a, const qq_unp_t *b, unsigned *neg,
     *s = ss;
 }
 
-/* Quad NaN: SNaN wins (NV), else larger payload (tie rs1). */
-static bool qq_nan2(uint64_t ahi, uint64_t alo, uint64_t bhi, uint64_t blo,
-    uint64_t *ohi, uint64_t *olo, unsigned *nv)
-{
-    unsigned ca = qq_class(ahi, alo);
-    unsigned cb = qq_class(bhi, blo);
-    bool sa = ca == 5U;
-    bool sb = cb == 5U;
-    bool qa = ca == 4U;
-    bool qb = cb == 4U;
-    bool pick_a;
-    if (!sa && !sb && !qa && !qb) {
-        return false;
-    }
-    *nv = (sa || sb) ? 0x10U : 0U;
-    if (sa || sb) {
-        if (sa && sb) {
-            pick_a = qq_payload_ge(ahi, alo, bhi, blo);
-        } else {
-            pick_a = sa;
-        }
-    } else if (qa && qb) {
-        pick_a = qq_payload_ge(ahi, alo, bhi, blo);
-    } else {
-        pick_a = qa;
-    }
-    if (pick_a) {
-        *ohi = ahi;
-        *olo = alo;
-    } else {
-        *ohi = bhi;
-        *olo = blo;
-    }
-    if (sa || sb) {
-        *ohi |= UINT64_C(0x0000800000000000);
-    }
-    return true;
-}
+/* qq_nan2 lives in interp/fp_qcommon.h as sparc64_quad_nan2. */
 
 static void qq_get(const sparc64_cpu_t *cpu, unsigned qi, uint64_t *hi,
     uint64_t *lo)
@@ -692,13 +619,14 @@ static sparc64_step_result_t qq_arith(sparc64_cpu_t *cpu, uint64_t pc,
     }
     qq_get(cpu, qa, &ahi, &alo);
     qq_get(cpu, qb, &bhi, &blo);
-    ca = qq_class(ahi, alo);
-    cb = qq_class(bhi, blo);
+    ca = sparc64_quad_class(ahi, alo);
+    cb = sparc64_quad_class(bhi, blo);
     aneg = (unsigned)(ahi >> 63);
     bneg = (unsigned)(bhi >> 63);
     rm = qq_rd_mode(cpu);
     if (ca >= 4U || cb >= 4U) {
-        if (!qq_nan2(ahi, alo, bhi, blo, &ohi, &olo, &fl)) {
+        if (!sparc64_quad_nan2(ahi, alo, bhi, blo, &ohi, &olo,
+                &fl)) {
             return sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
         }
         return qq_publish(cpu, pc, d, fl, qd, ohi, olo);

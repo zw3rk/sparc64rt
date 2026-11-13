@@ -62,6 +62,11 @@ unsigned long long sparc64_syscalls_dispatched(void);
  * src/os/syscalls_min.c and src/os/syscalls_sig.c. */
 uint64_t sparc64_host_errno_to_guest(long host_errno);
 
+/* SPARC64 guest ENOSYS (arch/sparc overrides asm-generic 38 with 90):
+ * shared by the Linux syscall layer and the Darwin futex backend so a
+ * missing feature reports 90 on every host. */
+#define SPARC64_GUEST_ENOSYS 90L
+
 /* Commit one handler result to %o0/ccr following the frozen dual-carry
  * convention: negative host errno fails with both carries set, anything
  * else succeeds with both carries clear (N/Z/V preserved). Shared by

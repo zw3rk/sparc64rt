@@ -44,13 +44,15 @@
 #define THR_DARWIN_WAIT_BITSET 9U
 #define THR_DARWIN_CLOCK_REALTIME UINT64_C(256)
 
-/* Guest-visible results use fixed Linux numbers, NOT host <errno.h>:
- * EAGAIN 11, ENOSYS 38 and ETIMEDOUT 110 differ on Darwin (35/78/60);
- * EFAULT 14, EINVAL 22, EINTR 4 and ENOMEM 12 coincide. The backend
- * contract already speaks Linux (-11/-110/-4/-12), so waiter outcomes
- * compare and pass through unchanged. */
+/* Guest-visible results use fixed SPARC64 Linux numbers, NOT host
+ * <errno.h>: EAGAIN 11, ENOSYS 90 (arch/sparc, not asm-generic 38)
+ * and ETIMEDOUT 110 differ on Darwin (35/78/60); EFAULT 14, EINVAL 22,
+ * EINTR 4 and ENOMEM 12 coincide. The backend contract already speaks
+ * Linux (-11/-110/-4/-12), so waiter outcomes compare and pass through
+ * unchanged. ENOSYS shares SPARC64_GUEST_ENOSYS with syscalls_min.c
+ * (S64-R13-7). */
 #define THR_LINUX_EAGAIN 11L
-#define THR_LINUX_ENOSYS 38L
+#define THR_LINUX_ENOSYS SPARC64_GUEST_ENOSYS
 #define THR_LINUX_ETIMEDOUT 110L
 #define THR_LINUX_EINTR 4L
 #define THR_LINUX_EFAULT 14L

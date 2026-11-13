@@ -101,7 +101,7 @@ static bool enc_and_imm(sparc64_dbt_buf_t *b, unsigned rd, unsigned rn,
     return true;
 }
 
-/* LDR/STR (register offset, LSL #0): word = size:V:111:00:opc:1....
+/* LDR/STR (register offset, LSL #0): word = size:111:V:00:opc:1....
  * size: 8B->3, 4B->2, 2B->1, 1B->0. opc: load->1, store->0. */
 static void enc_ldst_reg(sparc64_dbt_buf_t *b, bool is_load,
     unsigned size_bits, unsigned rt, unsigned rn, unsigned rm)
@@ -292,22 +292,6 @@ size_t sparc64_mem_emit_fast(struct sparc64_dbt_buf *b, bool is_store,
         return MEM_NO_EDGE;
     }
     site->cont_insn_offset = (uint16_t)((size_t)b->count * 4U);
-    return miss;
-}
-
-size_t sparc64_mem_emit_atomic_edge(struct sparc64_dbt_buf *b)
-{
-    size_t miss;
-    if (b == NULL) {
-        return MEM_NO_EDGE;
-    }
-    /* cbz wzr: never falls through, always takes the stub edge; the
-     * patch kind matches the fast-path cbnz so the tail treats every
-     * edge uniformly. */
-    miss = sb_cbz_placeholder(b, true, false, 31U);
-    if (miss == SPARC64_DBT_NOPOS) {
-        return MEM_NO_EDGE;
-    }
     return miss;
 }
 

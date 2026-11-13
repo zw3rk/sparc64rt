@@ -323,17 +323,4 @@ typedef struct {
  * Always fills *out (illegal words yield SPARC64_OP_ILLEGAL). */
 void sparc64_decode_word(uint32_t word, sparc64_decoded_t *out);
 
-/* Big-endian fetch + decode at guest VA. Returns 0 on success. On fault
- * (misaligned VA or a failed checked read of [va, va + 4)) marks *out
- * illegal and returns -1. Guest-visible faults (unmapped, permission,
- * range, bus) additionally set cpu->exit_reason = SPARC64_EXIT_FAULT
- * with cpu->fault_addr = va; runtime conditions (resource, retry,
- * internal) leave cpu untouched for the caller to map to RETRY/INTERNAL.
- * Guest addresses are full 64-bit values, never truncated. */
-int sparc64_fetch_decode(sparc64_cpu_t *cpu,
-                         const sparc64_mem_ops_t *memory,
-                         void *context,
-                         uint64_t va,
-                         sparc64_decoded_t *out);
-
 #endif /* SPARC64RT_INTERP_DECODE_H */

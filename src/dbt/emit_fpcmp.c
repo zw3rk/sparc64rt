@@ -41,7 +41,6 @@ static bool fp_fcc_nv_commit(sparc64_emit_ctx_t *ec, unsigned idx)
     case 2U: sh = 34U; break;
     default: sh = 36U; break;
     }
-    sb_ldst_imm(b, false, false, ES4, ECTX, 0x240U + (idx & 3U) * 4U);
     sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
     sb_ubfm(b, false, ES0, ES3, 23U, 27U);
     sb_ands_reg(b, false, 31U, ES0, ES5);
@@ -51,6 +50,10 @@ static bool fp_fcc_nv_commit(sparc64_emit_ctx_t *ec, unsigned idx)
     }
     e_fault_here(b, ec->fault_pc);
     sb_patch_b_cond(b, p_notrap, 0U, b->count);
+    /* The fcc[idx] store sits on the no-trap path (S64-R15-2): a
+     * trapping FCMP/FCMPE (TEM.NV on NaN) exits UNDEF with fcc[idx]
+     * untouched, so the interpreter replays it exactly. */
+    sb_ldst_imm(b, false, false, ES4, ECTX, 0x240U + (idx & 3U) * 4U);
     sb_ldst_imm(b, true, true, ES3, ECTX, FP_FSR_OFF);
     sb_mov_imm64(b, ES0, (UINT64_C(3) << sh) | UINT64_C(0x1F));
     sb_bic_reg(b, true, ES3, ES3, ES0);

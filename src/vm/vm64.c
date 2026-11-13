@@ -366,55 +366,10 @@ void vm64_zero_span(void *host_addr, size_t len)
  * (gva & ~0xFFF). addend is constant across the arena
  * (arena_base): in-place COW promotion never changes it. */
 
-/* Index of the LOWER 4 KiB half of the enclosing 8 KiB page. */
-static uint32_t vm64_tlb_lower_index(uint64_t gva8k)
-{
-    uint64_t vpn = (gva8k >> 12) & (uint64_t)(VM64_TLB_SIZE - 1u);
-    return (uint32_t)(vpn & ~(uint64_t)1u);
-}
-
-/* Publish one 8 KiB guest page into both paired TLB entries. */
-void vm64_tlb_publish_pair(vm64_tlb_entry_t *tlb, uint64_t gva8k,
-    bool readable, bool writable, uintptr_t addend)
-{
-    uint32_t lo;
-    uint32_t hi;
-    uint64_t lo_va;
-    uint64_t hi_va;
-    if (tlb == NULL || !vm64_is_8k_aligned(gva8k)) {
-        return;
-    }
-    lo = vm64_tlb_lower_index(gva8k);
-    hi = lo ^ 1u;
-    lo_va = gva8k & ~(uint64_t)VM64_SUB_MASK;
-    hi_va = (gva8k + VM64_SUB_PAGE) & ~(uint64_t)VM64_SUB_MASK;
-    tlb[lo].read_tag = readable ? lo_va : VM64_TLB_INVALID_TAG;
-    tlb[lo].addend = addend;
-    tlb[lo].write_tag = writable ? lo_va : VM64_TLB_INVALID_TAG;
-    tlb[lo].flags_reserved = UINT64_C(0);
-    tlb[hi].read_tag = readable ? hi_va : VM64_TLB_INVALID_TAG;
-    tlb[hi].addend = addend;
-    tlb[hi].write_tag = writable ? hi_va : VM64_TLB_INVALID_TAG;
-    tlb[hi].flags_reserved = UINT64_C(0);
-}
-
-/* Invalidate both paired entries of the enclosing 8 KiB page. */
-void vm64_tlb_invalidate_pair(vm64_tlb_entry_t *tlb, uint64_t gva)
-{
-    uint32_t lo;
-    uint32_t hi;
-    if (tlb == NULL) {
-        return;
-    }
-    lo = vm64_tlb_lower_index(vm64_align_down_8k(gva));
-    hi = lo ^ 1u;
-    tlb[lo].read_tag = VM64_TLB_INVALID_TAG;
-    tlb[lo].write_tag = VM64_TLB_INVALID_TAG;
-    tlb[lo].flags_reserved = UINT64_C(0);
-    tlb[hi].read_tag = VM64_TLB_INVALID_TAG;
-    tlb[hi].write_tag = VM64_TLB_INVALID_TAG;
-    tlb[hi].flags_reserved = UINT64_C(0);
-}
+/* vm64_tlb_publish_pair / vm64_tlb_invalidate_pair were removed
+ * (S64-R13-11, S64-R16-1): pair publish/invalidate had no callers;
+ * the paired-index helper went with them. Range invalidation below
+ * covers every use. */
 
 /* Range-selective invalidation (section 4.5, Step 5): ranges under 512
  * 4 KiB pages invalidate only the covered paired indices; larger

@@ -232,10 +232,6 @@ size_t sparc64_mem_emit_fast(struct sparc64_dbt_buf *b, bool is_store,
     unsigned width, bool is_signed, unsigned vd,
     sparc64_mem_site_t *site);
 
-/* Emit the 1-word unconditional miss edge for an atomic site. Returns
- * the branch patch index for the tail, or (size_t)-1 on overflow. */
-size_t sparc64_mem_emit_atomic_edge(struct sparc64_dbt_buf *b);
-
 /* Append per-site stubs plus the shared miss trampoline and redirect
  * every edge in edges[0..n-1] at its stub. blk is a template carrying
  * the site records (n_sites must equal n); the tail copies it into a

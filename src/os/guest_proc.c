@@ -483,6 +483,234 @@ static long pipe_content(const void *data, size_t len, int host_flags)
     return (long)fds[0];
 }
 
+/* ---- Canonical /proc classification (S64-R13-1/2) -------------------------
+ * Non-canonical spellings ("//", "/./", "/../", guest-pid spellings,
+ * relative paths resolved through dirfd) must never fall through to
+ * the translator's host /proc tree. sparc64_guest_proc_classify builds
+ * the effective absolute guest path, normalizes it, and reports
+ * HANDLED (a synthetic file this TU serves; norm_out holds the
+ * canonical "/proc/self/<entry>" spelling), BLOCKED ("/proc/self",
+ * "/proc/thread-self", or "/proc/<own-pid>" with no synthetic meaning:
+ * the caller must fail -ENOENT), or OTHER (unrelated path: fall
+ * through to the host).
+ * norm_out needs room for PROC_PATH_MAX bytes (only set when the
+ * result is HANDLED or BLOCKED). Fail-closed: an over-long absolute
+ * path starting with /proc reports BLOCKED. An unresolvable relative
+ * base (deleted cwd, bad dirfd) reports OTHER: the host resolves the
+ * same (dirfd, path) and fails the same way, so nothing extra leaks. */
+
+/* Resolve one fd to its absolute path (the guest fd's host backing).
+ * Returns 0 with the NUL-terminated path in out (PROC_PATH_MAX
+ * bytes), else -1. Linux reads /proc/self/fd; Darwin uses F_GETPATH. */
+static int proc_fd_path(int fd, char *out)
+{
+#if defined(__linux__)
+    char link[64];
+    ssize_t n;
+    int wn = snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    if (wn <= 0 || (size_t)wn >= sizeof(link)) {
+        return -1;
+    }
+    n = readlink(link, out, (size_t)PROC_PATH_MAX - 1U);
+    if (n < 0 || n >= (ssize_t)((size_t)PROC_PATH_MAX - 1U)) {
+        return -1;
+    }
+    out[n] = '\0';
+    return 0;
+#elif defined(__APPLE__)
+    if (fcntl(fd, F_GETPATH, out) != 0) {
+        return -1;
+    }
+    out[(size_t)PROC_PATH_MAX - 1U] = '\0';
+    return 0;
+#else
+    (void)fd;
+    (void)out;
+    return -1;
+#endif
+}
+
+/* Normalize an absolute path into out (PROC_PATH_MAX bytes): collapse
+ * "//" runs, drop "/./", resolve "/../" without escaping root, strip
+ * the trailing slash. Returns 0 on success, -1 when the input is not
+ * absolute or does not fit. */
+static int proc_normalize(const char *in, char *out)
+{
+    size_t len;
+    const char *p;
+    if (in == NULL || out == NULL || in[0] != '/') {
+        return -1;
+    }
+    out[0] = '/';
+    out[1] = '\0';
+    len = 1U;
+    p = in;
+    while (*p != '\0') {
+        const char *seg;
+        size_t sl;
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        seg = p;
+        while (*p != '\0' && *p != '/') {
+            p++;
+        }
+        sl = (size_t)(p - seg);
+        if (sl == 1U && seg[0] == '.') {
+            continue;
+        }
+        if (sl == 2U && seg[0] == '.' && seg[1] == '.') {
+            if (len > 1U) {
+                do {
+                    len--;
+                } while (len > 1U && out[len] != '/');
+                out[len] = '\0';
+            }
+            continue;
+        }
+        if (len > 1U) {
+            if (len + 1U >= (size_t)PROC_PATH_MAX) {
+                return -1;
+            }
+            out[len] = '/';
+            len++;
+        }
+        if (len + sl >= (size_t)PROC_PATH_MAX) {
+            return -1;
+        }
+        memcpy(out + len, seg, sl);
+        len += sl;
+        out[len] = '\0';
+    }
+    return 0;
+}
+
+/* Classify (dirfd, path): HANDLED/BLOCKED/OTHER as documented above.
+ * norm_out (PROC_PATH_MAX bytes) receives the canonical spelling when
+ * the result is HANDLED or BLOCKED. */
+int sparc64_guest_proc_classify(int dirfd, const char *path, char *norm_out)
+{
+    char eff[(size_t)PROC_PATH_MAX * 2U];
+    char norm[PROC_PATH_MAX];
+    size_t base_len = 0U;
+    size_t path_len;
+    if (path == NULL || norm_out == NULL) {
+        return SPARC64_PROC_OTHER;
+    }
+    path_len = strlen(path);
+    if (path[0] != '/') {
+        /* Relative: resolve against dirfd. AT_FDCWD reads the shared
+         * translator/guest cwd (like note_exec above); any other
+         * dirfd resolves through its host backing path. */
+        if (dirfd == AT_FDCWD) {
+            char cwd[PROC_PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd)) == NULL) {
+                /* Unresolvable cwd: the host resolves (dirfd, path)
+                 * identically and fails the same way, so passing
+                 * through can expose nothing the guest did not name. */
+                return SPARC64_PROC_OTHER;
+            }
+            base_len = strlen(cwd);
+            if (base_len + 1U + path_len >= sizeof(eff)) {
+                return SPARC64_PROC_BLOCKED;
+            }
+            memcpy(eff, cwd, base_len);
+        } else {
+            char dir[PROC_PATH_MAX];
+            if (proc_fd_path(dirfd, dir) != 0) {
+                /* Bad fd: the host call fails EBADF on the same
+                 * (dirfd, path), so passing through is exact. */
+                return SPARC64_PROC_OTHER;
+            }
+            base_len = strlen(dir);
+            if (base_len + 1U + path_len >= sizeof(eff)) {
+                return SPARC64_PROC_BLOCKED;
+            }
+            memcpy(eff, dir, base_len);
+        }
+        eff[base_len] = '/';
+        memcpy(eff + base_len + 1U, path, path_len + 1U);
+    } else {
+        if (path_len >= sizeof(eff)) {
+            return SPARC64_PROC_BLOCKED;
+        }
+        memcpy(eff, path, path_len + 1U);
+    }
+    if (proc_normalize(eff, norm) != 0) {
+        /* Over-long absolute: fail closed for anything under /proc. */
+        if (strncmp(eff, "/proc", 5) == 0 &&
+            (eff[5] == '/' || eff[5] == '\0')) {
+            return SPARC64_PROC_BLOCKED;
+        }
+        return SPARC64_PROC_OTHER;
+    }
+    if (strcmp(norm, "/proc/self") == 0) {
+        memcpy(norm_out, norm, sizeof(norm));
+        return SPARC64_PROC_BLOCKED;
+    }
+    if (strncmp(norm, "/proc/self/", 11U) == 0) {
+        memcpy(norm_out, norm, sizeof(norm));
+        return sparc64_guest_proc_handles(norm) ?
+            SPARC64_PROC_HANDLED : SPARC64_PROC_BLOCKED;
+    }
+    /* Linux maps /proc/thread-self onto the calling thread, which is
+     * our own pid in this single-threaded-guest view: rewrite it onto
+     * /proc/self so exe is HANDLED and mem is BLOCKED (-ENOENT). */
+    if (strcmp(norm, "/proc/thread-self") == 0) {
+        memcpy(norm_out, norm, sizeof(norm));
+        return SPARC64_PROC_BLOCKED;
+    }
+    if (strncmp(norm, "/proc/thread-self/", 18U) == 0) {
+        char mapped[PROC_PATH_MAX];
+        size_t tail = strlen(norm + 17U);
+        if (tail + 11U >= sizeof(mapped)) {
+            return SPARC64_PROC_BLOCKED;
+        }
+        memcpy(mapped, "/proc/self", 10U);
+        memcpy(mapped + 10U, norm + 17U, tail + 1U);
+        memcpy(norm_out, mapped, sizeof(mapped));
+        return sparc64_guest_proc_handles(mapped) ?
+            SPARC64_PROC_HANDLED : SPARC64_PROC_BLOCKED;
+    }
+    if (strncmp(norm, "/proc/", 6U) == 0) {
+        /* A guest pid spelling of our own pid names our own tree:
+         * serve the entry it maps to, block everything else. */
+        const char *rest = norm + 6U;
+        unsigned long pid = 0UL;
+        size_t ndig = 0U;
+        while (*rest >= '0' && *rest <= '9' && ndig < 20U) {
+            pid = pid * 10UL + (unsigned long)(*rest - '0');
+            rest++;
+            ndig++;
+        }
+        if (ndig != 0U && (*rest == '/' || *rest == '\0')) {
+            long self = (long)getpid();
+            if (self > 0L && pid == (unsigned long)self) {
+                if (*rest == '\0') {
+                    memcpy(norm_out, norm, sizeof(norm));
+                    return SPARC64_PROC_BLOCKED;
+                }
+                {
+                    char mapped[PROC_PATH_MAX];
+                    size_t tail = strlen(rest);
+                    if (tail + 11U >= sizeof(mapped)) {
+                        return SPARC64_PROC_BLOCKED;
+                    }
+                    memcpy(mapped, "/proc/self", 10U);
+                    memcpy(mapped + 10U, rest, tail + 1U);
+                    memcpy(norm_out, mapped, sizeof(mapped));
+                    return sparc64_guest_proc_handles(mapped) ?
+                        SPARC64_PROC_HANDLED : SPARC64_PROC_BLOCKED;
+                }
+            }
+        }
+    }
+    return SPARC64_PROC_OTHER;
+}
+
 long sparc64_guest_proc_openat(void *guest,
     const sparc64_syscall_mem_t *mem, const char *path, int host_flags)
 {
@@ -568,52 +796,9 @@ long sparc64_guest_proc_openat(void *guest,
     }
 }
 
-long sparc64_guest_proc_open(void *guest,
-    const sparc64_syscall_mem_t *mem, uint64_t path_va, uint64_t flags,
-    uint64_t mode)
-{
-    char path[PROC_PATH_MAX];
-    long rc;
-    int host_flags;
-    uint64_t rest = flags & ~3U;
-    size_t i;
-    /* SPARC O_* subset accepted on synthetic paths (mirrors the
-     * openat flag map in syscalls_ext.c). */
-    static const struct {
-        uint64_t guest;
-        int host;
-    } map[] = {
-        { 0x0008U, O_APPEND }, { 0x4000U, O_NONBLOCK },
-        { 0x8000U, O_NOCTTY }, { 0x10000U, O_DIRECTORY },
-        { 0x20000U, O_NOFOLLOW }, { 0x400000U, O_CLOEXEC },
-        { 0x1000000U, O_PATH },
-    };
-    (void)mode;
-    rc = l2a_copy_cstring(mem, path_va, path, (uint64_t)PROC_PATH_MAX);
-    if (rc != 0) {
-        return rc;
-    }
-    if (!sparc64_guest_proc_handles(path)) {
-        return -ENOENT;
-    }
-    if ((flags & (uint64_t)0x2010000U) == (uint64_t)0x2010000U) {
-        return -EINVAL; /* SP_O_TMPFILE has no synthetic-file meaning. */
-    }
-    host_flags = (int)(flags & 3U);
-    for (i = 0U; i < sizeof(map) / sizeof(map[0]); i++) {
-        if ((rest & map[i].guest) != 0U) {
-            host_flags |= map[i].host;
-            rest &= ~map[i].guest;
-        }
-    }
-    /* Tolerated without effect: sync/dsync, largefile, noatime,
-     * direct. Anything else is -EINVAL. */
-    rest &= ~(uint64_t)(0x802000U | 0x40000U | 0x200000U | 0x100000U);
-    if (rest != 0U) {
-        return -EINVAL;
-    }
-    return sparc64_guest_proc_openat(guest, mem, path, host_flags);
-}
+/* sparc64_guest_proc_open was removed (S64-R13-10): the open(2) path
+ * goes through sparc64_l2a_openat (which classifies first), so the
+ * dirfd-less wrapper had no callers. */
 
 long sparc64_guest_proc_readlinkat(void *guest,
     const sparc64_syscall_mem_t *mem, uint64_t dirfd, uint64_t path_va,
@@ -622,45 +807,49 @@ long sparc64_guest_proc_readlinkat(void *guest,
     guest_state_t *g = as_guest(guest);
     char path[PROC_PATH_MAX];
     char host_buf[PROC_PATH_MAX];
+    char norm[PROC_PATH_MAX];
+    int host_dirfd = ((int64_t)dirfd == PROC_AT_FDCWD) ? AT_FDCWD :
+        (int)dirfd;
+    int cls;
     long rc = l2a_copy_cstring(mem, path_va, path,
         (uint64_t)PROC_PATH_MAX);
     size_t len;
     if (rc != 0) {
         return rc;
     }
-    if (strcmp(path, "/proc/self/exe") == 0) {
-        long stored;
-        /* Like the kernel (and the oracle), readlink reports the
-         * canonical absolute path, not argv[0] verbatim: ld.so's
-         * _dl_get_origin asserts linkval[0] == '/' and computes
-         * $ORIGIN from it. open() above serves the same load_path. */
-        if (g == NULL || g->proc == NULL ||
-                g->proc->load_path[0] == '\0') {
-            return -ENOENT;
-        }
-        (void)dirfd;
-        len = strlen(g->proc->load_path);
-        if (len > (size_t)bufsz) {
-            len = (size_t)bufsz;
-        }
-        /* readlink reports the byte count, not a status code. */
-        stored = l2a_store_buf(mem, buf_va,
-            (const uint8_t *)g->proc->load_path, (uint64_t)len);
-        return (stored != 0) ? stored : (long)len;
-    }
-    if (sparc64_guest_proc_handles(path)) {
-        return -EINVAL; /* Synthetic regular files, not links. */
-    }
-    if (strcmp(path, "/proc/self") == 0 ||
-            strncmp(path, "/proc/self/", 11U) == 0) {
+    /* S64-R13-1: normalize before classifying so non-canonical
+     * spellings ("/proc/./self/exe", dirfd-relative "proc/self/mem")
+     * and guest-pid spellings never reach the host /proc tree. */
+    cls = sparc64_guest_proc_classify(host_dirfd, path, norm);
+    if (cls == SPARC64_PROC_BLOCKED) {
         return -ENOENT;
+    }
+    if (cls == SPARC64_PROC_HANDLED) {
+        if (strcmp(norm, "/proc/self/exe") == 0) {
+            long stored;
+            /* Like the kernel (and the oracle), readlink reports the
+             * canonical absolute path, not argv[0] verbatim: ld.so's
+             * _dl_get_origin asserts linkval[0] == '/' and computes
+             * $ORIGIN from it. open() above serves the same load_path. */
+            if (g == NULL || g->proc == NULL ||
+                    g->proc->load_path[0] == '\0') {
+                return -ENOENT;
+            }
+            len = strlen(g->proc->load_path);
+            if (len > (size_t)bufsz) {
+                len = (size_t)bufsz;
+            }
+            /* readlink reports the byte count, not a status code. */
+            stored = l2a_store_buf(mem, buf_va,
+                (const uint8_t *)g->proc->load_path, (uint64_t)len);
+            return (stored != 0) ? stored : (long)len;
+        }
+        return -EINVAL; /* Synthetic regular files, not links. */
     }
     if (bufsz == 0U) {
         return 0;
     }
     {
-        int host_dirfd = ((int64_t)dirfd == PROC_AT_FDCWD) ? AT_FDCWD :
-            (int)dirfd;
         ssize_t got = readlinkat(host_dirfd, path, host_buf,
             sizeof(host_buf));
         long stored;

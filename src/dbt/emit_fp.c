@@ -65,6 +65,7 @@
 
 /* Guest FP file base (ctx + 0x140); FSR at ctx + 0x120. */
 static bool fp_sync_fsr(sparc64_emit_ctx_t *ec);
+static bool fp_accrue_fpsr(sparc64_emit_ctx_t *ec);
 
 /* Rounding guard prologue: FSR.RD (bits 31:30) and FSR.TEM
  * (bits 27:23) must both be 0 (round-to-nearest with all traps masked,
@@ -97,10 +98,59 @@ static bool fp_guard_rd0(sparc64_emit_ctx_t *ec)
         sb_patch_cb(b, p_ok, b->count);
         b->fp_fast_checked = true;
     }
-    if (!b->fpsr_dirty) {
+    if (b->fpsr_dirty) {
+        /* A previous FPop in this batch left flags in host FPSR:
+         * accrue them into FSR.aexc (cexc stays for the last FPop)
+         * and clear FPSR so the next FPop starts clean. */
+        if (!fp_accrue_fpsr(ec)) {
+            return false;
+        }
+    } else {
         sb_word(b, UINT32_C(0xd51b443f)); /* msr FPSR, xzr */
         b->fpsr_dirty = true;
     }
+    return !b->overflow;
+}
+
+/* Lightweight 5-bit accrue (S64-R15-1): fold the previous FPop's host
+ * FPSR flags into FSR.aexc (bits 9:5), then clear FPSR for the next
+ * FPop. FSR.cexc is untouched: it comes only from the LAST FPop before
+ * an observable point (stfsr, block exit, branch, call). TEM == 0 is
+ * guaranteed on the inline path (fp_guard_rd0 exits UNDEF otherwise),
+ * so no trap check is needed; an earlier FPop in this batch could not
+ * trap and its flags only accrue. Uses no flag-setting instructions
+ * (MRS/UBFM/CBZ/ORR/LSL, never ANDS), so integer host NZCV survives.
+ * When the previous op raised no flags the MRS + CBZ pair (2 insns)
+ * skips the MSR because FPSR is already zero. */
+static bool fp_accrue_fpsr(sparc64_emit_ctx_t *ec)
+{
+    sparc64_dbt_buf_t *b = ec->buf;
+    size_t p_clean;
+    sb_word(b, UINT32_C(0xd53b4420) | (ES3 & 31U)); /* mrs ES3, FPSR */
+    sb_ubfm(b, false, ES3, ES3, 0U, 4U);
+    p_clean = sb_cbz_placeholder(b, false, false, ES3);
+    if (p_clean == SPARC64_DBT_NOPOS) {
+        return false;
+    }
+    sb_ubfm(b, false, ES4, ES3, 4U, 4U);
+    sb_ubfm(b, false, ES5, ES3, 1U, 1U);
+    e_lsl_imm32(b, ES5, ES5, 1U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ubfm(b, false, ES5, ES3, 3U, 3U);
+    e_lsl_imm32(b, ES5, ES5, 2U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ubfm(b, false, ES5, ES3, 2U, 2U);
+    e_lsl_imm32(b, ES5, ES5, 3U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ubfm(b, false, ES5, ES3, 0U, 0U);
+    e_lsl_imm32(b, ES5, ES5, 4U);
+    sb_orr_reg(b, false, ES4, ES4, ES5);
+    sb_ldst_imm(b, true, true, ES5, ECTX, FP_FSR_OFF);
+    e_lsl_imm32(b, ES4, ES4, 5U);
+    sb_orr_reg(b, true, ES5, ES5, ES4);
+    sb_ldst_imm(b, false, true, ES5, ECTX, FP_FSR_OFF);
+    sb_patch_cb(b, p_clean, b->count);
+    sb_word(b, UINT32_C(0xd51b443f)); /* msr FPSR, xzr */
     return !b->overflow;
 }
 

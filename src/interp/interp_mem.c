@@ -358,7 +358,6 @@ bool sparc64_fetch_word(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
     uint32_t *out, sparc64_step_result_t *res)
 {
     uint8_t b[4];
-    unsigned i;
     if ((va & UINT64_C(3)) != UINT64_C(0)) {
         *res = sparc64_trap(SPARC64_TRAP_INST_MISALIGNED, va, va);
         return false;
@@ -368,12 +367,11 @@ bool sparc64_fetch_word(const sparc64_mem_ops_t *mem, void *mc, uint64_t va,
         res->memory_reason = SPARC64_MEM_FAULT_INTERNAL;
         return false;
     }
-    for (i = 0; i < 4U; i++) {
+    {
         sparc64_mem_fault_t fault;
-        fault.address = va + (uint64_t)i;
+        fault.address = va;
         fault.reason = SPARC64_MEM_FAULT_NONE;
-        if (!mem->read(mc, va + (uint64_t)i, &b[i], 1U,
-                SPARC64_ACCESS_FETCH, &fault)) {
+        if (!mem->read(mc, va, b, 4U, SPARC64_ACCESS_FETCH, &fault)) {
             *res = sparc64_mem_trap(&fault, va, false);
             if (res->kind == SPARC64_STEP_TRAP) {
                 res->cause = SPARC64_TRAP_INST_ACCESS;

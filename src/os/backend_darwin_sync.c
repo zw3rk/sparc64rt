@@ -160,10 +160,21 @@ int rt_host_worker_sync_init(rt_worker_sync_t *ws)
         if (ws->kqueue_fd >= 0) { (void)close(ws->kqueue_fd); ws->kqueue_fd = -1; }
         return -(int)errno;
     }
-    (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-    (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    (void)fcntl(fds[0], F_SETFL, O_NONBLOCK);
-    (void)fcntl(fds[1], F_SETFL, O_NONBLOCK);
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(fds[0], F_SETFL, O_NONBLOCK) != 0 ||
+        fcntl(fds[1], F_SETFL, O_NONBLOCK) != 0) {
+        int saved = errno;
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        if (ws->kqueue_fd >= 0) {
+            (void)close(ws->kqueue_fd);
+            ws->kqueue_fd = -1;
+        }
+        ws->wake_pipe_rd = -1;
+        ws->wake_pipe_wr = -1;
+        return -saved;
+    }
     ws->wake_pipe_rd = fds[0];
     ws->wake_pipe_wr = fds[1];
     return 0;

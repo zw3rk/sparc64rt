@@ -102,6 +102,10 @@
 #define SP_FUTEX_WAIT 0U
 #define SP_FUTEX_WAKE 1U
 
+/* The /proc classifier writes up to 4096 bytes into its norm_out buffer;
+ * the openat staging below must offer at least that much. */
+_Static_assert(L2A_PATH_MAX >= 4096U, "L2A_PATH_MAX fits norm_out");
+
 /* SP_AT_* live in syscalls_ext.h (shared with syscalls_dirent.c). */
 
 #define SP_CLOCK_REALTIME 0U
@@ -186,9 +190,11 @@ long sparc64_l2a_openat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t dirfd, uint64_t path_va, uint64_t flags, uint64_t mode)
 {
     char path[L2A_PATH_MAX];
+    char norm[L2A_PATH_MAX];
     long rc = l2a_copy_cstring(mem, path_va, path, (uint64_t)L2A_PATH_MAX);
     int host_flags;
     int host_dirfd;
+    int cls;
     int fd;
     (void)ctx;
     if (rc != 0) {
@@ -198,18 +204,20 @@ long sparc64_l2a_openat(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     if (rc != 0) {
         return rc;
     }
-    /* Phase 5 L5a: /proc/self files are synthetic (exe/maps/cmdline/
-     * stat/auxv); other proc-self paths are -ENOENT, never the host
-     * translator's proc tree (S64-R12-6). */
-    if (sparc64_guest_proc_handles(path)) {
-        return sparc64_guest_proc_openat(mem->context, mem, path,
+    /* Phase 5 L5a + S64-R13-1/2: canonicalize before classifying so
+     * non-canonical spellings ("/proc/./self/exe", dirfd-relative
+     * "proc/self/mem") and guest-pid spellings never fall through to
+     * the host translator's proc tree. norm has PROC_PATH_MAX bytes
+     * (L2A_PATH_MAX matches). */
+    host_dirfd = ((int64_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd;
+    cls = sparc64_guest_proc_classify(host_dirfd, path, norm);
+    if (cls == SPARC64_PROC_HANDLED) {
+        return sparc64_guest_proc_openat(mem->context, mem, norm,
             host_flags);
     }
-    if (strcmp(path, "/proc/self") == 0 ||
-            strncmp(path, "/proc/self/", 11U) == 0) {
+    if (cls == SPARC64_PROC_BLOCKED) {
         return -ENOENT;
     }
-    host_dirfd = ((int64_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd;
     /* Absolute guest paths try SPARC64RT_SYSROOT first (qemu -L). */
     if (sparc64_sysroot_try_open(host_dirfd, path, host_flags,
             (unsigned)(mode & 0777U), &fd)) {

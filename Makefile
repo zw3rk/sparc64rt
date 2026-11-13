@@ -203,4 +203,22 @@ check-r3-darwin: ## Build and run the Round-3 Darwin backend test (S64-R3-4/5/6/
 		echo "check-r3-darwin: Darwin-only backend, pass"; \
 	fi
 
-test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin check-r7 ## Host-side gates with -Werror (no cross toolchain needed)
+# ---- Round-13/14/15/16 remediation gate (S64-R13-1..16) --------------------
+check-r1316: ## Build and run the Rounds 13-16 regression tests (proc, DBT, FP)
+	$(HOST_CC) $(CFLAGS) -Isrc -Iinclude tests/test_r1316_remediation.c \
+		src/os/guest_proc.c \
+		src/dbt/dbt.c src/dbt/mem_sites.c src/dbt/emit_cond.c \
+		src/dbt/emit_fast.c src/dbt/emit_fp.c src/dbt/emit_fpcmp.c \
+		src/dbt/emit_int.c src/dbt/emit_mem.c src/dbt/emit_rt.c \
+		src/dbt/trampoline_a64.S \
+		src/interp/interp.c src/interp/decode.c src/interp/interp_win.c \
+		src/interp/interp_mem.c src/interp/fp.c src/interp/fp_commit.c \
+		src/interp/fp_ldst.c src/interp/fp_conv.c src/interp/fp_sd.c \
+		src/interp/fp_quad.c src/interp/fp_qdiv.c src/interp/fp_qconv.c \
+		src/interp/interp_cond.c \
+		src/os/mem_space.c src/os/mem_space_write.c \
+		src/vm/vm64.c src/vm/vm_file.c \
+		-o $(BUILD_DIR)/test_r1316_remediation && \
+	./$(BUILD_DIR)/test_r1316_remediation
+
+test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin check-r7 check-r1316 ## Host-side gates with -Werror (no cross toolchain needed)

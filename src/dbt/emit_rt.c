@@ -20,8 +20,20 @@
 #include "dbt/dbt.h"
 #include "dbt/mem_sites.h"
 
-/* Invalidate wider than this many pages courses to a full flush. */
-#define DBT_MAX_PRECISE_PAGES 4096U
+/* A small-range invalidate (fewer than this many 4 KiB pages) evicts
+ * only the overlapping direct-mapped block-cache and IBTC slots (see
+ * sparc64_dbt_invalidate): unrelated pages keep their cached blocks
+ * and IBTC entries hot. Wider ranges course to a full flush (which
+ * also reclaims the code arena). */
+#define DBT_MAX_PRECISE_PAGES 8U
+
+/* A translated block spans at most 64 insns plus one inline CTI delay
+ * slot, so any block overlapping [va, end) starts within MAX_SPAN
+ * bytes before va (4-byte-aligned probes cover every direct-mapped
+ * block-cache and IBTC slot it could occupy). */
+#define DBT_INVALIDATE_MAX_SPAN \
+    ((uint64_t)SPARC64_DBT_MAX_INSNS_PER_BLOCK * UINT64_C(4) + \
+        UINT64_C(4))
 
 /* Trampoline probe layout contract (trampoline_a64.S hardcodes these
  * field offsets; break the build loudly if dbt.h ever drifts). */
@@ -86,22 +98,32 @@ static void dbt_flush_all(sparc64_dbt_t *dbt)
     }
 }
 
-static void dbt_page_bump(sparc64_dbt_t *dbt, uint64_t vpn)
+/* Record one VPN in the page-version table (fresh version 1). */
+static void dbt_page_record(sparc64_dbt_t *dbt, uint64_t vpn)
+{
+    sparc64_dbt_page_t *e = &dbt->pages[dbt_page_index(vpn)];
+    e->vpn = vpn;
+    e->version = 1U;
+    e->valid = true;
+}
+
+/* Bump one VPN's version; true when the slot held a different live
+ * VPN (hash alias), so the caller flushes and re-records instead of
+ * trusting a recycled version. */
+static bool dbt_page_bump(sparc64_dbt_t *dbt, uint64_t vpn)
 {
     sparc64_dbt_page_t *e = &dbt->pages[dbt_page_index(vpn)];
     if (!e->valid || e->vpn != vpn) {
-        e->vpn = vpn;
-        e->version = 1U;
-        e->valid = true;
-        return;
+        bool aliased = e->valid && e->vpn != vpn;
+        dbt_page_record(dbt, vpn);
+        return aliased;
     }
     e->version += 1U;
     if (e->version == 0U) {
         dbt_flush_all(dbt);
-        e->vpn = vpn;
-        e->version = 1U;
-        e->valid = true;
+        dbt_page_record(dbt, vpn);
     }
+    return false;
 }
 
 int sparc64_dbt_init(sparc64_dbt_t *dbt)
@@ -133,7 +155,10 @@ void sparc64_dbt_invalidate(sparc64_dbt_t *dbt, uint64_t va, uint64_t len)
     uint64_t first_vpn;
     uint64_t last_vpn;
     uint64_t vpn;
-    uint32_t i;
+    uint64_t va_aligned;
+    uint64_t scan_lo;
+    uint64_t scan_hi;
+    uint64_t pc;
     if (dbt == NULL || len == UINT64_C(0)) {
         return;
     }
@@ -148,14 +173,41 @@ void sparc64_dbt_invalidate(sparc64_dbt_t *dbt, uint64_t va, uint64_t len)
         dbt_flush_all(dbt);
         return;
     }
+    /* A CTI at prev_page + 0xffc delays into va: version the previous
+     * page too when va sits at its very start. */
+    if ((va & (SPARC64_DBT_PAGE_SIZE - UINT64_C(1))) < UINT64_C(4) &&
+        first_vpn > UINT64_C(0) &&
+        dbt_page_bump(dbt, first_vpn - UINT64_C(1))) {
+        dbt_flush_all(dbt);
+        dbt_page_record(dbt, first_vpn - UINT64_C(1));
+    }
     for (vpn = first_vpn; vpn <= last_vpn; vpn++) {
-        dbt_page_bump(dbt, vpn);
+        if (dbt_page_bump(dbt, vpn)) {
+            dbt_flush_all(dbt);
+            dbt_page_record(dbt, vpn);
+        }
         if (vpn == UINT64_MAX >> SPARC64_DBT_PAGE_SHIFT) {
             break;
         }
     }
-    for (i = 0U; i < SPARC64_DBT_CACHE_SIZE; i++) {
-        sparc64_dbt_block_t *b = &dbt->blocks[i];
+    /* Direct-mapped probes only: every overlapping block starts in
+     * [scan_lo, scan_hi), so no full cache or IBTC scan is needed and
+     * the epoch stays put (unrelated pages keep their entries hot).
+     * Cleared blocks also release their Soft-TLB write guard (the
+     * page_has_code check in mem_sites.c keys on valid/host_code). */
+    va_aligned = va & ~UINT64_C(3);
+    scan_lo = (va_aligned > DBT_INVALIDATE_MAX_SPAN) ?
+        (va_aligned - DBT_INVALIDATE_MAX_SPAN) : UINT64_C(0);
+    if (end >= UINT64_C(0xFFFFFFFFFFFFFFFC)) {
+        scan_hi = UINT64_C(0xFFFFFFFFFFFFFFFC);
+    } else {
+        scan_hi = (end + UINT64_C(3)) & ~UINT64_C(3);
+    }
+    for (pc = scan_lo; pc < scan_hi; pc += UINT64_C(4)) {
+        sparc64_dbt_block_t *b = &dbt->blocks[(uint32_t)((pc >> 2U) &
+            (uint64_t)(SPARC64_DBT_CACHE_SIZE - 1U))];
+        sparc64_dbt_ibtc_t *e = &dbt->ibtc[(uint32_t)((pc >> 2U) &
+            (uint64_t)(SPARC64_IBTC_SIZE - 1U))];
         if (b->valid && !(b->end_pc <= va || b->start_pc >= end)) {
             b->valid = false;
             b->host_code = NULL;
@@ -163,11 +215,11 @@ void sparc64_dbt_invalidate(sparc64_dbt_t *dbt, uint64_t va, uint64_t len)
                 dbt->cached_count -= 1U;
             }
         }
-    }
-    for (i = 0U; i < SPARC64_IBTC_SIZE; i++) {
-        sparc64_dbt_ibtc_t *e = &dbt->ibtc[i];
-        if (e->valid && !(e->key < va || e->key >= end)) {
+        if (e->valid && !(e->key < scan_lo || e->key >= scan_hi)) {
             e->valid = false;
+        }
+        if (pc >= UINT64_C(0xFFFFFFFFFFFFFFFC)) {
+            break;
         }
     }
 }

@@ -634,43 +634,6 @@ void sparc64_decode_word(uint32_t word, sparc64_decoded_t *out)
     }
 }
 
-int sparc64_fetch_decode(sparc64_cpu_t *cpu,
-                         const sparc64_mem_ops_t *memory,
-                         void *context,
-                         uint64_t va,
-                         sparc64_decoded_t *out)
-{
-    uint8_t bytes[4];
-    uint32_t word;
-    sparc64_mem_fault_t fault;
-
-    if (out == NULL) {
-        return -1;
-    }
-    sparc64_decode_word(0U, out);
-    if (cpu == NULL || memory == NULL || memory->read == NULL) {
-        return -1;
-    }
-    if ((va & 0x3U) != 0U) {
-        cpu->exit_reason = SPARC64_EXIT_FAULT;
-        cpu->fault_addr = va;
-        return -1;
-    }
-    fault.address = UINT64_C(0);
-    fault.reason = SPARC64_MEM_FAULT_NONE;
-    if (!memory->read(context, va, bytes, sizeof(bytes),
-                      SPARC64_ACCESS_FETCH, &fault)) {
-        if (fault.reason == SPARC64_MEM_FAULT_UNMAPPED ||
-            fault.reason == SPARC64_MEM_FAULT_PERMISSION ||
-            fault.reason == SPARC64_MEM_FAULT_RANGE ||
-            fault.reason == SPARC64_MEM_FAULT_BUS) {
-            cpu->exit_reason = SPARC64_EXIT_FAULT;
-            cpu->fault_addr = va;
-        }
-        return -1;
-    }
-    word = ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
-        ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
-    sparc64_decode_word(word, out);
-    return 0;
-}
+/* sparc64_fetch_decode was removed (S64-R13-9): callers fetch one
+ * big-endian word with sparc64_fetch_word and classify it with
+ * sparc64_decode_word, so the combined helper had no users. */

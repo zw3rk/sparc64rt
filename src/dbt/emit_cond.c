@@ -445,6 +445,7 @@ bool sparc64_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
 {
     sparc64_dbt_buf_t *b = ec->buf;
     size_t p_taken;
+    size_t taken_at = SPARC64_DBT_NOPOS;
     size_t p_syscall;
     if (d->cond == 0U) {
         return true;
@@ -465,6 +466,10 @@ bool sparc64_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
             return false;
         }
         e_exit_imm(b, ec->pc + 4U, SPARC64_EXIT_BRANCH);
+        /* Taken edge starts here: patch p_taken to this point so a
+         * true Tcc falls into the trap-number sequence below while a
+         * false Tcc exits to pc + 4 above (S64-R14-1). */
+        taken_at = b->count;
     }
     if (d->is_imm != 0U) {
         e_ld64(b, ES0, d->rs1);
@@ -488,7 +493,7 @@ bool sparc64_emit_tcc(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
     e_exit_imm(b, ec->pc, SPARC64_EXIT_SYSCALL);
     if (p_taken != SPARC64_DBT_NOPOS) {
         sb_patch_b_cond(b, p_taken, e_a64_cond[d->cond & 15U],
-            b->count);
+            taken_at);
     }
     return !b->overflow;
 }

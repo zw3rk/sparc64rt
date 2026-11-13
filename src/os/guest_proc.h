@@ -47,20 +47,32 @@ void sparc64_guest_proc_note_map(void *guest, uint64_t lo, uint64_t hi,
 /* Drop the snapshot (fork child, error paths). */
 void sparc64_guest_proc_forget(void *guest);
 
-/* openat interception: handled paths return a read-only synthetic fd
- * (pipe) or the reopened exe file, else -ENOENT so the caller falls
- * through to the host. host_flags are translated host O_* bits. */
+/* Classification of one (dirfd, path) pair (S64-R13-1/2): canonicalizes
+ * the effective guest path (redundant slashes, "/./", "/..", dirfd
+ * resolution, guest-pid and thread-self spellings) before deciding.
+ * Returns SPARC64_PROC_HANDLED when path names a synthetic file this
+ * TU serves (norm_out holds the canonical "/proc/self/<entry>"
+ * spelling), SPARC64_PROC_BLOCKED for "/proc/self",
+ * "/proc/thread-self" or "/proc/<own-pid>" with no synthetic meaning
+ * (the guest call must fail -ENOENT and never reach the host tree),
+ * else SPARC64_PROC_OTHER. norm_out needs room for 4096 bytes and is
+ * only set for HANDLED/BLOCKED. */
+#define SPARC64_PROC_OTHER 0
+#define SPARC64_PROC_HANDLED 1
+#define SPARC64_PROC_BLOCKED (-1)
+int sparc64_guest_proc_classify(int dirfd, const char *path,
+    char *norm_out);
+
+/* openat interception: HANDLED canonical paths return a read-only
+ * synthetic fd (pipe) or the reopened exe file, anything else is
+ * -ENOENT (callers classify first and only invoke this for HANDLED
+ * paths). host_flags are translated host O_* bits. */
 long sparc64_guest_proc_openat(void *guest,
     const sparc64_syscall_mem_t *mem, const char *path, int host_flags);
 
-/* open(path, flags, mode) shared body (dirfd is AT_FDCWD). */
-long sparc64_guest_proc_open(void *guest,
-    const sparc64_syscall_mem_t *mem, uint64_t path_va, uint64_t flags,
-    uint64_t mode);
-
-/* readlinkat body: /proc/self/exe yields the absolute load path
- * (truncated like readlink, no NUL); other synthetic files are
- * regular files (EINVAL); everything else is the host readlinkat. */
+/* readlinkat body: HANDLED paths serve the load path (exe, truncated
+ * like readlink, no NUL) or EINVAL (synthetic regular files); BLOCKED
+ * paths are -ENOENT; everything else is the host readlinkat. */
 long sparc64_guest_proc_readlinkat(void *guest,
     const sparc64_syscall_mem_t *mem, uint64_t dirfd, uint64_t path_va,
     uint64_t buf_va, uint64_t bufsz);

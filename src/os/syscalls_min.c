@@ -147,7 +147,7 @@ uint64_t sparc64_host_errno_to_guest(long host_errno)
     case EPIPE: return 32U;
     case ERANGE: return 34U;
     case ENAMETOOLONG: return 63U;
-    case ENOSYS: return 90U;
+    case ENOSYS: return (uint64_t)SPARC64_GUEST_ENOSYS;
     case ELOOP: return 62U;
     case EOVERFLOW: return 92U;
     default: break;

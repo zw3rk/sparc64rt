@@ -339,9 +339,9 @@ static sparc64_step_result_t exec_cti(sparc64_cpu_t *cpu,
     return sparc64_step_ok(pc);
 }
 
-/* Trap on condition: false advances; true with trap# 0x6d is the syscall
- * gate (no state change, the L1c layer applies carry + pc advance);
- * any other true trap number traps ILLEGAL. */
+/* Trap on condition: false advances; true with trap# 0x6d, 0x6e, or
+ * 0x6f is a syscall gate (no state change, the L1c layer applies
+ * carry + pc advance); any other true trap number traps ILLEGAL. */
 static sparc64_step_result_t exec_tcc(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {

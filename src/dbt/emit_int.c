@@ -37,7 +37,6 @@ static bool e_cc_transparent(const sparc64_dec_t *d)
     case SPARC64_ICLS_SETHI:
     case SPARC64_ICLS_SHIFT:
     case SPARC64_ICLS_RDASR:
-    case SPARC64_ICLS_WRASR:
     case SPARC64_ICLS_MEMBAR:
     case SPARC64_ICLS_FLUSH:
     case SPARC64_ICLS_ALIGN:
@@ -51,6 +50,11 @@ static bool e_cc_transparent(const sparc64_dec_t *d)
     case SPARC64_ICLS_SAVE:
     case SPARC64_ICLS_RESTORE:
         return true;
+    case SPARC64_ICLS_WRASR:
+        /* WR %ccr rewrites the CCR a later Bicc/BPcc/MOVcc/Tcc would
+         * test: live host NZCV from an earlier cc op is stale past
+         * it, so only WRASR targeting other ASRs is transparent. */
+        return d->rd != (uint32_t)SPARC64_ASR_CCR;
     case SPARC64_ICLS_ALU:
         switch (d->op3) {
         case SPARC64_OP3_ADD:
@@ -434,6 +438,10 @@ static bool e_emit_wrasr(sparc64_emit_ctx_t *ec, const sparc64_dec_t *d)
         sb_ubfm(b, false, ES1, ES1, 0U, 7U);
         sb_orr_reg(b, true, ES0, ES0, ES1);
         sb_ldst_imm(b, false, true, ES0, ECTX, SPARC64_CTX_CCR_OFFSET);
+        /* The CCR changed: a live NZCV cache from an earlier cc op no
+         * longer describes it, so later Bicc/BPcc/MOVcc/Tcc reload
+         * from ctx instead of branching on stale host flags. */
+        ec->buf->nzcv_state = SPARC64_NZCV_NONE;
         break;
     case SPARC64_ASR_ASI:
         sb_ubfm(b, false, ES1, ES1, 0U, 7U);

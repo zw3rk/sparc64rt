@@ -41,6 +41,7 @@
 #include "os/mem_space.h"
 #include "os/threads.h"
 #include "os/threads_darwin.h"
+#include "os/syscalls_min.h"
 
 static int fails = 0;
 
@@ -331,10 +332,12 @@ int main(void)
             sparc64_thread_big_unlock();
             check("futex-abs-etimedout", wrc == -110);
         }
-        /* Unknown commands stay -ENOSYS like the Linux path. */
+        /* Unknown commands stay -ENOSYS like the Linux path
+         * (SPARC64 guest ENOSYS is 90, S64-R13-7). */
         check("futex-enosys",
             thr_darwin_futex_wait(NULL, &ops, UINT64_C(0x300000),
-                UINT64_C(2), UINT64_C(0x1234), 0U, NULL) == -38);
+                UINT64_C(2), UINT64_C(0x1234), 0U, NULL) ==
+                -SPARC64_GUEST_ENOSYS);
         thr_darwin_ws_teardown();
         sparc64_space_destroy(&t_guest.space);
     }
