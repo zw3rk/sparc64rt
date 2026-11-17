@@ -73,7 +73,11 @@ uint32_t sparc64_dbt_page_version(sparc64_dbt_t *dbt, uint64_t va)
 static void dbt_flush_all(sparc64_dbt_t *dbt)
 {
     uint32_t i;
-    size_t span;
+    /* Do not reopen RW or reset arena_used here: sparc64_dbt_invalidate
+     * can run mid-block from guest_mem_write while the caller's return
+     * address still points into arena_base. Bumping dbt->epoch forces an
+     * immediate exit at block end; dbt_stage recycles arena_used safely
+     * from the top-level dispatcher when no block is on the stack. */
     for (i = 0U; i < SPARC64_DBT_CACHE_SIZE; i++) {
         dbt->blocks[i].valid = false;
         dbt->blocks[i].host_code = NULL;
@@ -85,16 +89,6 @@ static void dbt_flush_all(sparc64_dbt_t *dbt)
     dbt->epoch += 1U;
     if (dbt->epoch == 0U) {
         dbt->epoch = 1U;
-    }
-    if (dbt->arena_base != NULL) {
-        if (dbt->arena_published) {
-            span = a32h_page_span(dbt->arena_used);
-            if (a32h_wx_reopen(dbt->arena_base, span) != 0) {
-                return;
-            }
-            dbt->arena_published = false;
-        }
-        dbt->arena_used = 0U;
     }
 }
 
