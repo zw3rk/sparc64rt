@@ -129,6 +129,18 @@ void sparc64_sync_sig_clone(sparc64_ctx_t *child,
 int sparc64_sync_sig_deliver_pending(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *mem);
 
+/* ppoll/pselect6 -EINTR delivery: pick the lowest deliverable signal
+ * under the current (temporary) blocked mask, skipping SIG_IGN ones.
+ * With has_saved_mask, saved_mask is restored before returning and a
+ * handler frame records it (sigreturn restores saved_mask; the handler
+ * runs with saved_mask | sa_mask | self); without it the current mask
+ * is used. Returns 1 when a handler frame was pushed (pc/npc name the
+ * handler), 0 when nothing was deliverable, -1 when the signal is
+ * fatal (no handler, or the frame could not be written). */
+int sparc64_sync_sig_deliver_pending_saved(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t saved_mask,
+    int has_saved_mask);
+
 /* Queue a kill-family signal for the current thread: SIGKILL is fatal
  * (-1), SIGSTOP is a no-op (0, cannot stop), an unhandled signal is
  * fatal (-1), a blocked signal is queued (1), otherwise the signal is
@@ -149,6 +161,11 @@ void sparc64_sync_sig_classify_raw(uint32_t raw, int *signo_out,
  * committed the result (dual-carry), advanced pc/npc past the trap,
  * and redirected ctx at the signal handler: the dispatch tail must be
  * skipped (ctx->syscalls_executed++ and return 0, like rt_sigreturn). */
+
+/* Fatal guest signal: report signo, disarm every handler, and park pc
+ * on the unmapped zero page so the next step ends the guest. */
+void sparc64_sig_force_fatal(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, int signo);
 
 long sparc64_sig_rt_sigaction(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *mem, uint64_t sig, uint64_t act_va,

@@ -65,6 +65,15 @@ extern const sparc64_mem_ops_t guest_mem_ops;
 
 #define SYNC_SIG_MAX 64U
 
+/* sparc64 SA_RESTART / SA_RESETHAND. SA_RESTART needs no restart
+ * logic: guest handlers only run at synchronous points (traps,
+ * self-kill, sigprocmask-unblock, sigreturn, and the ppoll/pselect6
+ * temporary-mask -EINTR, which Linux never restarts either), never
+ * inside another interrupted blocking syscall. SA_RESETHAND is
+ * applied in sparc64_sync_sig_deliver. */
+#define SYNC_SA_RESTART UINT64_C(0x2)
+#define SYNC_SA_RESETHAND UINT64_C(0x4)
+
 static uint64_t sync_handler[SYNC_SIG_MAX + 1U];
 static uint64_t sync_flags[SYNC_SIG_MAX + 1U];
 static uint64_t sync_restorer[SYNC_SIG_MAX + 1U];
@@ -132,10 +141,16 @@ int sparc64_sync_sig_install_full(uint64_t sig, uint64_t handler,
         sig == (uint64_t)SPARC64_SIG_STOP) {
         return -EINVAL;
     }
+    /* Kernel sparc64 sa_flags: SA_ONSTACK 1, SA_RESTART 2, SA_RESETHAND
+     * 4, SA_NOCLDSTOP 8, SA_NODEFER 0x20, SA_NOCLDWAIT 0x100,
+     * SA_SIGINFO 0x200. glibc passes sa_handler-style actions without
+     * SA_SIGINFO (e.g. OpenSSL's CPU probe); delivery always builds the
+     * rt frame, so the extra handler arguments are harmless. */
     allowed = (uint64_t)SPARC64_SA_SIGINFO |
-        (uint64_t)SPARC64_SA_ONSTACK | (uint64_t)SPARC64_SA_NODEFER;
-    if ((flags & ~allowed) != UINT64_C(0) ||
-        (flags & (uint64_t)SPARC64_SA_SIGINFO) == UINT64_C(0)) {
+        (uint64_t)SPARC64_SA_ONSTACK | (uint64_t)SPARC64_SA_NODEFER |
+        SYNC_SA_RESTART | SYNC_SA_RESETHAND | UINT64_C(0x8) |
+        UINT64_C(0x100);
+    if ((flags & ~allowed) != UINT64_C(0)) {
         return -EINVAL;
     }
     if (handler != UINT64_C(0) && handler != UINT64_C(1) &&
@@ -658,6 +673,11 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
     ctx->r[SPARC64_SP] = base - SPARC64_STACK_BIAS;
     ctx->pc = handler;
     ctx->npc = handler + 4U;
+    /* SA_RESETHAND (kernel SA_ONESHOT): the disposition reverts to
+     * SIG_DFL once the frame is built, before the handler runs. */
+    if ((sync_flags[(unsigned)signo] & SYNC_SA_RESETHAND) != UINT64_C(0)) {
+        sync_handler[(unsigned)signo] = UINT64_C(0);
+    }
     return 0;
 }
 
@@ -686,6 +706,41 @@ int sparc64_sync_sig_deliver_pending(sparc64_ctx_t *ctx,
             SPARC64_SI_USER, UINT64_C(0));
     }
     return 1;
+}
+
+/* ppoll/pselect6 -EINTR delivery (Linux restore_saved_sigmask): the
+ * signal is chosen under the still-installed temporary mask, but the
+ * frame records saved_mask and the handler runs with
+ * saved_mask | sa_mask | self (sparc64_sync_sig_deliver reads the old
+ * set from st->blocked, so saved_mask is reinstated first). */
+int sparc64_sync_sig_deliver_pending_saved(sparc64_ctx_t *ctx,
+    const sparc64_syscall_mem_t *mem, uint64_t saved_mask,
+    int has_saved_mask)
+{
+    uint64_t deliverable;
+    int signo;
+    sync_thr_t *st = sync_resolve(ctx);
+    if (has_saved_mask == 0) {
+        saved_mask = st->blocked;
+    }
+    deliverable = st->pending & ~st->blocked;
+    for (signo = 1; signo <= (int)SYNC_SIG_MAX; signo++) {
+        if ((deliverable & sig_mask_bit(signo)) == UINT64_C(0)) {
+            continue;
+        }
+        if (sync_handler[(unsigned)signo] == UINT64_C(1)) {
+            st->pending &= ~sig_mask_bit(signo);
+            continue;
+        }
+        st->blocked = saved_mask;
+        if (sync_handler[(unsigned)signo] == UINT64_C(0)) {
+            return -1;
+        }
+        return (sparc64_sync_sig_deliver(ctx, mem, signo,
+            SPARC64_SI_USER, UINT64_C(0)) == 0) ? 1 : -1;
+    }
+    st->blocked = saved_mask;
+    return 0;
 }
 
 long sparc64_sync_sig_return(sparc64_ctx_t *ctx,

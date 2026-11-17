@@ -110,6 +110,12 @@ _Static_assert(L2A_PATH_MAX >= 4096U, "L2A_PATH_MAX fits norm_out");
 
 #define SP_CLOCK_REALTIME 0U
 #define SP_CLOCK_MONOTONIC 1U
+#define SP_CLOCK_PROCESS_CPUTIME 2U
+#define SP_CLOCK_THREAD_CPUTIME 3U
+#define SP_CLOCK_MONOTONIC_RAW 4U
+#define SP_CLOCK_REALTIME_COARSE 5U
+#define SP_CLOCK_MONOTONIC_COARSE 6U
+#define SP_CLOCK_BOOTTIME 7U
 
 #define SP_GRND_NONBLOCK 0x0001U
 #define SP_GRND_RANDOM 0x0002U
@@ -610,6 +616,12 @@ static long sys_clock_get(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     switch (clk_id) {
     case SP_CLOCK_REALTIME: host_clk = CLOCK_REALTIME; break;
     case SP_CLOCK_MONOTONIC: host_clk = CLOCK_MONOTONIC; break;
+    case SP_CLOCK_PROCESS_CPUTIME: host_clk = CLOCK_PROCESS_CPUTIME_ID; break;
+    case SP_CLOCK_THREAD_CPUTIME: host_clk = CLOCK_THREAD_CPUTIME_ID; break;
+    case SP_CLOCK_MONOTONIC_RAW:
+    case SP_CLOCK_MONOTONIC_COARSE: host_clk = CLOCK_MONOTONIC; break;
+    case SP_CLOCK_REALTIME_COARSE: host_clk = CLOCK_REALTIME; break;
+    case SP_CLOCK_BOOTTIME: host_clk = CLOCK_MONOTONIC; break;
     default: return -EINVAL;
     }
     if (is_res == 0 && tp_va == 0U) {

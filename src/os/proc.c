@@ -33,6 +33,7 @@
 #include "os/guest_proc.h"
 #include "os/guest_run_priv.h"
 #include "os/proc.h"
+#include "os/proc_stackframe.h"
 #include "os/sysmem_file.h"
 #include "os/guest_interp_map.h"
 
@@ -49,6 +50,7 @@ extern char **environ;
 
 /* Clone flag subset (arch-generic Linux values, same on SPARC). */
 #define PROC_CLONE_VM 0x100U
+#define PROC_CLONE_VFORK 0x4000U
 #define PROC_CLONE_SIGHAND 0x800U
 #define PROC_CLONE_THREAD 0x10000U
 #define PROC_CLONE_SETTLS 0x80000U
@@ -196,16 +198,42 @@ long sparc64_proc_clone(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     uint64_t tls_va, uint64_t child_tid_va)
 {
     uint64_t set_flags;
-    (void)stack_va;
+    uint64_t vfork_like = flags & (uint64_t)PROC_CLONE_VFORK;
+    sparc64_clone_frame_t frame = { NULL, 0U };
+    long ret;
     (void)tls_va;
-    if ((flags & (uint64_t)(PROC_CLONE_VM | PROC_CLONE_THREAD |
-            PROC_CLONE_SIGHAND | PROC_CLONE_SETTLS)) != UINT64_C(0)) {
+    if ((flags & (uint64_t)(PROC_CLONE_THREAD | PROC_CLONE_SIGHAND |
+            PROC_CLONE_SETTLS)) != UINT64_C(0) ||
+        ((flags & (uint64_t)PROC_CLONE_VM) != UINT64_C(0) &&
+         vfork_like == UINT64_C(0))) {
         /* Host-thread-backed threads belong to lane L4b. */
         return -EINVAL;
     }
     set_flags = flags & (uint64_t)(PROC_CLONE_PARENT_SETTID |
         PROC_CLONE_CHILD_SETTID | PROC_CLONE_CHILD_CLEARTID);
-    return proc_do_fork(ctx, mem, parent_tid_va, child_tid_va, set_flags);
+    /* Snapshot the current frame before forking: an unreadable or
+     * inverted frame fails the clone in the parent, cleanly. */
+    if (vfork_like != UINT64_C(0) && stack_va != UINT64_C(0)) {
+        long frc = sparc64_clone_frame_capture(ctx, mem, &frame);
+        if (frc != 0) {
+            return frc;
+        }
+    }
+    ret = proc_do_fork(ctx, mem, parent_tid_va, child_tid_va, set_flags);
+    /* CLONE_VM|CLONE_VFORK (glibc posix_spawn): run the child as a
+     * fork on its private stack. The shared-memory exec-error report
+     * is lost; a failed exec surfaces as exit status 127 instead.
+     * Like Linux clone_stackframe(), the child gets a copy of the
+     * parent's current frame below the new stack top. */
+    if (ret >= 0 && ctx->r[SPARC64_O1] == UINT64_C(1) &&
+        vfork_like != UINT64_C(0) && stack_va != UINT64_C(0)) {
+        long irc = sparc64_clone_frame_install(ctx, mem, stack_va, &frame);
+        if (irc != 0) {
+            ret = irc;
+        }
+    }
+    free(frame.data);
+    return ret;
 }
 
 /* Close every CLOEXEC fd >= 3 (execve semantics), except the

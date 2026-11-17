@@ -139,6 +139,12 @@ static int engine_setjmp_trap(sparc64_ctx_t *ctx,
         engine_put64(&jb[0x110] + (uint64_t)i * 8U,
             ctx->r[SPARC64_I0 + i]);
     }
+    /* glibc's ____longjmp_chk reads the saved %sp from jmp_buf+0xa8
+     * (the kernel ucontext's MC_O6 slot) to detect unwinding to a
+     * popped frame. %o3 is caller-saved across setjmp, so its slot in
+     * the private snapshot holds the biased %sp instead; longjmp
+     * restores it into %o3, which the ABI allows to be clobbered. */
+    engine_put64(&jb[0xA8], ctx->r[SPARC64_SP]);
     engine_put64(&jb[0x150], sparc64_sync_sig_blocked_get(ctx));
     engine_put64(&jb[0x158], (uint64_t)ctx->cansave);
     engine_put64(&jb[0x160], (uint64_t)ctx->canrestore);

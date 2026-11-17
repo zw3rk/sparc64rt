@@ -516,6 +516,15 @@ bool sparc64_asi_check(uint64_t pc, const sparc64_dec_t *d, bool *little,
         *res = sparc64_trap(SPARC64_TRAP_PRIVILEGED, pc, d->raw);
         return false;
     }
+    if (asi >= 0xC0U) {
+        /* User-level VIS ASIs (partial store 0xC0.., short FP 0xD0..,
+         * block 0xE0..): VIS is not implemented, so report the
+         * instruction as illegal (SIGILL). Capability probes such as
+         * OpenSSL's sparcv9cap catch SIGILL only and then fall back to
+         * the portable C code. */
+        *res = sparc64_trap(SPARC64_TRAP_ILLEGAL, pc, d->raw);
+        return false;
+    }
     *res = sparc64_trap(SPARC64_TRAP_LOAD_ACCESS, pc, d->raw);
     return false;
 }
