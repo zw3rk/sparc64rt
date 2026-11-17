@@ -76,7 +76,7 @@ static const int poll_reserved[] = {
 /* Read a guest sigset (BE64) into a host sigset_t. A NULL pointer
  * means "no mask" (*have = 0); otherwise sigsetsize must be 8. */
 static long poll_sigmask(memp_t mem, uint64_t sigva, uint64_t sigsetsize,
-                         sigset_t *out, int *have)
+                         sigset_t *out, int *have, uint64_t *guest)
 {
     uint8_t raw[8];
     uint64_t bits;
@@ -95,12 +95,25 @@ static long poll_sigmask(memp_t mem, uint64_t sigva, uint64_t sigsetsize,
         return rc;
     }
     bits = l2a_get_be64(raw);
+    *guest = bits & ~(SPARC64_SIGKILL_BIT | SPARC64_SIGSTOP_BIT);
     sigemptyset(out);
     for (i = 0U; i < sizeof poll_sigmap / sizeof poll_sigmap[0]; i++) {
         if (((bits >> (poll_sigmap[i].sparc - 1)) & 1U) != 0U) {
             (void)sigaddset(out, poll_sigmap[i].host);
         }
     }
+#if defined(SIGRTMIN) && defined(SIGRTMAX)
+    /* Realtime SPARC signals 32..64 map onto SIGRTMIN+0..32. */
+    for (i = 32U; i <= 64U; i++) {
+        int host = SIGRTMIN + (int)(i - 32U);
+
+        if (host <= SIGRTMAX && ((bits >> (i - 1U)) & 1U) != 0U) {
+            (void)sigaddset(out, host);
+        }
+    }
+    /* SIGRTMIN+1 is the translator's preemption signal. */
+    (void)sigdelset(out, SIGRTMIN + 1);
+#endif
     for (i = 0U; i < sizeof poll_reserved / sizeof poll_reserved[0]; i++) {
         (void)sigdelset(out, poll_reserved[i]);
     }
@@ -180,6 +193,31 @@ static int poll_interrupted(const sparc64_ctx_t *ctx)
     }
     return ctx != NULL && (sparc64_sync_sig_pending_get(ctx) &
                            ~sparc64_sync_sig_blocked_get(ctx)) != UINT64_C(0);
+}
+
+/* Temporary ppoll/pselect6 guest blocked mask. The mask is installed in
+ * the ctx for the whole wait so poll_interrupted() and the pending
+ * check before the first sleep see it (no lost wakeup). It is restored
+ * on every return, -EINTR included: this engine has no post-syscall
+ * async delivery, so an interrupting signal stays queued and delivers
+ * at the next unblock point with the original mask recorded in its
+ * frame (the Linux restore_saved_sigmask outcome). */
+static uint64_t poll_mask_enter(const sparc64_ctx_t *ctx, uint64_t temp)
+{
+    uint64_t prev = 0U;
+
+    if (ctx != NULL) {
+        prev = sparc64_sync_sig_blocked_get(ctx);
+        sparc64_sync_sig_blocked_set(ctx, temp);
+    }
+    return prev;
+}
+
+static void poll_mask_leave(const sparc64_ctx_t *ctx, uint64_t prev)
+{
+    if (ctx != NULL) {
+        sparc64_sync_sig_blocked_set(ctx, prev);
+    }
 }
 
 /* One host ppoll. Darwin has none: swap the mask around poll() (the
@@ -294,6 +332,8 @@ long sparc64_fs_ppoll(const sparc64_ctx_t *ctx, memp_t mem, uint64_t fds,
 {
     struct timespec ts;
     sigset_t sm;
+    uint64_t temp = 0U;
+    uint64_t prev;
     int has_ts;
     int has_sm;
     long rc = poll_timeout(mem, tva, 0, &ts, &has_ts);
@@ -301,12 +341,19 @@ long sparc64_fs_ppoll(const sparc64_ctx_t *ctx, memp_t mem, uint64_t fds,
     if (rc != 0) {
         return rc;
     }
-    rc = poll_sigmask(mem, sigva, sigsetsize, &sm, &has_sm);
+    rc = poll_sigmask(mem, sigva, sigsetsize, &sm, &has_sm, &temp);
     if (rc != 0) {
         return rc;
     }
-    return poll_core(ctx, mem, fds, nfds, has_ts ? &ts : NULL,
-                     has_sm ? &sm : NULL);
+    if (!has_sm) {
+        return poll_core(ctx, mem, fds, nfds, has_ts ? &ts : NULL, NULL);
+    }
+    prev = poll_mask_enter(ctx, temp);
+    rc = poll_interrupted(ctx) ? -EINTR
+                               : poll_core(ctx, mem, fds, nfds,
+                                           has_ts ? &ts : NULL, &sm);
+    poll_mask_leave(ctx, prev);
+    return rc;
 }
 
 /* select/pselect6 share a body; bitmaps are BE 64-bit words. */
@@ -412,6 +459,8 @@ long sparc64_fs_pselect6(const sparc64_ctx_t *ctx, memp_t mem, uint64_t nfds,
     uint8_t pair[16];
     struct timespec ts;
     sigset_t sm;
+    uint64_t temp = 0U;
+    uint64_t prev;
     int has_ts;
     int has_sm = 0;
     long rc = poll_timeout(mem, tva, 0, &ts, &has_ts);
@@ -423,7 +472,7 @@ long sparc64_fs_pselect6(const sparc64_ctx_t *ctx, memp_t mem, uint64_t nfds,
         rc = poll_rd(mem, sigarg, pair, sizeof pair);
         if (rc == 0) {
             rc = poll_sigmask(mem, l2a_get_be64(pair),
-                              l2a_get_be64(pair + 8), &sm, &has_sm);
+                              l2a_get_be64(pair + 8), &sm, &has_sm, &temp);
         }
         if (rc != 0) {
             return rc;
@@ -432,8 +481,15 @@ long sparc64_fs_pselect6(const sparc64_ctx_t *ctx, memp_t mem, uint64_t nfds,
     va[0] = r;
     va[1] = w;
     va[2] = x;
-    return select_core(ctx, mem, nfds, va, has_ts ? &ts : NULL,
-                       has_sm ? &sm : NULL);
+    if (!has_sm) {
+        return select_core(ctx, mem, nfds, va, has_ts ? &ts : NULL, NULL);
+    }
+    prev = poll_mask_enter(ctx, temp);
+    rc = poll_interrupted(ctx) ? -EINTR
+                               : select_core(ctx, mem, nfds, va,
+                                             has_ts ? &ts : NULL, &sm);
+    poll_mask_leave(ctx, prev);
+    return rc;
 }
 
 long sparc64_fs_nanosleep(const sparc64_ctx_t *ctx, memp_t mem, uint64_t req,
