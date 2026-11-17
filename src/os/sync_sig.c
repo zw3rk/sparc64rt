@@ -132,10 +132,15 @@ int sparc64_sync_sig_install_full(uint64_t sig, uint64_t handler,
         sig == (uint64_t)SPARC64_SIG_STOP) {
         return -EINVAL;
     }
+    /* Kernel sparc64 sa_flags: SA_ONSTACK 1, SA_RESTART 2, SA_RESETHAND
+     * 4, SA_NOCLDSTOP 8, SA_NODEFER 0x20, SA_NOCLDWAIT 0x100,
+     * SA_SIGINFO 0x200. glibc passes sa_handler-style actions without
+     * SA_SIGINFO (e.g. OpenSSL's CPU probe); delivery always builds the
+     * rt frame, so the extra handler arguments are harmless. */
     allowed = (uint64_t)SPARC64_SA_SIGINFO |
-        (uint64_t)SPARC64_SA_ONSTACK | (uint64_t)SPARC64_SA_NODEFER;
-    if ((flags & ~allowed) != UINT64_C(0) ||
-        (flags & (uint64_t)SPARC64_SA_SIGINFO) == UINT64_C(0)) {
+        (uint64_t)SPARC64_SA_ONSTACK | (uint64_t)SPARC64_SA_NODEFER |
+        UINT64_C(0x2) | UINT64_C(0x4) | UINT64_C(0x8) | UINT64_C(0x100);
+    if ((flags & ~allowed) != UINT64_C(0)) {
         return -EINVAL;
     }
     if (handler != UINT64_C(0) && handler != UINT64_C(1) &&

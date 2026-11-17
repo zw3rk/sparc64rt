@@ -21,22 +21,24 @@
 
 #include "dbt/mem_sites.h"
 
-/* Window backing file: winfile[w][0..7] = %l, [8..15] = %i. Single global
- * file serves one guest thread (matches the Phase 1 single-threaded
- * interpreter; Phase 4 threads need a side table). */
-static uint64_t interp_winfile[SPARC64_NWINDOWS][16];
+/* Window backing file: winfile[w][0..7] = %l, [8..15] = %i. One file per
+ * host thread (each guest thread runs on its own host thread): a shared
+ * file let a second guest thread clobber the first one's outstanding
+ * frames. A new thread starts with no outstanding images; the parent
+ * flushes its windows to the stack before the child context is copied. */
+static _Thread_local uint64_t interp_winfile[SPARC64_NWINDOWS][16];
 /* Home stack pointer per window: interp_winsp[w] is the %sp of the frame
  * whose L/I image sits in interp_winfile[w] (0 when w was never stashed,
  * e.g. fresh windows at the depth-8 boundary). Maintained on every stash
  * and fill so spill, fill, and flush_all address the frame's own
  * [%sp + 2047] slot; Phase 4 fork must copy this beside winfile. */
-static uint64_t interp_winsp[SPARC64_NWINDOWS];
+static _Thread_local uint64_t interp_winsp[SPARC64_NWINDOWS];
 /* Validity per window: win_valid[w] means winfile[w] holds the image of
  * an outstanding frame. SAVE validates the switched-out frame, RESTORE
  * invalidates its source, fills validate targets; spill/flush consult
  * validity, never the saturating cansave/canrestore counters. Phase 4
  * fork must copy this beside winfile. */
-static bool win_valid[SPARC64_NWINDOWS];
+static _Thread_local bool win_valid[SPARC64_NWINDOWS];
 
 /* Fresh-process init is lazy: sparc64_ctx_init() zeroes the counters, and
  * the first SAVE/RESTORE arms CANSAVE = NWINDOWS - 1. The pattern only

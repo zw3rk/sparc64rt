@@ -61,11 +61,13 @@
 #endif
 
 #include "core/cpu.h"
+#include "os/errno_sparc.h"
 #include "os/proc.h"
 #include "os/sigframe_sparc64rt.h"
 #include "os/sync_sig.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
+#include "os/syscalls_fs.h"
 #include "os/syscalls_min.h"
 #include "os/syscalls_sig.h"
 #include "os/threads.h"
@@ -152,7 +154,11 @@ uint64_t sparc64_host_errno_to_guest(long host_errno)
     case EOVERFLOW: return 92U;
     default: break;
     }
+#if !defined(__APPLE__)
+    return sparc64_errno_generic_to_sparc(host_errno);
+#else
     return (uint64_t)host_errno;
+#endif
 }
 
 /* Host syscall result: negative errno on failure, else the value. Short
@@ -528,7 +534,9 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     case (long)SPARC64__NR_fcntl:
     case (long)SPARC64__NR_fcntl64:
-        ret = sparc64_l2a_fcntl(o0, o1, o2);
+        ret = (o1 >= 7U && o1 <= 9U) ?
+            sparc64_fs_fcntl_lock(mem, o0, o1, o2) :
+            sparc64_l2a_fcntl(o0, o1, o2);
         break;
     case (long)SPARC64__NR_rt_sigprocmask: {
         int delivered = 0;
@@ -563,7 +571,8 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     case (long)SPARC64__NR_clone:
         /* L4b owns CLONE_VM threads; L4c owns fork-like clones. */
-        if ((o0 & (uint64_t)SPARC64_CLONE_VM) != UINT64_C(0)) {
+        if ((o0 & (uint64_t)SPARC64_CLONE_VM) != UINT64_C(0) &&
+            (o0 & UINT64_C(0x4000)) == UINT64_C(0)) {
             ret = sparc64_thread_clone(ctx, mem, o0, o1, o2, o3, o4);
         } else {
             ret = sparc64_proc_clone(ctx, mem, o0, o1, o2, o3, o4);
@@ -715,9 +724,13 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
     case (long)SPARC64__NR_dup3:
         ret = sparc64_proc_dup3(o0, o1, o2);
         break;
-    default:
-        ret = -ENOSYS;
+    default: {
+        int claimed = 0;
+
+        ret = sparc64_l2a_fs_extra(ctx, mem, nr, o0, o1, o2, o3, o4,
+                                   &claimed);
         break;
+    }
     }
 
     /* 64-bit guest addresses never collide with the kernel -4095..-1

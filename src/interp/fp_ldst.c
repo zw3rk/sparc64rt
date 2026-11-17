@@ -99,9 +99,62 @@ static sparc64_step_result_t fp_aligndata(sparc64_cpu_t *cpu, uint64_t pc,
     return sparc64_step_ok(pc);
 }
 
+/* VIS1 logical ops (opf 0x60..0x7F): even opf is the 64-bit double
+ * form, odd opf the 32-bit single form. Compilers targeting a VIS1
+ * baseline (Debian sparc64) emit these for plain 64-bit integer
+ * and/or/xor. Never touches FSR. */
+static uint64_t vis_logic(unsigned fn, uint64_t a, uint64_t b)
+{
+    switch (fn) {
+    case 0x0U: return UINT64_C(0);
+    case 0x1U: return ~(a | b);
+    case 0x2U: return a & ~b;
+    case 0x3U: return ~b;
+    case 0x4U: return ~a & b;
+    case 0x5U: return ~a;
+    case 0x6U: return a ^ b;
+    case 0x7U: return ~(a & b);
+    case 0x8U: return a & b;
+    case 0x9U: return ~(a ^ b);
+    case 0xAU: return a;
+    case 0xBU: return a | ~b;
+    case 0xCU: return b;
+    case 0xDU: return ~a | b;
+    case 0xEU: return a | b;
+    default: return ~UINT64_C(0);
+    }
+}
+
+static sparc64_step_result_t fp_vis_logic(sparc64_cpu_t *cpu, uint64_t pc,
+    const sparc64_dec_t *d)
+{
+    unsigned fn = (d->opf >> 1U) & 0xFU;
+    if ((d->opf & 1U) == 0U) {
+        cpu->fp.d[fp_pair(d->rd)] = vis_logic(fn,
+            cpu->fp.d[fp_pair(d->rs1)], cpu->fp.d[fp_pair(d->raw & 31U)]);
+        sparc64_fp_mark_dirty(cpu, (fp_pair(d->rd) >= 16U) ? 1U : 0U);
+    } else {
+        /* Singles index the host-order halves with ^1 (see fp_zero). */
+        uint64_t a = cpu->fp.f[(d->rs1 & 31U) ^ 1U];
+        uint64_t b = cpu->fp.f[(d->raw & 31U) ^ 1U];
+        cpu->fp.f[(d->rd & 31U) ^ 1U] = (uint32_t)vis_logic(fn, a, b);
+        sparc64_fp_mark_dirty(cpu, 0U);
+    }
+    return sparc64_step_ok(pc);
+}
+
 sparc64_step_result_t sparc64_fp_vis(sparc64_cpu_t *cpu, uint64_t pc,
     const sparc64_dec_t *d)
 {
+    if (d->opf >= 0x62U && d->opf <= 0x7FU && d->opf != 0x7EU &&
+        d->opf != 0x7FU) {
+        return fp_vis_logic(cpu, pc, d);
+    }
+    if (d->opf == 0x7FU) {
+        cpu->fp.f[(d->rd & 31U) ^ 1U] = UINT32_C(0xFFFFFFFF);
+        sparc64_fp_mark_dirty(cpu, 0U);
+        return sparc64_step_ok(pc);
+    }
     if (d->opf == 0x60U || d->opf == 0x61U || d->opf == 0x7EU) {
         return fp_zero(cpu, pc, d);
     }
