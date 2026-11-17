@@ -23,22 +23,27 @@ long sparc64_fs_poll(const sparc64_ctx_t *ctx,
                      const sparc64_syscall_mem_t *mem, uint64_t fds,
                      uint64_t nfds, int timeout_ms);
 
-/* ppoll(fds, nfds, timespec, sigmask, sigsetsize). */
-long sparc64_fs_ppoll(const sparc64_ctx_t *ctx,
+/* ppoll(fds, nfds, timespec, sigmask, sigsetsize). With a sigmask, an
+ * -EINTR caused by a signal only the temporary mask unblocks delivers
+ * that signal before the original mask returns; *delivered is then set
+ * and the result is already committed with pc/npc redirected (the
+ * dispatch tail must skip its commit and advance). */
+long sparc64_fs_ppoll(sparc64_ctx_t *ctx,
                       const sparc64_syscall_mem_t *mem, uint64_t fds,
                       uint64_t nfds, uint64_t tva, uint64_t sigva,
-                      uint64_t sigsetsize);
+                      uint64_t sigsetsize, int *delivered);
 
 /* _newselect (timeval timeout). */
 long sparc64_fs_select(const sparc64_ctx_t *ctx,
                        const sparc64_syscall_mem_t *mem, uint64_t nfds,
                        uint64_t r, uint64_t w, uint64_t x, uint64_t tva);
 
-/* pselect6: sigarg points at {BE64 sigset_ptr, BE64 sigsetsize}. */
-long sparc64_fs_pselect6(const sparc64_ctx_t *ctx,
+/* pselect6: sigarg points at {BE64 sigset_ptr, BE64 sigsetsize}.
+ * *delivered as for ppoll. */
+long sparc64_fs_pselect6(sparc64_ctx_t *ctx,
                          const sparc64_syscall_mem_t *mem, uint64_t nfds,
                          uint64_t r, uint64_t w, uint64_t x, uint64_t tva,
-                         uint64_t sigarg);
+                         uint64_t sigarg, int *delivered);
 
 long sparc64_fs_nanosleep(const sparc64_ctx_t *ctx,
                           const sparc64_syscall_mem_t *mem, uint64_t req,

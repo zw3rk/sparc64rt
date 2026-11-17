@@ -57,7 +57,7 @@ static void sig_commit_advance(sparc64_ctx_t *ctx, long ret)
  * and park pc on the always-unmapped zero page. The next step faults
  * INST_ACCESS, whose SIGSEGV finds no handler, so the engines return
  * the runner-fatal status. */
-static void sig_force_fatal(sparc64_ctx_t *ctx,
+void sparc64_sig_force_fatal(sparc64_ctx_t *ctx,
     const sparc64_syscall_mem_t *mem, int signo)
 {
     (void)mem;
@@ -191,7 +191,7 @@ long sparc64_sig_rt_sigprocmask(sparc64_ctx_t *ctx,
     ctx->ccr |= trap_ccr & SPARC64_CCR_ICC_C;
     pending_rc = sparc64_sync_sig_deliver_pending(ctx, mem);
     if (pending_rc < 0) {
-        sig_force_fatal(ctx, mem, 0);
+        sparc64_sig_force_fatal(ctx, mem, 0);
     }
     if (delivered != NULL) {
         *delivered = 1;
@@ -294,7 +294,7 @@ static long sig_deliver_self(sparc64_ctx_t *ctx,
     ctx->ccr |= trap_ccr & SPARC64_CCR_ICC_C;
     rc = sparc64_sync_sig_queue(ctx, mem, (int)sig);
     if (rc < 0) {
-        sig_force_fatal(ctx, mem, (int)sig);
+        sparc64_sig_force_fatal(ctx, mem, (int)sig);
     }
     if (delivered != NULL) {
         *delivered = 1;

@@ -579,11 +579,13 @@ static long fs_pio(memp_t mem, uint64_t fd, uint64_t va, uint64_t count,
 
 long sparc64_l2a_fs_extra(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
                           long nr, uint64_t o0, uint64_t o1, uint64_t o2,
-                          uint64_t o3, uint64_t o4, uint64_t o5, int *claimed)
+                          uint64_t o3, uint64_t o4, uint64_t o5, int *claimed,
+                          int *delivered)
 {
     const uint64_t cwd = (uint64_t)SP_AT_FDCWD;
 
     *claimed = 1;
+    *delivered = 0;
     switch (nr) {
     CASE(chdir): return fs_chdir(mem, o0);
     CASE(fchdir): return fs_ret(fchdir((int)o0));
@@ -624,11 +626,12 @@ long sparc64_l2a_fs_extra(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     CASE(getrusage): return fs_getrusage(mem, o0, o1);
     CASE(sysinfo): return fs_sysinfo(mem, o0);
     CASE(poll): return sparc64_fs_poll(ctx, mem, o0, o1, (int)(int32_t)o2);
-    CASE(ppoll): return sparc64_fs_ppoll(ctx, mem, o0, o1, o2, o3, o4);
+    CASE(ppoll): return sparc64_fs_ppoll(ctx, mem, o0, o1, o2, o3, o4,
+                                         delivered);
     CASE(_newselect): return sparc64_fs_select(ctx, mem, o0, o1, o2, o3, o4);
     CASE(pselect6_time64):
     CASE(pselect6): return sparc64_fs_pselect6(ctx, mem, o0, o1, o2, o3, o4,
-                                               o5);
+                                               o5, delivered);
     CASE(getppid): return (long)getppid();
     CASE(geteuid): return (long)geteuid();
     CASE(getegid): return (long)getegid();

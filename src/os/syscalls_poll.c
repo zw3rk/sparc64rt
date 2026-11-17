@@ -197,11 +197,9 @@ static int poll_interrupted(const sparc64_ctx_t *ctx)
 
 /* Temporary ppoll/pselect6 guest blocked mask. The mask is installed in
  * the ctx for the whole wait so poll_interrupted() and the pending
- * check before the first sleep see it (no lost wakeup). It is restored
- * on every return, -EINTR included: this engine has no post-syscall
- * async delivery, so an interrupting signal stays queued and delivers
- * at the next unblock point with the original mask recorded in its
- * frame (the Linux restore_saved_sigmask outcome). */
+ * check before the first sleep see it (no lost wakeup). poll_mask_exit
+ * restores the original mask on every return; an -EINTR caused by a
+ * signal the temporary mask unblocks delivers it first. */
 static uint64_t poll_mask_enter(const sparc64_ctx_t *ctx, uint64_t temp)
 {
     uint64_t prev = 0U;
@@ -218,6 +216,31 @@ static void poll_mask_leave(const sparc64_ctx_t *ctx, uint64_t prev)
     if (ctx != NULL) {
         sparc64_sync_sig_blocked_set(ctx, prev);
     }
+}
+
+/* Leave the temporary mask (Linux restore_saved_sigmask). A pending
+ * signal that only temp unblocks would stay blocked under prev, so a
+ * caller looping on ppoll(-EINTR) would spin forever: deliver it while
+ * temp is still installed. The result is committed and pc advanced past
+ * the ta first (the frame captures the post-syscall pc/npc), the frame
+ * records prev, and *delivered tells the dispatch tail to skip its
+ * commit/advance. */
+static long poll_mask_exit(sparc64_ctx_t *ctx, memp_t mem, uint64_t temp,
+                           uint64_t prev, long rc, int *delivered)
+{
+    if (rc != -EINTR || ctx == NULL || delivered == NULL ||
+        (sparc64_sync_sig_pending_get(ctx) & ~temp) == UINT64_C(0)) {
+        poll_mask_leave(ctx, prev);
+        return rc;
+    }
+    sparc64_commit_sysret(ctx, rc);
+    ctx->pc = ctx->npc;
+    ctx->npc += 4U;
+    *delivered = 1;
+    if (sparc64_sync_sig_deliver_pending_saved(ctx, mem, prev, 1) < 0) {
+        sparc64_sig_force_fatal(ctx, mem, 0);
+    }
+    return 0;
 }
 
 /* One host ppoll. Darwin has none: swap the mask around poll() (the
@@ -326,9 +349,9 @@ long sparc64_fs_poll(const sparc64_ctx_t *ctx, memp_t mem, uint64_t fds,
     return poll_core(ctx, mem, fds, nfds, timeout_ms < 0 ? NULL : &ts, NULL);
 }
 
-long sparc64_fs_ppoll(const sparc64_ctx_t *ctx, memp_t mem, uint64_t fds,
+long sparc64_fs_ppoll(sparc64_ctx_t *ctx, memp_t mem, uint64_t fds,
                       uint64_t nfds, uint64_t tva, uint64_t sigva,
-                      uint64_t sigsetsize)
+                      uint64_t sigsetsize, int *delivered)
 {
     struct timespec ts;
     sigset_t sm;
@@ -352,8 +375,7 @@ long sparc64_fs_ppoll(const sparc64_ctx_t *ctx, memp_t mem, uint64_t fds,
     rc = poll_interrupted(ctx) ? -EINTR
                                : poll_core(ctx, mem, fds, nfds,
                                            has_ts ? &ts : NULL, &sm);
-    poll_mask_leave(ctx, prev);
-    return rc;
+    return poll_mask_exit(ctx, mem, temp, prev, rc, delivered);
 }
 
 /* select/pselect6 share a body; bitmaps are BE 64-bit words. */
@@ -451,9 +473,9 @@ long sparc64_fs_select(const sparc64_ctx_t *ctx, memp_t mem, uint64_t nfds,
                                       has_ts ? &ts : NULL, NULL);
 }
 
-long sparc64_fs_pselect6(const sparc64_ctx_t *ctx, memp_t mem, uint64_t nfds,
+long sparc64_fs_pselect6(sparc64_ctx_t *ctx, memp_t mem, uint64_t nfds,
                          uint64_t r, uint64_t w, uint64_t x, uint64_t tva,
-                         uint64_t sigarg)
+                         uint64_t sigarg, int *delivered)
 {
     uint64_t va[3];
     uint8_t pair[16];
@@ -488,8 +510,7 @@ long sparc64_fs_pselect6(const sparc64_ctx_t *ctx, memp_t mem, uint64_t nfds,
     rc = poll_interrupted(ctx) ? -EINTR
                                : select_core(ctx, mem, nfds, va,
                                              has_ts ? &ts : NULL, &sm);
-    poll_mask_leave(ctx, prev);
-    return rc;
+    return poll_mask_exit(ctx, mem, temp, prev, rc, delivered);
 }
 
 long sparc64_fs_nanosleep(const sparc64_ctx_t *ctx, memp_t mem, uint64_t req,

@@ -9,7 +9,7 @@
 # or: nix build .#sparc64rt (uses the configured aarch64-linux builder).
 
 .DEFAULT_GOAL := help
-.PHONY: help all build check test check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin darwin-sparc64rt clean
+.PHONY: help all build check test check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin check-ppoll-sig darwin-sparc64rt clean
 MAKEFLAGS += -j8
 
 BUILD_DIR := _build
@@ -61,7 +61,7 @@ $(OBJ_DIR)/%.o: src/%.S Makefile $(shell find src include -name '*.h')
 $(BUILD_DIR):
 	mkdir -p $@
 
-check: build check-line-limits check-abi-invariants check-thr-granule check-rc-u2 ## Build plus all Phase 0 gates
+check: build check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-ppoll-sig ## Build plus all Phase 0 gates
 
 check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
 	@dirs="src"; test -d include && dirs="$$dirs include"; test -d tests && dirs="$$dirs tests"; \
@@ -221,4 +221,26 @@ check-r1316: ## Build and run the Rounds 13-16 regression tests (proc, DBT, FP)
 		-o $(BUILD_DIR)/test_r1316_remediation && \
 	./$(BUILD_DIR)/test_r1316_remediation
 
-test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin check-r7 check-r1316 ## Host-side gates with -Werror (no cross toolchain needed)
+# ---- ppoll/pselect6 temporary-mask signal delivery gate --------------------
+# Drives the real syscall dispatch, so it links every translator object
+# except main: the Darwin set on macOS, the static-PIE Linux set
+# elsewhere (run only on an aarch64 host).
+ifeq ($(shell uname -s),Darwin)
+PPOLL_SIG_OBJS := $(filter-out $(DARWIN_OBJ_DIR)/main.o,$(DARWIN_OBJS))
+PPOLL_SIG_CC := $(DARWIN_CC) -target $(DARWIN_TARGET) $(DARWIN_CFLAGS) \
+	$(DARWIN_CPPFLAGS)
+else
+PPOLL_SIG_OBJS := $(filter-out $(OBJ_DIR)/main.o,$(OBJS))
+PPOLL_SIG_CC := $(A64_CC) $(CFLAGS) $(CPPFLAGS) -fPIE $(LDFLAGS_STATIC_PIE)
+endif
+
+check-ppoll-sig: $(PPOLL_SIG_OBJS) ## Build and run the ppoll/pselect6 temporary-mask delivery test
+	$(PPOLL_SIG_CC) tests/test_ppoll_sigmask.c $(PPOLL_SIG_OBJS) \
+		-o $(BUILD_DIR)/test_ppoll_sigmask
+	@if [ "$$(uname -s)" = "Darwin" ] || [ "$$(uname -m)" = "aarch64" ]; then \
+		./$(BUILD_DIR)/test_ppoll_sigmask; \
+	else \
+		echo "check-ppoll-sig: needs an aarch64 host to run, pass"; \
+	fi
+
+test: check-line-limits check-abi-invariants check-thr-granule check-rc-u2 check-r3 check-r4 check-r3-darwin check-r7 check-r1316 check-ppoll-sig ## Host-side gates with -Werror (no cross toolchain needed)

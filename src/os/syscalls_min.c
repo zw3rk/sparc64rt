@@ -735,9 +735,15 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     default: {
         int claimed = 0;
+        int delivered = 0;
 
         ret = sparc64_l2a_fs_extra(ctx, mem, nr, o0, o1, o2, o3, o4,
-                                   o5, &claimed);
+                                   o5, &claimed, &delivered);
+        if (delivered) {
+            ctx->syscalls_executed++;
+            note_dispatched();
+            return 0;
+        }
         if (claimed == 0) {
             ret = -ENOSYS;
         }
