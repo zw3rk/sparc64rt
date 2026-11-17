@@ -65,6 +65,14 @@ extern const sparc64_mem_ops_t guest_mem_ops;
 
 #define SYNC_SIG_MAX 64U
 
+/* sparc64 SA_RESTART / SA_RESETHAND. SA_RESTART needs no restart
+ * logic: guest handlers only run at synchronous points (traps,
+ * self-kill, sigprocmask-unblock, sigreturn), never inside an
+ * interrupted blocking syscall, so no syscall is ever left at -EINTR
+ * by a handler. SA_RESETHAND is applied in sparc64_sync_sig_deliver. */
+#define SYNC_SA_RESTART UINT64_C(0x2)
+#define SYNC_SA_RESETHAND UINT64_C(0x4)
+
 static uint64_t sync_handler[SYNC_SIG_MAX + 1U];
 static uint64_t sync_flags[SYNC_SIG_MAX + 1U];
 static uint64_t sync_restorer[SYNC_SIG_MAX + 1U];
@@ -139,7 +147,8 @@ int sparc64_sync_sig_install_full(uint64_t sig, uint64_t handler,
      * rt frame, so the extra handler arguments are harmless. */
     allowed = (uint64_t)SPARC64_SA_SIGINFO |
         (uint64_t)SPARC64_SA_ONSTACK | (uint64_t)SPARC64_SA_NODEFER |
-        UINT64_C(0x2) | UINT64_C(0x4) | UINT64_C(0x8) | UINT64_C(0x100);
+        SYNC_SA_RESTART | SYNC_SA_RESETHAND | UINT64_C(0x8) |
+        UINT64_C(0x100);
     if ((flags & ~allowed) != UINT64_C(0)) {
         return -EINVAL;
     }
@@ -663,6 +672,11 @@ int sparc64_sync_sig_deliver(sparc64_ctx_t *ctx,
     ctx->r[SPARC64_SP] = base - SPARC64_STACK_BIAS;
     ctx->pc = handler;
     ctx->npc = handler + 4U;
+    /* SA_RESETHAND (kernel SA_ONESHOT): the disposition reverts to
+     * SIG_DFL once the frame is built, before the handler runs. */
+    if ((sync_flags[(unsigned)signo] & SYNC_SA_RESETHAND) != UINT64_C(0)) {
+        sync_handler[(unsigned)signo] = UINT64_C(0);
+    }
     return 0;
 }
 

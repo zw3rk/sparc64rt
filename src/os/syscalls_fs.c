@@ -43,6 +43,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
 #include "os/syscalls_fs.h"
+#include "os/syscalls_poll.h"
 #include "os/syscalls_min.h"
 #include "os/threads.h"
 
@@ -69,7 +70,9 @@ static long fs_rd(memp_t mem, uint64_t va, void *buf, uint64_t len)
 
 static int fs_dirfd(uint64_t g)
 {
-    return (int64_t)g == SP_AT_FDCWD ? AT_FDCWD : (int)g;
+    int32_t fd = (int32_t)g; /* the kernel takes an int */
+
+    return fd == (int32_t)SP_AT_FDCWD ? AT_FDCWD : (int)fd;
 }
 
 static long fs_ret(int rc)
@@ -409,8 +412,8 @@ static long fs_getrusage(memp_t mem, uint64_t who, uint64_t buf)
 {
     struct rusage ru;
     uint8_t img[144];
-    int hw = who == 0U ? RUSAGE_SELF
-                       : (who == (uint64_t)-1 ? RUSAGE_CHILDREN : -99);
+    int32_t w = (int32_t)who; /* the kernel takes an int */
+    int hw = w == 0 ? RUSAGE_SELF : (w == -1 ? RUSAGE_CHILDREN : -99);
 
     if (hw == -99) {
         return -EINVAL;
@@ -423,11 +426,16 @@ static long fs_getrusage(memp_t mem, uint64_t who, uint64_t buf)
     l2a_put_be64(img + 8, (uint64_t)ru.ru_utime.tv_usec);
     l2a_put_be64(img + 16, (uint64_t)ru.ru_stime.tv_sec);
     l2a_put_be64(img + 24, (uint64_t)ru.ru_stime.tv_usec);
+#if defined(__APPLE__)
+    /* Darwin reports ru_maxrss in bytes; Linux (the guest) in KiB. */
+    l2a_put_be64(img + 32, (uint64_t)ru.ru_maxrss / 1024U);
+#else
     l2a_put_be64(img + 32, (uint64_t)ru.ru_maxrss);
+#endif
     l2a_put_be64(img + 64, (uint64_t)ru.ru_minflt);
     l2a_put_be64(img + 72, (uint64_t)ru.ru_majflt);
-    l2a_put_be64(img + 96, (uint64_t)ru.ru_inblock);
-    l2a_put_be64(img + 104, (uint64_t)ru.ru_oublock);
+    l2a_put_be64(img + 88, (uint64_t)ru.ru_inblock);
+    l2a_put_be64(img + 96, (uint64_t)ru.ru_oublock);
     l2a_put_be64(img + 128, (uint64_t)ru.ru_nvcsw);
     l2a_put_be64(img + 136, (uint64_t)ru.ru_nivcsw);
     return l2a_store_buf(mem, buf, img, sizeof img);
@@ -452,163 +460,6 @@ static long fs_sysinfo(memp_t mem, uint64_t buf)
     l2a_put_be16(img + 80, 1U);
     l2a_put_be32(img + 104, 1U);
     return l2a_store_buf(mem, buf, img, sizeof img);
-}
-
-/* poll core: nfds {int fd; short events; short revents}, big-endian. */
-static long fs_poll(memp_t mem, uint64_t va, uint64_t nfds, int timeout_ms)
-{
-    struct pollfd *pf;
-    uint8_t *img;
-    uint64_t i;
-    long ret;
-    int n;
-    int e;
-
-    if (nfds > FS_NFDS_MAX) {
-        return -EINVAL;
-    }
-    pf = (struct pollfd *)calloc((size_t)nfds + 1U, sizeof *pf);
-    img = (uint8_t *)malloc((size_t)nfds * 8U + 1U);
-    if (pf == NULL || img == NULL) {
-        free(pf);
-        free(img);
-        return -ENOMEM;
-    }
-    ret = nfds == 0U ? 0L : fs_rd(mem, va, img, nfds * 8U);
-    if (ret == 0) {
-        for (i = 0U; i < nfds; i++) {
-            pf[i].fd = (int)(int32_t)l2a_get_be32(img + i * 8U);
-            pf[i].events = (short)(((unsigned)img[i * 8U + 4U] << 8) |
-                                   img[i * 8U + 5U]);
-        }
-        sparc64_thread_big_unlock();
-        n = poll(pf, (nfds_t)nfds, timeout_ms);
-        e = errno;
-        sparc64_thread_big_lock();
-        if (n < 0) {
-            ret = -(long)e;
-        } else {
-            for (i = 0U; i < nfds; i++) {
-                l2a_put_be16(img + i * 8U + 6U, (uint16_t)pf[i].revents);
-            }
-            ret = nfds != 0U ? l2a_store_buf(mem, va, img, nfds * 8U) : 0L;
-            if (ret == 0) {
-                ret = n;
-            }
-        }
-    }
-    free(pf);
-    free(img);
-    return ret;
-}
-
-/* Guest timespec/timeval (two BE words) to ms; -1 means block forever. */
-static long fs_timeout(memp_t mem, uint64_t va, int is_usec, int *ms)
-{
-    uint8_t g[16];
-    uint64_t sec;
-    uint64_t sub;
-    uint64_t total;
-    long rc;
-
-    if (va == 0U) {
-        *ms = -1;
-        return 0;
-    }
-    rc = fs_rd(mem, va, g, sizeof g);
-    if (rc != 0) {
-        return rc;
-    }
-    sec = l2a_get_be64(g);
-    sub = l2a_get_be64(g + 8);
-    total = sec * 1000U + (is_usec ? sub / 1000U : sub / 1000000U);
-    if (sec > 1000000U || total > 2000000000U) {
-        total = 2000000000U;
-    }
-    *ms = (int)total;
-    return 0;
-}
-
-static long fs_ppoll(memp_t mem, uint64_t fds, uint64_t nfds, uint64_t tva)
-{
-    int ms;
-    long rc = fs_timeout(mem, tva, 0, &ms);
-
-    return rc != 0 ? rc : fs_poll(mem, fds, nfds, ms);
-}
-
-/* select/pselect6 share a body; bitmaps are BE 64-bit words. */
-static long fs_select(memp_t mem, uint64_t nfds, uint64_t r, uint64_t w,
-                      uint64_t x, uint64_t tva, int is_usec)
-{
-    fd_set sets[3];
-    uint64_t va[3];
-    uint8_t buf[sizeof(fd_set)];
-    uint64_t nbytes = ((nfds + 63U) / 64U) * 8U;
-    struct timeval tv;
-    long rc;
-    int ms;
-    int i;
-    int ret;
-    int e;
-
-    if (nfds > FD_SETSIZE) {
-        return -EINVAL;
-    }
-    va[0] = r;
-    va[1] = w;
-    va[2] = x;
-    rc = fs_timeout(mem, tva, is_usec, &ms);
-    if (rc != 0) {
-        return rc;
-    }
-    for (i = 0; i < 3; i++) {
-        uint64_t k;
-
-        FD_ZERO(&sets[i]);
-        if (va[i] == 0U) {
-            continue;
-        }
-        rc = fs_rd(mem, va[i], buf, nbytes);
-        if (rc != 0) {
-            return rc;
-        }
-        for (k = 0U; k < nfds; k++) {
-            if (((l2a_get_be64(buf + (k / 64U) * 8U) >> (k % 64U)) & 1U) != 0U) {
-                FD_SET((int)k, &sets[i]);
-            }
-        }
-    }
-    tv.tv_sec = ms < 0 ? 0 : ms / 1000;
-    tv.tv_usec = ms < 0 ? 0 : (ms % 1000) * 1000;
-    sparc64_thread_big_unlock();
-    ret = select((int)nfds, va[0] ? &sets[0] : NULL, va[1] ? &sets[1] : NULL,
-                 va[2] ? &sets[2] : NULL, ms < 0 ? NULL : &tv);
-    e = errno;
-    sparc64_thread_big_lock();
-    if (ret < 0) {
-        return -(long)e;
-    }
-    for (i = 0; i < 3; i++) {
-        uint64_t k;
-
-        if (va[i] == 0U) {
-            continue;
-        }
-        memset(buf, 0, sizeof buf);
-        for (k = 0U; k < nfds; k++) {
-            if (FD_ISSET((int)k, &sets[i])) {
-                uint8_t *wp = buf + (k / 64U) * 8U;
-
-                l2a_put_be64(wp, l2a_get_be64(wp) | ((uint64_t)1U << (k % 64U)));
-            }
-        }
-        rc = l2a_store_buf(mem, va[i], buf, nbytes);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-    return ret;
 }
 
 static long fs_getgroups(memp_t mem, uint64_t n, uint64_t va)
@@ -724,86 +575,14 @@ static long fs_pio(memp_t mem, uint64_t fd, uint64_t va, uint64_t count,
     return (long)done;
 }
 
-static long fs_nanosleep(memp_t mem, uint64_t req, uint64_t rem)
-{
-    uint8_t g[16];
-    struct timespec rq;
-    struct timespec rm;
-    long rc = fs_rd(mem, req, g, sizeof g);
-    int r;
-    int e;
-
-    if (rc != 0) {
-        return rc;
-    }
-    rq.tv_sec = (time_t)l2a_get_be64(g);
-    rq.tv_nsec = (long)l2a_get_be64(g + 8);
-    if (rq.tv_sec < 0 || rq.tv_nsec < 0 || rq.tv_nsec >= 1000000000L) {
-        return -EINVAL;
-    }
-    sparc64_thread_big_unlock();
-    r = nanosleep(&rq, &rm);
-    e = errno;
-    sparc64_thread_big_lock();
-    if (r != 0 && e == EINTR && rem != 0U) {
-        l2a_put_be64(g, (uint64_t)rm.tv_sec);
-        l2a_put_be64(g + 8, (uint64_t)rm.tv_nsec);
-        (void)l2a_store_buf(mem, rem, g, sizeof g);
-    }
-    return r != 0 ? -(long)e : 0L;
-}
-
 #define CASE(n) case (long)SPARC64__NR_##n
-
-/* fcntl record locks (sparc64: F_GETLK 7, F_SETLK 8, F_SETLKW 9; lock
- * types RDLCK 1, WRLCK 2, UNLCK 3). Guest struct flock is 32 bytes:
- * s16 type, s16 whence, s64 start, s64 len, s32 pid. Translated to the
- * host struct flock, whose type constants differ per host. */
-long sparc64_fs_fcntl_lock(memp_t mem, uint64_t fd, uint64_t cmd,
-                           uint64_t arg)
-{
-    uint8_t g[32];
-    struct flock fl;
-    int hcmd = cmd == 7U ? F_GETLK : (cmd == 8U ? F_SETLK : F_SETLKW);
-    int16_t t;
-    long rc = fs_rd(mem, arg, g, sizeof g);
-
-    if (rc != 0) {
-        return rc;
-    }
-    memset(&fl, 0, sizeof fl);
-    t = (int16_t)(((unsigned)g[0] << 8) | g[1]);
-    fl.l_type = t == 1 ? F_RDLCK : (t == 2 ? F_WRLCK : F_UNLCK);
-    fl.l_whence = (short)(((unsigned)g[2] << 8) | g[3]);
-    fl.l_start = (off_t)l2a_get_be64(g + 8);
-    fl.l_len = (off_t)l2a_get_be64(g + 16);
-    if (fcntl((int)fd, hcmd, &fl) != 0) {
-        return -(long)errno;
-    }
-    if (hcmd == F_GETLK) {
-        memset(g, 0, sizeof g);
-        t = fl.l_type == F_RDLCK ? 1 : (fl.l_type == F_WRLCK ? 2 : 3);
-        g[0] = (uint8_t)((unsigned)t >> 8);
-        g[1] = (uint8_t)t;
-        g[3] = (uint8_t)fl.l_whence;
-        l2a_put_be64(g + 8, (uint64_t)fl.l_start);
-        l2a_put_be64(g + 16, (uint64_t)fl.l_len);
-        g[27] = (uint8_t)fl.l_pid;
-        g[26] = (uint8_t)((unsigned)fl.l_pid >> 8);
-        g[25] = (uint8_t)((unsigned)fl.l_pid >> 16);
-        g[24] = (uint8_t)((unsigned)fl.l_pid >> 24);
-        return l2a_store_buf(mem, arg, g, sizeof g);
-    }
-    return 0;
-}
 
 long sparc64_l2a_fs_extra(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
                           long nr, uint64_t o0, uint64_t o1, uint64_t o2,
-                          uint64_t o3, uint64_t o4, int *claimed)
+                          uint64_t o3, uint64_t o4, uint64_t o5, int *claimed)
 {
     const uint64_t cwd = (uint64_t)SP_AT_FDCWD;
 
-    (void)ctx;
     *claimed = 1;
     switch (nr) {
     CASE(chdir): return fs_chdir(mem, o0);
@@ -844,11 +623,12 @@ long sparc64_l2a_fs_extra(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     CASE(times): return fs_times(mem, o0);
     CASE(getrusage): return fs_getrusage(mem, o0, o1);
     CASE(sysinfo): return fs_sysinfo(mem, o0);
-    CASE(poll): return fs_poll(mem, o0, o1, (int)(int32_t)o2);
-    CASE(ppoll): return fs_ppoll(mem, o0, o1, o2);
-    CASE(_newselect): return fs_select(mem, o0, o1, o2, o3, o4, 1);
+    CASE(poll): return sparc64_fs_poll(ctx, mem, o0, o1, (int)(int32_t)o2);
+    CASE(ppoll): return sparc64_fs_ppoll(ctx, mem, o0, o1, o2, o3, o4);
+    CASE(_newselect): return sparc64_fs_select(ctx, mem, o0, o1, o2, o3, o4);
     CASE(pselect6_time64):
-    CASE(pselect6): return fs_select(mem, o0, o1, o2, o3, o4, 0);
+    CASE(pselect6): return sparc64_fs_pselect6(ctx, mem, o0, o1, o2, o3, o4,
+                                               o5);
     CASE(getppid): return (long)getppid();
     CASE(geteuid): return (long)geteuid();
     CASE(getegid): return (long)getegid();
@@ -865,7 +645,7 @@ long sparc64_l2a_fs_extra(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     CASE(prctl): return fs_prctl(mem, o0, o1);
     CASE(fsync):
     CASE(fdatasync): return fs_ret(fsync((int)o0));
-    CASE(flock): return fs_ret(flock((int)o0, (int)o1));
+    CASE(flock): return sparc64_fs_flock(ctx, o0, o1);
     CASE(sched_yield): return fs_ret(sched_yield());
     CASE(lseek): return fs_lseek(o0, o1, o2);
     CASE(_llseek): {
@@ -882,7 +662,7 @@ long sparc64_l2a_fs_extra(sparc64_ctx_t *ctx, const sparc64_syscall_mem_t *mem,
     CASE(access): return sparc64_l2a_faccessat(ctx, mem, cwd, o0, o1, 0U);
     CASE(pread64): return fs_pio(mem, o0, o1, o2, o3, 0);
     CASE(pwrite64): return fs_pio(mem, o0, o1, o2, o3, 1);
-    CASE(nanosleep): return fs_nanosleep(mem, o0, o1);
+    CASE(nanosleep): return sparc64_fs_nanosleep(ctx, mem, o0, o1);
     CASE(msync):
     CASE(mlock):
     CASE(fadvise64):

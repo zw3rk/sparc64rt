@@ -68,6 +68,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_ext.h"
 #include "os/syscalls_fs.h"
+#include "os/syscalls_poll.h"
 #include "os/syscalls_min.h"
 #include "os/syscalls_sig.h"
 #include "os/threads.h"
@@ -157,7 +158,15 @@ uint64_t sparc64_host_errno_to_guest(long host_errno)
 #if !defined(__APPLE__)
     return sparc64_errno_generic_to_sparc(host_errno);
 #else
-    return (uint64_t)host_errno;
+    /* Darwin numbers that differ from SPARC Linux and that the wait,
+     * lock, and timeout paths can produce. */
+    switch (host_errno) {
+    case EDEADLK: return 78U;
+    case ENOLCK: return 79U;
+    case EOPNOTSUPP: return 45U;
+    case ETIMEDOUT: return 110U;
+    default: return (uint64_t)host_errno;
+    }
 #endif
 }
 
@@ -534,8 +543,8 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         break;
     case (long)SPARC64__NR_fcntl:
     case (long)SPARC64__NR_fcntl64:
-        ret = (o1 >= 7U && o1 <= 9U) ?
-            sparc64_fs_fcntl_lock(mem, o0, o1, o2) :
+        ret = ((o1 >= 7U && o1 <= 9U) || (o1 >= 36U && o1 <= 38U)) ?
+            sparc64_fs_fcntl_lock(ctx, mem, o0, o1, o2) :
             sparc64_l2a_fcntl(o0, o1, o2);
         break;
     case (long)SPARC64__NR_rt_sigprocmask: {
@@ -728,7 +737,10 @@ long sparc64_handle_syscall(sparc64_ctx_t *ctx,
         int claimed = 0;
 
         ret = sparc64_l2a_fs_extra(ctx, mem, nr, o0, o1, o2, o3, o4,
-                                   &claimed);
+                                   o5, &claimed);
+        if (claimed == 0) {
+            ret = -ENOSYS;
+        }
         break;
     }
     }
